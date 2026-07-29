@@ -58,6 +58,10 @@ add_library(llama
             llama-hparams.cpp
             llama-delta-net.h
             llama-delta-net.cpp
+            # KVarN KV cache (from BeeLlama/Anbeeld — headers only, impl needs BeeLlama APIs)
+            llama-kvarn.h
+            llama-kv-cache-kvarn.h
+            llama-kv-cache-tail.h
             unicode.h
             unicode.cpp
             unicode-data.cpp
