@@ -345,6 +345,8 @@ if (GGML_CUDA)
 
         file(GLOB   GGML_SOURCES_CUDA "ggml-cuda/*.cu")
         list(APPEND GGML_SOURCES_CUDA "ggml-cuda.cu")
+        # Exclude standalone cubin sources from main library (PTX isolation)
+        list(FILTER GGML_SOURCES_CUDA EXCLUDE REGEX "nvfp4_omma\\.cu$")
         file(GLOB   SRCS "ggml-cuda/template-instances/fattn-wmma*.cu")
         list(APPEND GGML_SOURCES_CUDA ${SRCS})
         file(GLOB   SRCS "ggml-cuda/template-instances/fattn-mma*.cu")
@@ -383,6 +385,22 @@ if (GGML_CUDA)
         add_compile_definitions(GGML_CUDA_PEER_MAX_BATCH_SIZE=${GGML_CUDA_PEER_MAX_BATCH_SIZE})
         add_compile_definitions(GGML_CUDA_MIN_BATCH_OFFLOAD=${GGML_CUDA_MIN_BATCH_OFFLOAD})
         add_compile_definitions(GGML_CUDA_FUSION=${GGML_CUDA_FUSION})
+
+        # NVFP4 OMMA cubin — standalone compilation for PTX isolation
+        # The cubin source cannot share a TU with normal CUDA C++ (ptxas bug)
+        if (CUDAToolkit_VERSION VERSION_GREATER_EQUAL "13.0")
+            add_custom_command(
+                OUTPUT ${CMAKE_CURRENT_BINARY_DIR}/nvfp4_omma.cubin
+                COMMAND ${CMAKE_CUDA_COMPILER}
+                    -arch=compute_120a -code=sm_120a --cubin
+                    -o ${CMAKE_CURRENT_BINARY_DIR}/nvfp4_omma.cubin
+                    ${CMAKE_CURRENT_SOURCE_DIR}/ggml-cuda/nvfp4_omma.cu
+                DEPENDS ${CMAKE_CURRENT_SOURCE_DIR}/ggml-cuda/nvfp4_omma.cu
+                COMMENT "Compiling NVFP4 OMMA cubin (sm_120a)"
+            )
+            add_custom_target(nvfp4_cubin ALL
+                DEPENDS ${CMAKE_CURRENT_BINARY_DIR}/nvfp4_omma.cubin)
+        endif()
 
         if (GGML_CUDA_USE_GRAPHS)
             add_compile_definitions(GGML_CUDA_USE_GRAPHS)

@@ -186,6 +186,15 @@ typedef struct {
 } block_mxfp4;
 static_assert(sizeof(block_mxfp4) == sizeof(uint8_t) + QK_MXFP4/2, "wrong mxfp4 block size/padding");
 
+// NVFP4: Blackwell-native E2M1+UE4M3 quantization, 256 elements per block
+#define QK_NVFP4 256
+typedef struct {
+    ggml_half d;          // tile-level fp16 norm
+    uint8_t  scales[16];  // UE4M3 block scales (1 per 16-element group)
+    uint8_t  qs[128];     // 256 E2M1 4-bit nibbles packed 2 per byte
+} block_nvfp4;
+static_assert(sizeof(block_nvfp4) == sizeof(ggml_half) + 16 + 128, "wrong nvfp4 block size/padding");
+
 #define QK5_0 32
 typedef struct {
     ggml_half d;           // delta

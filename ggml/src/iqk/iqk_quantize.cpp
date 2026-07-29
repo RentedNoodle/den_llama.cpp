@@ -4255,6 +4255,37 @@ void dequantize_row_mxfp4(const block_mxfp4 * x, float * y, int64_t k) {
     }
 }
 
+// NVFP4 dequantization: 256-element blocks, E2M1 nibbles + UE4M3 scales
+// E2M1 values: {0, 0.5, 1, 1.5, 2, 3, 4, 6} × sign
+static const float kvalues_nvfp4[16] = {
+     0.0f,  0.5f,  1.0f,  1.5f,  2.0f,  3.0f,  4.0f,  6.0f,
+    -0.0f, -0.5f, -1.0f, -1.5f, -2.0f, -3.0f, -4.0f, -6.0f,
+};
+// UE4M3 block scale LUT
+static const float kscales_nvfp4[16] = {
+    0.0f, 0.0625f, 0.125f, 0.1875f, 0.25f, 0.3125f, 0.375f, 0.4375f,
+    1.0f, 1.125f,  1.25f,  1.375f,  1.5f,  1.625f,  1.75f,  1.875f,
+};
+
+void dequantize_row_nvfp4(const block_nvfp4 * x, float * y, int64_t k) {
+    constexpr int kBlockSize = QK_NVFP4;
+    GGML_ASSERT(k % kBlockSize == 0);
+    int nblock = k / kBlockSize;
+    for (int ib = 0; ib < nblock; ++ib) {
+        float d = GGML_FP16_TO_FP32(x[ib].d);
+        for (int i = 0; i < kBlockSize; i++) {
+            int byte_idx = i / 2;
+            int nibble   = i & 1;
+            uint8_t e2m1 = (x[ib].qs[byte_idx] >> (nibble * 4)) & 0xF;
+            int blk = i / 16;
+            uint8_t scale_code = x[ib].scales[blk] & 0xF;
+            float scale = kscales_nvfp4[scale_code];
+            y[i] = d * scale * kvalues_nvfp4[e2m1];
+        }
+        y += kBlockSize;
+    }
+}
+
 void  vec_dot_mxfp4_q8_0_x4(int n, float * s, size_t bs, const void * vx, size_t bx, const void * vy, size_t by, int nrc) {
 #if GGML_USE_IQK_MULMAT
     if (iqk_mul_mat(1, 1, n, GGML_TYPE_MXFP4, vx, 0, GGML_TYPE_Q8_K, vy, 0, s, 0, 0, 1)) {

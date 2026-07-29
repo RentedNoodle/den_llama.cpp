@@ -484,6 +484,7 @@ extern "C" {
         GGML_TYPE_Q8_K_R16  = 397,
         GGML_TYPE_Q8_KV_R8  = 398,
         GGML_TYPE_Q8_K_R8   = 399,
+        GGML_TYPE_NVFP4     = 400,
         GGML_TYPE_COUNT,
     };
 
