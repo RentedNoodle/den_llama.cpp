@@ -10,6 +10,7 @@
 #include "ggml-backend-impl.h"
 
 #include "ggml-cuda/common.cuh"
+#include "ggml-cuda/l2_cache.cuh"
 #include "ggml-cuda/acc.cuh"
 #include "ggml-cuda/arange.cuh"
 #include "ggml-cuda/argsort.cuh"
@@ -289,6 +290,14 @@ static ggml_cuda_device_info ggml_cuda_init() {
         }
     }
 #endif
+    // Initialize L2 cache pinning (Mech 41)
+    {
+        const char* l2_env = getenv("DEN_L2_CACHE_MB");
+        int l2_mb = l2_env ? atoi(l2_env) : 0;  // 0 = use default (8 MB)
+        if (l2_env || getenv("GGML_L2_CACHE")) {
+            l2_cache_init(l2_mb > 0 ? l2_mb : 8);
+        }
+    }
     return info;
 }
 
