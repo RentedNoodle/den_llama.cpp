@@ -77,6 +77,15 @@ void   vec_dot_mxfp4_q8_0_x4(int n, float * GGML_RESTRICT s, size_t bs, const vo
 
 void   dequantize_row_nvfp4(const block_nvfp4 * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k);
 
+// Low-bit KV cache dequant functions (from BeeLlama/Anbeeld)
+void   dequantize_row_q2_0_kv (const block_q2_0_kv  * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k);
+void   dequantize_row_q2_0s_kv(const block_q2_0s_kv * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k);
+void   dequantize_row_q2_1_kv (const block_q2_1_kv  * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k);
+void   dequantize_row_q3_0_kv (const block_q3_0_kv  * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k);
+void   dequantize_row_q3_1_kv (const block_q3_1_kv  * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k);
+void   dequantize_row_q6_0_kv (const block_q6_0_kv  * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k);
+void   dequantize_row_q6_1_kv (const block_q6_1_kv  * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k);
+
 void   quantize_row_iq2_ks_ref(const float * GGML_RESTRICT x, block_iq2_ks  * GGML_RESTRICT y, int64_t k);
 void   quantize_row_iq2_ks(const float * GGML_RESTRICT x, void * GGML_RESTRICT y, int64_t k);
 size_t quantize_iq2_ks(const float * GGML_RESTRICT src, void * GGML_RESTRICT dst, int64_t nrows, int64_t n_per_row, const float * imatrix, const struct quantize_user_data * use_data);

@@ -484,6 +484,15 @@ extern "C" {
         GGML_TYPE_Q8_K_R16  = 397,
         GGML_TYPE_Q8_KV_R8  = 398,
         GGML_TYPE_Q8_K_R8   = 399,
+        // Low-bit KV cache types (from BeeLlama/Anbeeld — KV-suffix to avoid Q6_0 conflict)
+        GGML_TYPE_Q2_0_KV   = 357,
+        GGML_TYPE_Q2_0S_KV  = 358,
+        GGML_TYPE_Q2_1_KV   = 359,
+        GGML_TYPE_Q3_0_KV   = 360,
+        GGML_TYPE_Q3_1_KV   = 361,
+        GGML_TYPE_Q6_0_KV   = 362,
+        GGML_TYPE_Q6_1_KV   = 363,
+
         GGML_TYPE_NVFP4     = 400,
         GGML_TYPE_COUNT,
     };

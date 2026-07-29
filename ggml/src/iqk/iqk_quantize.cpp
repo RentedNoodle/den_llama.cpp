@@ -4286,6 +4286,99 @@ void dequantize_row_nvfp4(const block_nvfp4 * x, float * y, int64_t k) {
     }
 }
 
+// ── Low-bit KV cache dequant — from BeeLlama/Anbeeld ───────────────────────
+
+void dequantize_row_q2_0_kv(const block_q2_0_kv * x, float * y, int64_t k) {
+    static const int qk = QK2_0;
+    assert(k % qk == 0);
+    for (int i = 0; i < k / qk; i++) {
+        const float d = GGML_FP16_TO_FP32(x[i].d);
+        for (int j = 0; j < qk; ++j) {
+            const int q = (x[i].qs[j / 4] >> ((j % 4) * 2)) & 0x03;
+            y[i*qk + j] = ((int)q - 1) * d;
+        }
+    }
+}
+
+void dequantize_row_q2_0s_kv(const block_q2_0s_kv * x, float * y, int64_t k) {
+    static const int qk = QK2_0S;
+    assert(k % qk == 0);
+    for (int i = 0; i < k / qk; i++) {
+        const float d = GGML_FP16_TO_FP32(x[i].d);
+        for (int j = 0; j < qk; ++j) {
+            const int q = (x[i].qs[j / 4] >> ((j % 4) * 2)) & 0x03;
+            y[i*qk + j] = ((int)q - 1) * d;
+        }
+    }
+}
+
+void dequantize_row_q2_1_kv(const block_q2_1_kv * x, float * y, int64_t k) {
+    static const int qk = QK2_1;
+    assert(k % qk == 0);
+    for (int i = 0; i < k / qk; i++) {
+        const float d = GGML_FP16_TO_FP32(x[i].d);
+        const float m = GGML_FP16_TO_FP32(x[i].m);
+        for (int j = 0; j < qk; ++j) {
+            const int q = (x[i].qs[j / 4] >> ((j % 4) * 2)) & 0x03;
+            y[i*qk + j] = q * d + m;
+        }
+    }
+}
+
+void dequantize_row_q3_0_kv(const block_q3_0_kv * x, float * y, int64_t k) {
+    static const int qk = QK3_0;
+    assert(k % qk == 0);
+    for (int i = 0; i < k / qk; i++) {
+        const float d = GGML_FP16_TO_FP32(x[i].d);
+        for (int j = 0; j < qk; ++j) {
+            const int q = ((x[i].qs[j / 4] >> ((j % 4) * 2)) & 0x03)
+                        | (((x[i].qh[j / 8] >> (j % 8)) & 1) << 2);
+            y[i*qk + j] = ((int)q - 3) * d;
+        }
+    }
+}
+
+void dequantize_row_q3_1_kv(const block_q3_1_kv * x, float * y, int64_t k) {
+    static const int qk = QK3_1;
+    assert(k % qk == 0);
+    for (int i = 0; i < k / qk; i++) {
+        const float d = GGML_FP16_TO_FP32(x[i].d);
+        const float m = GGML_FP16_TO_FP32(x[i].m);
+        for (int j = 0; j < qk; ++j) {
+            const int q = ((x[i].qs[j / 4] >> ((j % 4) * 2)) & 0x03)
+                        | (((x[i].qh[j / 8] >> (j % 8)) & 1) << 2);
+            y[i*qk + j] = q * d + m;
+        }
+    }
+}
+
+void dequantize_row_q6_0_kv(const block_q6_0_kv * x, float * y, int64_t k) {
+    static const int qk = QK6_0;
+    assert(k % qk == 0);
+    for (int i = 0; i < k / qk; i++) {
+        const float d = GGML_FP16_TO_FP32(x[i].d);
+        for (int j = 0; j < qk; ++j) {
+            const int q = (x[i].qs[j / 2] >> ((j % 2) * 4)) & 0x0F
+                        | ((x[i].qh[j / 4] >> ((j % 4) * 2)) & 0x03) << 4;
+            y[i*qk + j] = ((int)q - 32) * d;
+        }
+    }
+}
+
+void dequantize_row_q6_1_kv(const block_q6_1_kv * x, float * y, int64_t k) {
+    static const int qk = QK6_1;
+    assert(k % qk == 0);
+    for (int i = 0; i < k / qk; i++) {
+        const float d = GGML_FP16_TO_FP32(x[i].d);
+        const float m = GGML_FP16_TO_FP32(x[i].m);
+        for (int j = 0; j < qk; ++j) {
+            const int q = (x[i].qs[j / 2] >> ((j % 2) * 4)) & 0x0F
+                        | ((x[i].qh[j / 4] >> ((j % 4) * 2)) & 0x03) << 4;
+            y[i*qk + j] = q * d + m;
+        }
+    }
+}
+
 void  vec_dot_mxfp4_q8_0_x4(int n, float * s, size_t bs, const void * vx, size_t bx, const void * vy, size_t by, int nrc) {
 #if GGML_USE_IQK_MULMAT
     if (iqk_mul_mat(1, 1, n, GGML_TYPE_MXFP4, vx, 0, GGML_TYPE_Q8_K, vy, 0, s, 0, 0, 1)) {

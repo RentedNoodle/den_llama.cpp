@@ -186,6 +186,22 @@ typedef struct {
 } block_mxfp4;
 static_assert(sizeof(block_mxfp4) == sizeof(uint8_t) + QK_MXFP4/2, "wrong mxfp4 block size/padding");
 
+// Low-bit KV cache types (from BeeLlama/Anbeeld)
+#define QK2_0   64
+typedef struct { ggml_half d; uint8_t qs[QK2_0/4]; } block_q2_0_kv;
+#define QK2_0S  32
+typedef struct { ggml_half d; uint8_t qs[QK2_0S/4]; } block_q2_0s_kv;
+#define QK2_1   32
+typedef struct { ggml_half d; ggml_half m; uint8_t qs[QK2_1/4]; } block_q2_1_kv;
+#define QK3_0   32
+typedef struct { ggml_half d; uint8_t qh[QK3_0/8]; uint8_t qs[QK3_0/4]; } block_q3_0_kv;
+#define QK3_1   32
+typedef struct { ggml_half d; ggml_half m; uint8_t qh[QK3_1/8]; uint8_t qs[QK3_1/4]; } block_q3_1_kv;
+#define QK6_0   32
+typedef struct { ggml_half d; uint8_t qh[QK6_0/4]; uint8_t qs[QK6_0/2]; } block_q6_0_kv;
+#define QK6_1   32
+typedef struct { ggml_half d; ggml_half m; uint8_t qh[QK6_1/4]; uint8_t qs[QK6_1/2]; } block_q6_1_kv;
+
 // NVFP4: Blackwell-native E2M1+UE4M3 quantization, 256 elements per block
 #define QK_NVFP4 256
 typedef struct {
