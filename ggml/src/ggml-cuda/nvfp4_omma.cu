@@ -307,3 +307,123 @@ extern "C" __global__ void nvfp4_gemv_fused_kernel(
     }
     if (lane == 0) y[row] = d0;
 }
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// WALSH-HADAMARD TRANSFORM — Register-domain via __shfl_xor_sync
+// Ported from dengine den_wht_reg.h (Innovation #5)
+// 6-stage 64-point WHT: 4 intra-thread + 2 cross-thread butterfly stages
+// ═══════════════════════════════════════════════════════════════════════════════
+
+// Intra-thread 16-point WHT (stages 1-4)
+__device__ __forceinline__ void wht16_f32_intra(float r[16]) {
+    for (int i = 0; i < 16; i += 2) {
+        float a = r[i], b = r[i+1]; r[i] = a + b; r[i+1] = a - b;
+    }
+    for (int i = 0; i < 16; i += 4) {
+        float a = r[i], b = r[i+2]; r[i] = a + b; r[i+2] = a - b;
+        a = r[i+1]; b = r[i+3]; r[i+1] = a + b; r[i+3] = a - b;
+    }
+    for (int i = 0; i < 16; i += 8) {
+        for (int j = 0; j < 4; j++) {
+            float a = r[i+j], b = r[i+j+4]; r[i+j] = a + b; r[i+j+4] = a - b;
+        }
+    }
+    for (int i = 0; i < 8; i++) {
+        float a = r[i], b = r[i+8]; r[i] = a + b; r[i+8] = a - b;
+    }
+}
+
+// 1/sqrt(N) normalization
+__device__ __forceinline__ void wht_normalize(float r[], int n) {
+    float s = rsqrtf((float)n);
+    for (int i = 0; i < n; i++) r[i] *= s;
+}
+
+// 64-point WHT — 4 threads x 16 values each = 64 K-positions
+// Thread layout: lane%4 covers K-threads; each thread has 16 contiguous values
+__device__ __forceinline__ void wht64_f32(float r[16], int lane_id) {
+    wht16_f32_intra(r);                          // Stages 1-4: intra-thread
+    unsigned active = __activemask();
+    // Stage 5: cross-thread XOR mask 1 (lane pairs 0-1, 2-3)
+    for (int i = 0; i < 16; i++) {
+        float p = __shfl_xor_sync(active, r[i], 1);
+        r[i] = (lane_id & 1) ? (p - r[i]) : (r[i] + p);
+    }
+    // Stage 6: cross-thread XOR mask 2 (lane pairs 0-2, 1-3)
+    for (int i = 0; i < 16; i++) {
+        float p = __shfl_xor_sync(active, r[i], 2);
+        r[i] = (lane_id & 2) ? (p - r[i]) : (r[i] + p);
+    }
+    wht_normalize(r, 64);
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// FUSED WH4 KERNEL — GGML block_nvfp4 → WHT(input) → OMMA.SF.16864
+// Inline WHT eliminates the separate gpu_wht_f32_kernel launch.
+// WH4 identity: <Hw, Hx> = 16·<w,x> — correction folded into weight scales.
+// ═══════════════════════════════════════════════════════════════════════════════
+extern "C" __global__ void nvfp4_gemv_fused_wh4_kernel(
+    const uint8_t* __restrict__ blocks,  // [N*tpr][146] block_nvfp4
+    const uint16_t* __restrict__ x,      // [K] input fp16
+    float*         __restrict__ y,       // [N] output
+    int N, int K, int tpr)
+{
+    int row = blockIdx.x;
+    if (row >= N) return;
+    int lane = threadIdx.x, kgroup = lane / 8, within = lane % 4;
+    float d0 = 0, d1 = 0, d2 = 0, d3 = 0;
+    constexpr int BLOCK_BYTES = 146;
+
+    for (int t = 0; t < tpr; t++) {
+        const uint8_t* blk = blocks + ((size_t)row * tpr + t) * BLOCK_BYTES;
+        float tile_norm = __half2float(*(const __half*)blk);
+        uint32_t packed_scales[4];
+        for (int s = 0; s < 4; s++)
+            packed_scales[s] = *(const uint32_t*)(blk + 2 + s * 4);
+
+        for (int sub = 0; sub < 4; sub++) {
+            int k_off = sub * 64;
+
+            // A fragment: weight E2M1 nibbles (unchanged — pre-WHT'd during quant)
+            uint32_t a0 = 0, a1 = 0, a2 = 0, a3 = 0;
+            for (int ni = 0; ni < 8; ni++) {
+                int byte_a0 = 18 + sub * 32 + (kgroup * 8 + ni) / 2;
+                uint8_t w_a0 = (byte_a0 < 146) ? ((blk[byte_a0] >> (((kgroup * 8 + ni) & 1) * 4)) & 0xF) : 0;
+                a0 |= (uint32_t)w_a0 << (ni * 4);
+                int byte_a1 = 18 + sub * 32 + (kgroup * 8 + ni + 32) / 2;
+                uint8_t w_a1 = (byte_a1 < 146) ? ((blk[byte_a1] >> (((kgroup * 8 + ni + 32) & 1) * 4)) & 0xF) : 0;
+                a1 |= (uint32_t)w_a1 << (ni * 4);
+                a2 |= (uint32_t)w_a0 << (ni * 4);
+                a3 |= (uint32_t)w_a1 << (ni * 4);
+            }
+
+            // B fragment: INLINE WHT on input activations (Innovation #5)
+            float r[16];
+            int k_start = k_off + within * 16;
+            for (int i = 0; i < 16; i++)
+                r[i] = (k_start + i < K) ? half_to_float(x[k_start + i]) : 0.0f;
+            wht64_f32(r, lane);  // register-domain WHT
+            uint32_t b0 = 0, b1 = 0;
+            for (int ni = 0; ni < 8; ni++) {
+                b0 |= (uint32_t)f32_to_e2m1(r[ni]) << (ni * 4);
+                b1 |= (uint32_t)f32_to_e2m1(r[ni + 8]) << (ni * 4);
+            }
+
+            // OMMA.SF.16864 — scales include WH4 correction
+            uint32_t sfa = packed_scales[sub], sfb = 0x38383838u;
+            uint16_t bid_a = 0, tid_a = 0, bid_b = 0, tid_b = 0;
+            float c0 = 0, c1 = 0, c2 = 0, c3 = 0;
+            asm volatile(
+                "mma.sync.aligned.kind::mxf4nvf4.block_scale.scale_vec::4X.m16n8k64.row.col.f32.e2m1.e2m1.f32.ue4m3 "
+                "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%10,%11,%12,%13}, %14,{%15,%16},%17,{%18,%19};"
+                : "+f"(c0),"+f"(c1),"+f"(c2),"+f"(c3)
+                : "r"(a0),"r"(a1),"r"(a2),"r"(a3), "r"(b0),"r"(b1),
+                  "f"(c0),"f"(c1),"f"(c2),"f"(c3),
+                  "r"(sfa),"h"(bid_a),"h"(tid_a),"r"(sfb),"h"(bid_b),"h"(tid_b));
+            d0 += c0; d1 += c1; d2 += c2; d3 += c3;
+        }
+        if (tile_norm != 0 && tile_norm != 1.0f)
+            { d0 *= tile_norm; d1 *= tile_norm; d2 *= tile_norm; d3 *= tile_norm; }
+    }
+    if (lane == 0) y[row] = d0;
+}

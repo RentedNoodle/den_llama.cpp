@@ -1716,7 +1716,7 @@ static void ggml_cuda_op_mul_mat_cublas(
     }
 #endif
 
-    if (compute_capability >= CC_VOLTA && (src0->type == GGML_TYPE_F16 || src0->type == GGML_TYPE_BF16 || ggml_is_quantized(src0->type)) && ggml_is_contiguous(src0) && row_diff == src0->ne[1] && dst->op_params[0] == GGML_PREC_DEFAULT) {
+    if (compute_capability >= CC_VOLTA && (src0->type == GGML_TYPE_F16 || src0->type == GGML_TYPE_BF16 || (ggml_is_quantized(src0->type) && src0->type != GGML_TYPE_NVFP4)) && ggml_is_contiguous(src0) && row_diff == src0->ne[1] && dst->op_params[0] == GGML_PREC_DEFAULT) {
         // convert src0 and src1 to fp16, multiply as fp16, convert dst to fp32
         ggml_cuda_pool_alloc<half> src0_as_f16(ctx.pool(id));
         if (src0->type != GGML_TYPE_F16) {
@@ -1761,13 +1761,13 @@ static void ggml_cuda_op_mul_mat_cublas(
 
         if (src0->type != GGML_TYPE_F32) {
             const to_fp32_cuda_t to_fp32_cuda = ggml_get_to_fp32_cuda(src0->type);
-            GGML_ASSERT(to_fp32_cuda != nullptr);
+            GGML_ASSERT(to_fp32_cuda != nullptr || src0->type == GGML_TYPE_NVFP4);
             src0_ddq_as_f32.alloc(row_diff*ne00);
             to_fp32_cuda(src0_dd_i, src0_ddq_as_f32.get(), row_diff, ne00, stream);
         }
         if (src1->type != GGML_TYPE_F32) {
             const to_fp32_cuda_t to_fp32_cuda = ggml_get_to_fp32_cuda(src1->type);
-            GGML_ASSERT(to_fp32_cuda != nullptr);
+            GGML_ASSERT(to_fp32_cuda != nullptr || src0->type == GGML_TYPE_NVFP4);
             src1_ddq_as_f32.alloc(src1_ncols*ne10);
             to_fp32_cuda(src1_ddf_i, src1_ddq_as_f32.get(), src1_ncols, ne10, stream);
         }

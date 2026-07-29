@@ -16,6 +16,7 @@
 static CUmodule   g_nvfp4_module   = nullptr;
 static CUfunction g_nvfp4_func       = nullptr;  // original (tile-based)
 static CUfunction g_nvfp4_fused_func  = nullptr;  // fused (block-based, Innovation #1)
+static CUfunction g_nvfp4_wh4_func    = nullptr;  // fused WH4 (WHT inline, Innovation #5)
 static CUfunction g_nvfp4_batch_func  = nullptr;
 static bool       g_nvfp4_loaded      = false;
 static uint8_t*   g_tile_buffer       = nullptr;  // fallback tile buffer
@@ -77,7 +78,13 @@ cudaError_t nvfp4_omma_init(void) {
     // Load fused kernel (Innovation #1 — block_nvfp4 → OMMA directly)
     cu_err = cuModuleGetFunction(&g_nvfp4_fused_func, g_nvfp4_module, "nvfp4_gemv_fused_kernel");
     if (cu_err != CUDA_SUCCESS) {
-        g_nvfp4_fused_func = nullptr;  // fallback to two-step path
+        g_nvfp4_fused_func = nullptr;
+    }
+
+    // Load WH4 fused kernel (Innovation #5 — WHT inline + OMMA)
+    cu_err = cuModuleGetFunction(&g_nvfp4_wh4_func, g_nvfp4_module, "nvfp4_gemv_fused_wh4_kernel");
+    if (cu_err != CUDA_SUCCESS) {
+        g_nvfp4_wh4_func = nullptr;
     }
 
     g_nvfp4_loaded = true;
@@ -145,8 +152,13 @@ void mul_mat_vec_nvfp4_cuda(const mmvq_args& args, cudaStream_t stream) {
     void* d_x_ptr = const_cast<void*>(static_cast<const void*>(args.vy));
     void* d_y_ptr = static_cast<void*>(args.dst);
 
-    // Use fused kernel if available (Innovation #1 — skip tile conversion)
-    if (g_nvfp4_fused_func) {
+    // Use WH4 fused kernel if available (Innovation #5 — WHT inline, fastest path)
+    // Fall back to regular fused kernel (Innovation #1), then two-step path
+    if (g_nvfp4_wh4_func) {
+        void* kernel_args[] = { &d_blocks_ptr, &d_x_ptr, &d_y_ptr, &N, &K, &tpr };
+        cuLaunchKernel(g_nvfp4_wh4_func,
+            N, 1, 1, 32, 1, 1, 0, stream, kernel_args, nullptr);
+    } else if (g_nvfp4_fused_func) {
         void* kernel_args[] = { &d_blocks_ptr, &d_x_ptr, &d_y_ptr, &N, &K, &tpr };
         cuLaunchKernel(g_nvfp4_fused_func,
             N, 1, 1, 32, 1, 1, 0, stream, kernel_args, nullptr);
