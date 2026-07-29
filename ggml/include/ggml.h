@@ -497,6 +497,14 @@ extern "C" {
         GGML_TYPE_COUNT,
     };
 
+    // KVarN flash attention domain (from BeeLlama/Anbeeld)
+    enum ggml_flash_attn_ext_kvarn_domain {
+        GGML_FLASH_ATTN_EXT_KVARN_DOMAIN_AUTO                 = 0,
+        GGML_FLASH_ATTN_EXT_KVARN_DOMAIN_ROTATED              = 1,
+        GGML_FLASH_ATTN_EXT_KVARN_DOMAIN_ORIGINAL             = 2,
+        GGML_FLASH_ATTN_EXT_KVARN_DOMAIN_ROTATED_K_ORIGINAL_V = 3,
+    };
+
     // precision
     enum ggml_prec {
         GGML_PREC_DEFAULT,
