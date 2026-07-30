@@ -88,7 +88,7 @@ extern "C" __global__ void nvfp4_gemv_kernel(
             int k_off = sub * 64;
 
             // ── Build A fragment (weight E2M1 nibbles → uint32 registers) ──
-            uint32_t a0 = 0, a1 = 0, a2 = 0, a3 = 0;
+            volatile uint32_t a0 = 0, a1 = 0, a2 = 0, a3 = 0;
             (void)(k_off + kgroup * 8);         // k_start_a0 — reserved for multi-row GEMV
             (void)(k_off + 32 + kgroup * 8);    // k_start_a1 — reserved for multi-row GEMV
 
@@ -108,7 +108,7 @@ extern "C" __global__ void nvfp4_gemv_kernel(
             }
 
             // ── Build B fragment (fp16 input → E2M1 → uint32 registers) ──
-            uint32_t b0 = 0, b1 = 0;
+            volatile uint32_t b0 = 0, b1 = 0;
             int ks = within * 16;
             for (int ni = 0; ni < 8; ni++) {
                 int ki0 = k_off + ks + ni;
@@ -125,7 +125,7 @@ extern "C" __global__ void nvfp4_gemv_kernel(
             uint32_t sfb = 0x38383838u;  // activation scale = 1.0
             uint16_t bid_a = 0, tid_a = 0, bid_b = 0, tid_b = 0;
 
-            float c0 = 0.0f, c1 = 0.0f, c2 = 0.0f, c3 = 0.0f;
+            volatile float c0 = 0.0f, c1 = 0.0f, c2 = 0.0f, c3 = 0.0f;
             asm volatile(
                 "mma.sync.aligned.kind::mxf4nvf4.block_scale.scale_vec::4X.m16n8k64.row.col.f32.e2m1.e2m1.f32.ue4m3 "
                 "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%10,%11,%12,%13}, %14,{%15,%16},%17,{%18,%19};"
@@ -183,7 +183,7 @@ extern "C" __global__ void nvfp4_gemv_batch_kernel(
         for (int sub = 0; sub < 4; sub++) {
             int k_off = sub * 64;
 
-            uint32_t a0 = 0, a1 = 0, a2 = 0, a3 = 0;
+            volatile uint32_t a0 = 0, a1 = 0, a2 = 0, a3 = 0;
             for (int ni = 0; ni < 8; ni++) {
                 int byte_a0 = 16 + sub * 32 + (kgroup * 8 + ni) / 2;
                 int nib_a0 = (kgroup * 8 + ni) & 1;
@@ -199,7 +199,7 @@ extern "C" __global__ void nvfp4_gemv_batch_kernel(
                 a3 |= (uint32_t)w_a1 << (ni * 4);
             }
 
-            uint32_t b0 = 0, b1 = 0;
+            volatile uint32_t b0 = 0, b1 = 0;
             int ks = within * 16;
             for (int ni = 0; ni < 8; ni++) {
                 int ki0 = k_off + ks + ni;
@@ -215,7 +215,7 @@ extern "C" __global__ void nvfp4_gemv_batch_kernel(
             uint32_t sfb = 0x38383838u;
             uint16_t bid_a = 0, tid_a = 0, bid_b = 0, tid_b = 0;
 
-            float c0 = 0.0f, c1 = 0.0f, c2 = 0.0f, c3 = 0.0f;
+            volatile float c0 = 0.0f, c1 = 0.0f, c2 = 0.0f, c3 = 0.0f;
             asm volatile(
                 "mma.sync.aligned.kind::mxf4nvf4.block_scale.scale_vec::4X.m16n8k64.row.col.f32.e2m1.e2m1.f32.ue4m3 "
                 "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%10,%11,%12,%13}, %14,{%15,%16},%17,{%18,%19};"
@@ -272,7 +272,7 @@ extern "C" __global__ void nvfp4_gemv_fused_kernel(
 
         for (int sub = 0; sub < 4; sub++) {
             int k_off = sub * 64;
-            uint32_t a0 = 0, a1 = 0, a2 = 0, a3 = 0;
+            volatile uint32_t a0 = 0, a1 = 0, a2 = 0, a3 = 0;
             for (int ni = 0; ni < 8; ni++) {
                 int byte_a0 = 18 + sub * 32 + (kgroup * 8 + ni) / 2;
                 int nib_a0 = (kgroup * 8 + ni) & 1;
@@ -285,7 +285,7 @@ extern "C" __global__ void nvfp4_gemv_fused_kernel(
                 a2 |= (uint32_t)w_a0 << (ni * 4);
                 a3 |= (uint32_t)w_a1 << (ni * 4);
             }
-            uint32_t b0 = 0, b1 = 0;
+            volatile uint32_t b0 = 0, b1 = 0;
             int ks = within * 16;
             for (int ni = 0; ni < 8; ni++) {
                 int ki0 = k_off + ks + ni;
@@ -391,7 +391,7 @@ extern "C" __global__ void nvfp4_gemv_fused_wh4_kernel(
             int k_off = sub * 64;
 
             // A fragment: weight E2M1 nibbles (unchanged — pre-WHT'd during quant)
-            uint32_t a0 = 0, a1 = 0, a2 = 0, a3 = 0;
+            volatile uint32_t a0 = 0, a1 = 0, a2 = 0, a3 = 0;
             for (int ni = 0; ni < 8; ni++) {
                 int byte_a0 = 18 + sub * 32 + (kgroup * 8 + ni) / 2;
                 uint8_t w_a0 = (byte_a0 < 146) ? ((blk[byte_a0] >> (((kgroup * 8 + ni) & 1) * 4)) & 0xF) : 0;
@@ -583,4 +583,71 @@ __device__ __noinline__ void omma_step(
           "r"(sfa),"h"(bid_a),"h"(tid_a),"r"(sfb),"h"(bid_b),"h"(tid_b)
         : "memory");
     d0 += c0; d1 += c1; d2 += c2; d3 += c3;
+}
+// Fused kernel with SMEM staging to avoid register pressure
+extern "C" __global__ void nvfp4_gemv_smem_fused_kernel(
+    const uint8_t* __restrict__ blocks, const uint16_t* __restrict__ x,
+    float* __restrict__ y, int N, int K, int tpr)
+{
+    __shared__ uint32_t smem_scales[4][4];    // 4 tiles * 4 uint32 scales
+    __shared__ uint8_t  smem_nibs[4][128];    // 4 sub-tiles * 128B nibbles
+    __shared__ float    smem_x[256];          // 256 fp32 activations per tile
+
+    int row = blockIdx.x;
+    if (row >= N) return;
+    int lane = threadIdx.x;
+    float d0 = 0, d1 = 0, d2 = 0, d3 = 0;
+    constexpr int BLOCK_BYTES = 146;
+
+    for (int t = 0; t < tpr; t++) {
+        const uint8_t* blk = blocks + ((size_t)row * tpr + t) * BLOCK_BYTES;
+        float tile_norm = __half2float(*(const __half*)blk);
+
+        // Cooperative load: 32 threads load nibbles into SMEM
+        for (int i = lane; i < 128; i += 32) smem_nibs[0][i] = blk[18 + i];
+        for (int i = lane; i < 4; i++) smem_scales[0][i] = *(const uint32_t*)(blk + 2 + i*4);
+        // Load activations for this tile
+        int base_k = t * 256;
+        for (int i = lane; i < 256; i += 32)
+            smem_x[i] = (base_k + i < K) ? half_to_float(x[base_k + i]) : 0.0f;
+        __syncthreads();
+
+        // Process 4 sub-tiles from SMEM (no memory reads, no register pressure)
+        for (int sub = 0; sub < 4; sub++) {
+            int kgroup = lane / 8, within = lane % 4;
+            uint32_t a0 = 0, a1 = 0, a2 = 0, a3 = 0;
+            for (int ni = 0; ni < 8; ni++) {
+                int byte_idx = sub * 32 + (kgroup * 8 + ni) / 2;
+                uint8_t w = (byte_idx < 128) ? ((smem_nibs[0][byte_idx] >> (((kgroup * 8 + ni) & 1) * 4)) & 0xF) : 0;
+                a0 |= (uint32_t)w << (ni * 4);
+                int byte_idx2 = sub * 32 + (kgroup * 8 + ni + 32) / 2;
+                uint8_t w2 = (byte_idx2 < 128) ? ((smem_nibs[0][byte_idx2] >> (((kgroup * 8 + ni + 32) & 1) * 4)) & 0xF) : 0;
+                a1 |= (uint32_t)w2 << (ni * 4);
+                a2 |= (uint32_t)w << (ni * 4);
+                a3 |= (uint32_t)w2 << (ni * 4);
+            }
+            uint32_t b0 = 0, b1 = 0;
+            int ks = within * 16;
+            for (int ni = 0; ni < 8; ni++) {
+                float xf0 = smem_x[sub * 64 + ks + ni];
+                b0 |= (uint32_t)f32_to_e2m1(xf0) << (ni * 4);
+                float xf1 = smem_x[sub * 64 + ks + 8 + ni];
+                b1 |= (uint32_t)f32_to_e2m1(xf1) << (ni * 4);
+            }
+            uint32_t sfa = smem_scales[0][sub], sfb = 0x38383838u;
+            uint16_t bid_a=0,tid_a=0,bid_b=0,tid_b=0;
+            float c0=0,c1=0,c2=0,c3=0;
+            asm volatile(
+                "mma.sync.aligned.kind::mxf4nvf4.block_scale.scale_vec::4X.m16n8k64.row.col.f32.e2m1.e2m1.f32.ue4m3 "
+                "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%10,%11,%12,%13}, %14,{%15,%16},%17,{%18,%19};"
+                : "+f"(c0),"+f"(c1),"+f"(c2),"+f"(c3)
+                : "r"(a0),"r"(a1),"r"(a2),"r"(a3), "r"(b0),"r"(b1),
+                  "f"(c0),"f"(c1),"f"(c2),"f"(c3),
+                  "r"(sfa),"h"(bid_a),"h"(tid_a),"r"(sfb),"h"(bid_b),"h"(tid_b));
+            d0 += c0; d1 += c1; d2 += c2; d3 += c3;
+        }
+        if (tile_norm != 0 && tile_norm != 1.0f) { d0 *= tile_norm; d1 *= tile_norm; d2 *= tile_norm; d3 *= tile_norm; }
+        __syncthreads();
+    }
+    if (lane == 0) y[row] = d0;
 }

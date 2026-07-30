@@ -11,6 +11,7 @@
 
 #include "ggml-cuda/common.cuh"
 #include "ggml-cuda/l2_cache.cuh"
+#include "ggml-cuda/persistent_kernel.cuh"
 #include "ggml-cuda/acc.cuh"
 #include "ggml-cuda/arange.cuh"
 #include "ggml-cuda/argsort.cuh"
