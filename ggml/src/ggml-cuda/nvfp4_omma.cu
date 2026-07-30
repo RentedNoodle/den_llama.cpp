@@ -46,6 +46,9 @@ __device__ __forceinline__ float half_to_float(uint16_t h) {
     return __half2float(*(const __half*)&h);
 }
 
+// Forward declaration — noinline OMMA wrapper (prevents register conflicts)
+__device__ __noinline__ void omma_step(uint32_t,uint32_t,uint32_t,uint32_t,uint32_t,uint32_t,uint32_t,uint32_t,float&,float&,float&,float&);
+
 // ═══════════════════════════════════════════════════════════════════════════════
 // nvfp4_gemv_kernel — OMMA-accelerated NVFP4 GEMV, 1 warp per row
 //
@@ -130,7 +133,8 @@ extern "C" __global__ void nvfp4_gemv_kernel(
                 : "r"(a0),"r"(a1),"r"(a2),"r"(a3),
                   "r"(b0),"r"(b1),
                   "f"(c0),"f"(c1),"f"(c2),"f"(c3),
-                  "r"(sfa),"h"(bid_a),"h"(tid_a),"r"(sfb),"h"(bid_b),"h"(tid_b));
+                  "r"(sfa),"h"(bid_a),"h"(tid_a),"r"(sfb),"h"(bid_b),"h"(tid_b)
+            : "memory");
 
             d0 += c0; d1 += c1; d2 += c2; d3 += c3;
         }
@@ -219,7 +223,8 @@ extern "C" __global__ void nvfp4_gemv_batch_kernel(
                 : "r"(a0),"r"(a1),"r"(a2),"r"(a3),
                   "r"(b0),"r"(b1),
                   "f"(c0),"f"(c1),"f"(c2),"f"(c3),
-                  "r"(sfa),"h"(bid_a),"h"(tid_a),"r"(sfb),"h"(bid_b),"h"(tid_b));
+                  "r"(sfa),"h"(bid_a),"h"(tid_a),"r"(sfb),"h"(bid_b),"h"(tid_b)
+            : "memory");
 
             d0 += c0; d1 += c1; d2 += c2; d3 += c3;
         }
@@ -299,7 +304,8 @@ extern "C" __global__ void nvfp4_gemv_fused_kernel(
                 : "+f"(c0),"+f"(c1),"+f"(c2),"+f"(c3)
                 : "r"(a0),"r"(a1),"r"(a2),"r"(a3), "r"(b0),"r"(b1),
                   "f"(c0),"f"(c1),"f"(c2),"f"(c3),
-                  "r"(sfa),"h"(bid_a),"h"(tid_a),"r"(sfb),"h"(bid_b),"h"(tid_b));
+                  "r"(sfa),"h"(bid_a),"h"(tid_a),"r"(sfb),"h"(bid_b),"h"(tid_b)
+            : "memory");
             d0 += c0; d1 += c1; d2 += c2; d3 += c3;
         }
         if (tile_norm != 0 && tile_norm != 1.0f)
@@ -409,7 +415,7 @@ extern "C" __global__ void nvfp4_gemv_fused_wh4_kernel(
                 b1 |= (uint32_t)f32_to_e2m1(r[ni + 8]) << (ni * 4);
             }
 
-            // OMMA.SF.16864 — scales include WH4 correction
+            // OMMA.SF.16864 — INLINE with memory clobber
             uint32_t sfa = packed_scales[sub], sfb = 0x38383838u;
             uint16_t bid_a = 0, tid_a = 0, bid_b = 0, tid_b = 0;
             float c0 = 0, c1 = 0, c2 = 0, c3 = 0;
@@ -419,11 +425,162 @@ extern "C" __global__ void nvfp4_gemv_fused_wh4_kernel(
                 : "+f"(c0),"+f"(c1),"+f"(c2),"+f"(c3)
                 : "r"(a0),"r"(a1),"r"(a2),"r"(a3), "r"(b0),"r"(b1),
                   "f"(c0),"f"(c1),"f"(c2),"f"(c3),
-                  "r"(sfa),"h"(bid_a),"h"(tid_a),"r"(sfb),"h"(bid_b),"h"(tid_b));
+                  "r"(sfa),"h"(bid_a),"h"(tid_a),"r"(sfb),"h"(bid_b),"h"(tid_b)
+                : "memory");
             d0 += c0; d1 += c1; d2 += c2; d3 += c3;
         }
         if (tile_norm != 0 && tile_norm != 1.0f)
             { d0 *= tile_norm; d1 *= tile_norm; d2 *= tile_norm; d3 *= tile_norm; }
     }
     if (lane == 0) y[row] = d0;
+}
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// DEBUG PROBE: validate pointer + data layout (no OMMA)
+extern "C" __global__ void nvfp4_probe_kernel(
+    const uint8_t* __restrict__ blocks,
+    const uint16_t* __restrict__ x,
+    float*         __restrict__ y,
+    int N, int K, int tpr)
+{
+    int row = blockIdx.x;
+    if (row >= N) return;
+    int lane = threadIdx.x;
+    constexpr int BLOCK_BYTES = 146;
+
+    // Probe: read first block's fp16 norm and write it
+    const uint8_t* blk = blocks + (size_t)row * tpr * BLOCK_BYTES;
+    float norm = __half2float(*(const __half*)blk);
+
+    // Probe: read first few scales and nibbles
+    uint32_t scales_0 = *(const uint32_t*)(blk + 2);
+    uint8_t nibble_0 = blk[18] & 0xF;
+
+    // Probe: read input activation
+    float x0 = (K > 0) ? half_to_float(x[0]) : 0.0f;
+
+    // Write probe values (lane 0 writes all diagnostics)
+    if (lane == 0) {
+        y[row] = norm + (float)(scales_0 & 0xFF) * 0.0001f + nibble_0 * 0.000001f + x0 * 0.00000001f;
+    } else if (lane < 4) {
+        // Lanes 1-3: more probes
+        float v = 0;
+        if (lane == 1) v = half_to_float(x[lane]);
+        if (lane == 2) v = (float)((scales_0 >> 8) & 0xFF);
+        if (lane == 3) v = (float)((scales_0 >> 16) & 0xFF);
+        __syncwarp();
+    }
+}
+
+// DEBUG: OMMA with hardcoded all-ones (no memory reads)
+extern "C" __global__ void nvfp4_omma_hardcoded_kernel(
+    const uint8_t*, const uint16_t*, float* y, int N, int, int)
+{
+    int row = blockIdx.x;
+    if (row >= N) return;
+    if (threadIdx.x != 0) return;
+    
+    uint32_t a0 = 0x22222222u, a1 = 0x22222222u, a2 = 0x22222222u, a3 = 0x22222222u;
+    uint32_t b0 = 0x22222222u, b1 = 0x22222222u;
+    uint32_t sfa = 0x38383838u, sfb = 0x38383838u;
+    uint16_t bid_a = 0, tid_a = 0, bid_b = 0, tid_b = 0;
+    float c0 = 0, c1 = 0, c2 = 0, c3 = 0;
+    asm volatile(
+        "mma.sync.aligned.kind::mxf4nvf4.block_scale.scale_vec::4X.m16n8k64.row.col.f32.e2m1.e2m1.f32.ue4m3 "
+        "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%10,%11,%12,%13}, %14,{%15,%16},%17,{%18,%19};"
+        : "+f"(c0),"+f"(c1),"+f"(c2),"+f"(c3)
+        : "r"(a0),"r"(a1),"r"(a2),"r"(a3), "r"(b0),"r"(b1),
+          "f"(c0),"f"(c1),"f"(c2),"f"(c3),
+          "r"(sfa),"h"(bid_a),"h"(tid_a),"r"(sfb),"h"(bid_b),"h"(tid_b)
+            : "memory");
+    y[row] = c0;
+}
+
+// DEBUG: iterate all tiles + all sub-tiles (no OMMA, but same access pattern)
+extern "C" __global__ void nvfp4_probe_full_kernel(
+    const uint8_t* __restrict__ blocks, const uint16_t* __restrict__ x,
+    float* __restrict__ y, int N, int K, int tpr)
+{
+    int row = blockIdx.x;
+    if (row >= N) return;
+    int lane = threadIdx.x;
+    int kgroup = lane / 8, within = lane % 4;
+    constexpr int BLOCK_BYTES = 146;
+    float sum = 0;
+
+    for (int t = 0; t < tpr; t++) {
+        const uint8_t* blk = blocks + ((size_t)row * tpr + t) * BLOCK_BYTES;
+        sum += __half2float(*(const __half*)blk) * 0.000001f;  // norm
+        for (int sub = 0; sub < 4; sub++) {
+            int k_off = sub * 64;
+            // Access A-fragment nibbles (same as fused kernel)
+            for (int ni = 0; ni < 8; ni++) {
+                int ba = 18 + sub * 32 + (kgroup * 8 + ni) / 2;
+                if (ba < 146) sum += (float)(blk[ba] & 0xF) * 1e-9f;
+                int bb = 18 + sub * 32 + (kgroup * 8 + ni + 32) / 2;
+                if (bb < 146) sum += (float)(blk[bb] & 0xF) * 1e-9f;
+            }
+            // Access B-fragment activations (same as fused kernel)
+            int ks = within * 16;
+            for (int ni = 0; ni < 8; ni++) {
+                int ki0 = k_off + ks + ni;
+                if (ki0 < K) sum += half_to_float(x[ki0]) * 1e-12f;
+                int ki1 = k_off + ks + 8 + ni;
+                if (ki1 < K) sum += half_to_float(x[ki1]) * 1e-12f;
+            }
+        }
+    }
+    // Single warp reduction
+    for (int offset = 16; offset > 0; offset /= 2)
+        sum += __shfl_xor_sync(0xFFFFFFFF, sum, offset);
+    if (lane == 0) y[row] = sum;
+}
+// DEBUG: Hardcoded OMMA with full 32-thread warp (same config as fused)
+extern "C" __global__ void nvfp4_omma_mt_kernel(float* y, int N) {
+    int row = blockIdx.x;
+    if (row >= N) return;
+    int lane = threadIdx.x;
+    int kgroup = lane / 8, within = lane % 4;
+    
+    // Read memory (simulate the fused kernel's access pattern)
+    volatile float dummy = 0;
+    for (int i = 0; i < 16; i++) dummy += (float)(lane * 0.0001f);
+    
+    // OMMA with per-lane registers (matching fused kernel layout)
+    uint32_t a0 = 0x22222222u, a1 = 0x22222222u, a2 = 0x22222222u, a3 = 0x22222222u;
+    uint32_t b0 = 0x22222222u, b1 = 0x22222222u;
+    uint32_t sfa = 0x38383838u, sfb = 0x38383838u;
+    uint16_t bid_a = 0, tid_a = 0, bid_b = 0, tid_b = 0;
+    float c0 = dummy, c1 = 0, c2 = 0, c3 = 0;
+    asm volatile(
+        "mma.sync.aligned.kind::mxf4nvf4.block_scale.scale_vec::4X.m16n8k64.row.col.f32.e2m1.e2m1.f32.ue4m3 "
+        "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%10,%11,%12,%13}, %14,{%15,%16},%17,{%18,%19};"
+        : "+f"(c0),"+f"(c1),"+f"(c2),"+f"(c3)
+        : "r"(a0),"r"(a1),"r"(a2),"r"(a3), "r"(b0),"r"(b1),
+          "f"(c0),"f"(c1),"f"(c2),"f"(c3),
+          "r"(sfa),"h"(bid_a),"h"(tid_a),"r"(sfb),"h"(bid_b),"h"(tid_b)
+        : "memory");
+    if (lane == 0) y[row] = c0;
+}
+// Forward declaration
+__device__ __noinline__ void omma_step(uint32_t,uint32_t,uint32_t,uint32_t,uint32_t,uint32_t,uint32_t,uint32_t,float&,float&,float&,float&);
+
+// Noinline OMMA wrapper — prevents register conflicts with calling code
+__device__ __noinline__ void omma_step(
+    uint32_t a0, uint32_t a1, uint32_t a2, uint32_t a3,
+    uint32_t b0, uint32_t b1,
+    uint32_t sfa, uint32_t sfb,
+    float& d0, float& d1, float& d2, float& d3)
+{
+    uint16_t bid_a = 0, tid_a = 0, bid_b = 0, tid_b = 0;
+    float c0 = d0, c1 = d1, c2 = d2, c3 = d3;
+    asm volatile(
+        "mma.sync.aligned.kind::mxf4nvf4.block_scale.scale_vec::4X.m16n8k64.row.col.f32.e2m1.e2m1.f32.ue4m3 "
+        "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%10,%11,%12,%13}, %14,{%15,%16},%17,{%18,%19};"
+        : "+f"(c0),"+f"(c1),"+f"(c2),"+f"(c3)
+        : "r"(a0),"r"(a1),"r"(a2),"r"(a3), "r"(b0),"r"(b1),
+          "f"(c0),"f"(c1),"f"(c2),"f"(c3),
+          "r"(sfa),"h"(bid_a),"h"(tid_a),"r"(sfb),"h"(bid_b),"h"(tid_b)
+        : "memory");
+    d0 += c0; d1 += c1; d2 += c2; d3 += c3;
 }
