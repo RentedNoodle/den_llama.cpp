@@ -327,6 +327,7 @@ bool ggml_cuda_mmvq_type_supported(ggml_type src0_type) {
         case GGML_TYPE_IQ2_BN:
         case GGML_TYPE_IQ4_NL:
         case GGML_TYPE_MXFP4:
+        case GGML_TYPE_NVFP4:
         case GGML_TYPE_IQ4_XS:
         case GGML_TYPE_IQ2_K:
         case GGML_TYPE_IQ2_KL:

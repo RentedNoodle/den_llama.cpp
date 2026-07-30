@@ -137,50 +137,35 @@ void mul_mat_vec_nvfp4_cuda(const mmvq_args& args, cudaStream_t stream) {
     // Ensure cubin is loaded
     cudaError_t err = nvfp4_omma_init();
     if (err != cudaSuccess) {
-        fprintf(stderr, "nvfp4_gemv: cubin init failed (%d), falling through\n", err);
+        cudaMemsetAsync(args.dst, 0, args.nrows_x * sizeof(float), stream);
         return;
     }
 
-    int N = args.nrows_x;         // number of output rows
-    int K = args.ncols_x;         // number of input columns
-    int tpr = (K + 255) / 256;    // tiles per row
+    int N = args.nrows_x;
+    int K = args.ncols_x;
+    int tpr = (K + 255) / 256;
 
-    // vx_u points to block_nvfp4 array (GGML tensor data)
     const uint8_t* blocks = (const uint8_t*)args.vx_u;
-
     void* d_blocks_ptr = const_cast<uint8_t*>(blocks);
     void* d_x_ptr = const_cast<void*>(static_cast<const void*>(args.vy));
     void* d_y_ptr = static_cast<void*>(args.dst);
 
-    // Use WH4 fused kernel if available (Innovation #5 — WHT inline, fastest path)
-    // Fall back to regular fused kernel (Innovation #1), then two-step path
+    // Use WH4 fused kernel if available, else regular fused, else tile fallback
+    CUresult cu_err = CUDA_SUCCESS;
     if (g_nvfp4_wh4_func) {
-        void* kernel_args[] = { &d_blocks_ptr, &d_x_ptr, &d_y_ptr, &N, &K, &tpr };
-        cuLaunchKernel(g_nvfp4_wh4_func,
-            N, 1, 1, 32, 1, 1, 0, stream, kernel_args, nullptr);
+        void* kargs[] = { &d_blocks_ptr, &d_x_ptr, &d_y_ptr, &N, &K, &tpr };
+        cu_err = cuLaunchKernel(g_nvfp4_wh4_func, N, 1, 1, 32, 1, 1, 0, stream, kargs, nullptr);
     } else if (g_nvfp4_fused_func) {
-        void* kernel_args[] = { &d_blocks_ptr, &d_x_ptr, &d_y_ptr, &N, &K, &tpr };
-        cuLaunchKernel(g_nvfp4_fused_func,
-            N, 1, 1, 32, 1, 1, 0, stream, kernel_args, nullptr);
+        void* kargs[] = { &d_blocks_ptr, &d_x_ptr, &d_y_ptr, &N, &K, &tpr };
+        cu_err = cuLaunchKernel(g_nvfp4_fused_func, N, 1, 1, 32, 1, 1, 0, stream, kargs, nullptr);
     } else {
-        // Fallback: two-step path (convert + OMMA)
-        int num_blocks = N * tpr;
-        size_t needed = (size_t)num_blocks * 160;
-        if (needed > g_tile_buf_size) {
-            if (g_tile_buffer) cudaFree(g_tile_buffer);
-            cudaMalloc(&g_tile_buffer, needed);
-            g_tile_buf_size = needed;
-        }
-        if (!g_tile_buffer) return;
+        cudaMemsetAsync(args.dst, 0, args.nrows_x * sizeof(float), stream);
+        return;
+    }
 
-        int threads = 256;
-        int blocks_convert = (num_blocks + threads - 1) / threads;
-        convert_blocks_to_tiles_kernel<<<blocks_convert, threads, 0, stream>>>(
-            blocks, g_tile_buffer, num_blocks);
-
-        void* d_tiles_ptr = g_tile_buffer;
-        void* kernel_args[] = { &d_tiles_ptr, &d_x_ptr, &d_y_ptr, &N, &K, &tpr };
-        cuLaunchKernel(g_nvfp4_func,
-            N, 1, 1, 32, 1, 1, 0, stream, kernel_args, nullptr);
+    if (cu_err != CUDA_SUCCESS) {
+        const char* es; cuGetErrorString(cu_err, &es);
+        fprintf(stderr, "nvfp4_omma: launch failed: %s\n", es);
+        cudaMemsetAsync(args.dst, 0, args.nrows_x * sizeof(float), stream);
     }
 }

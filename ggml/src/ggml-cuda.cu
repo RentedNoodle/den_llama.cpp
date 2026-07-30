@@ -1759,9 +1759,9 @@ static void ggml_cuda_op_mul_mat_cublas(
         ggml_cuda_pool_alloc<float> src0_ddq_as_f32(ctx.pool(id));
         ggml_cuda_pool_alloc<float> src1_ddq_as_f32(ctx.pool(id));
 
-        if (src0->type != GGML_TYPE_F32) {
+        if (src0->type != GGML_TYPE_F32 && src0->type != GGML_TYPE_NVFP4) {
             const to_fp32_cuda_t to_fp32_cuda = ggml_get_to_fp32_cuda(src0->type);
-            GGML_ASSERT(to_fp32_cuda != nullptr || src0->type == GGML_TYPE_NVFP4);
+            GGML_ASSERT(to_fp32_cuda != nullptr);
             src0_ddq_as_f32.alloc(row_diff*ne00);
             to_fp32_cuda(src0_dd_i, src0_ddq_as_f32.get(), row_diff, ne00, stream);
         }
