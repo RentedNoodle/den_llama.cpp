@@ -1,0 +1,225 @@
+// cluster_expert_reduce.cu — Thread Block Cluster expert reduction (sm_120a+)
+//
+// Implements an 8-block cluster DSMEM reduction for MoE expert FFN outputs.
+// Designed for GB203 (RTX 5070 Ti) with max cluster size = 8.
+//
+// Architecture:
+//   grid  = dim3(8 * n_tokens, 1, 1)   — one cluster of 8 per token
+//   block = dim3(256, 1, 1)
+//   cluster dim = dim3(8, 1, 1)
+//   Each block (SM) processes one expert's slice of the hidden dimension,
+//   tiles results through __shared__ memory, and cluster.sync() barriers
+//   enable block 0 to read all 8 experts' tiles via cluster DSMEM.
+//
+// Fallback: if cluster is not available or n_expert_used == 1, the caller
+// should use the standard mul_multi_add path. This kernel handles
+// n_expert_used ∈ [2, 8] with < 8 meaning some cluster blocks are idle.
+//
+// Input layout (mirrors mul_multi_add_f32):
+//   src0 = [n_embd, n_expert_used, n_tokens]  with strides nb01, nb02
+//   src1 = [1, n_expert_used, n_tokens]       with strides nb11, nb12
+//   dst  = [n_embd, n_tokens]
+
+#include "cluster_expert_reduce.cuh"
+#include "common.cuh"
+
+#include <cuda_runtime.h>
+#include <cooperative_groups.h>
+
+namespace cg = cooperative_groups;
+
+// Tile size for DSMEM communication. Must be ≤ (shared memory per block / 4).
+// With 99 KB SMEM per block on GB203, 256 floats = 1 KB fits easily.
+// Larger tiles reduce loop overhead but increase SMEM pressure.
+#define CLUSTER_TILE_SIZE 256
+#define CLUSTER_MAX_BLOCKS 8
+
+// =========================================================================
+// Kernel: cluster_expert_reduce
+//
+// Each cluster of 8 blocks processes one token's worth of expert reduction.
+// The work is tiled across n_embd in CLUSTER_TILE_SIZE chunks.
+//
+// __cluster_launch_bounds__ = (256, 2) means:
+//   - max_threads_per_block = 256
+//   - min_blocks_per_multiprocessor = 2 (enough for cluster occupancy)
+// =========================================================================
+__launch_bounds__(CLUSTER_TILE_SIZE, 2)
+__global__ void cluster_expert_reduce_kernel(
+    const float * __restrict__ src0,   // [n_embd, n_expert_used, n_tokens]
+    const float * __restrict__ src1,   // [1, n_expert_used, n_tokens]
+    float * __restrict__ dst,          // [n_embd, n_tokens]
+    const int n_embd,
+    const int n_expert_used,
+    const int n_tokens)
+{
+    // Cluster group — each cluster has up to 8 blocks
+    auto cluster = cg::this_cluster();
+    const int cluster_rank = (int)cluster.block_rank();
+    const int cluster_size = (int)cluster.num_blocks();
+
+    // Each cluster handles one token.
+    // Blocks are laid out as: [cluster_0_blk0..blk7, cluster_1_blk0..blk7, ...]
+    const int token_id = blockIdx.x / cluster_size;
+    const int expert_id = cluster_rank;
+
+    // Strides match mul_multi_add_f32 layout:
+    //   nb01 = n_embd * sizeof(float)   (stride between experts)
+    //   nb02 = n_embd * n_expert_used * sizeof(float) (stride between tokens)
+    //   nb11 = 1 * sizeof(float)        (stride between weights per expert)
+    //   nb12 = n_expert_used * sizeof(float) (stride between weight-sets per token)
+    const int64_t expert_stride = (int64_t)n_embd;
+    const int64_t token_stride  = (int64_t)n_embd * n_expert_used;
+    const int64_t w_expert_stride = 1;
+    const int64_t w_token_stride  = n_expert_used;
+
+    // Check bounds
+    if (token_id >= n_tokens) return;
+
+    // Distributed shared memory tile — each block in the cluster owns one tile
+    // that becomes visible cluster-wide after cluster.sync().
+    __shared__ float smem[CLUSTER_TILE_SIZE];
+
+    // Tile loop across the hidden dimension
+    for (int offset = 0; offset < n_embd; offset += CLUSTER_TILE_SIZE) {
+        const int tile = min(CLUSTER_TILE_SIZE, n_embd - offset);
+
+        // Phase 1: Each block loads its assigned expert's tile from src0.
+        // Blocks with expert_id >= n_expert_used still participate in cluster.sync()
+        // but their smem contents are unused.
+        if (expert_id < n_expert_used) {
+            const float * expert_slice = src0
+                + expert_id * expert_stride
+                + token_id  * token_stride
+                + offset;
+            #pragma unroll 4
+            for (int i = threadIdx.x; i < tile; i += blockDim.x) {
+                smem[i] = expert_slice[i];
+            }
+        }
+        // Ensure all threads in this block have finished writing before cluster sync
+        __syncthreads();
+
+        // Cluster-wide barrier: all 8 blocks' shared memory stores are now visible
+        cluster.sync();
+
+        // Phase 2: Block 0 reads all experts' tiles via cluster DSMEM,
+        // applies router weights, and writes the weighted sum to dst.
+        // Pre-map shared memory pointers for all experts — map_shared_rank
+        // returns a pointer valid until the next cluster.sync().
+        if (cluster_rank == 0) {
+            float * e_smem_ptrs[CLUSTER_MAX_BLOCKS];
+            for (int e = 0; e < n_expert_used; e++) {
+                e_smem_ptrs[e] = (float *)cluster.map_shared_rank(smem, e);
+            }
+            const float * w_slice = src1 + token_id * w_token_stride;
+            for (int i = threadIdx.x; i < tile; i += blockDim.x) {
+                float sum = 0.0f;
+                #pragma unroll
+                for (int e = 0; e < n_expert_used; e++) {
+                    sum += e_smem_ptrs[e][i] * w_slice[e * w_expert_stride];
+                }
+                dst[offset + i + (int64_t)token_id * n_embd] = sum;
+            }
+        }
+
+        // Phase 3: Ensure block 0 has finished reading before blocks overwrite smem.
+        // cluster.sync() is a collective barrier across ALL blocks.
+        cluster.sync();
+    }
+}
+
+// =========================================================================
+// Host-side launch function for cluster expert reduction.
+//
+// Uses cudaLaunchKernelEx() with cudaLaunchAttributeClusterDimension to
+// launch 8-block clusters. Falls back to normal launch if the extended
+// API is not available (older CUDA toolkit headers).
+// =========================================================================
+void ggml_cuda_cluster_expert_reduce(
+    const float * src0,
+    const float * src1,
+    float * dst,
+    int n_embd,
+    int n_expert_used,
+    int n_tokens,
+    cudaStream_t stream)
+{
+    // Validate: cluster reduction only handles 2-8 experts
+    if (n_expert_used <= 1 || n_expert_used > CLUSTER_MAX_BLOCKS) {
+        fprintf(stderr, "%s: n_expert_used=%d out of range [2, %d], falling back\n",
+            __func__, n_expert_used, CLUSTER_MAX_BLOCKS);
+        return;
+    }
+
+    // Determine cluster size: use n_expert_used rounded up to power-of-2?
+    // No — cluster size is fixed at 8 for the grid launch. Blocks with
+    // expert_id >= n_expert_used simply do no work after cluster.sync().
+    const int cluster_size = CLUSTER_MAX_BLOCKS;
+
+    // Grid: (cluster_size * n_tokens) blocks, arranged so contiguous
+    // cluster_size blocks form a thread block cluster.
+    dim3 grid_dim(cluster_size * n_tokens, 1, 1);
+    dim3 block_dim(CLUSTER_TILE_SIZE, 1, 1);
+
+    // Set up extended launch attributes for cluster dimension.
+    // cudaLaunchKernelExC (CUDA 12.0+) takes config, kernel func, and args as
+    // separate parameters. The config.attrs array specifies the cluster dimension.
+    cudaLaunchConfig_t launch_config = {0};
+    launch_config.gridDim = grid_dim;
+    launch_config.blockDim = block_dim;
+    launch_config.dynamicSmemBytes = 0;  // all smem is static
+    launch_config.stream = stream;
+
+    cudaLaunchAttribute cluster_attr;
+    cluster_attr.id = cudaLaunchAttributeClusterDimension;
+    cluster_attr.val.clusterDim.x = (unsigned int)cluster_size;
+    cluster_attr.val.clusterDim.y = 1;
+    cluster_attr.val.clusterDim.z = 1;
+
+    launch_config.attrs = &cluster_attr;
+    launch_config.numAttrs = 1;
+
+    // Kernel arguments — stored as an array of void* pointers
+    void * kernel_args[] = {
+        const_cast<float **>(&src0),
+        const_cast<float **>(&src1),
+        &dst,
+        &n_embd,
+        &n_expert_used,
+        &n_tokens
+    };
+
+    // Launch with cluster support
+    cudaError_t err = cudaLaunchKernelExC(
+        &launch_config,
+        (const void *)cluster_expert_reduce_kernel,
+        kernel_args);
+    if (err != cudaSuccess) {
+        fprintf(stderr, "%s: cudaLaunchKernelExC failed: %s\n",
+            __func__, cudaGetErrorString(err));
+    }
+}
+
+// =========================================================================
+// Query functions — check cluster availability
+// =========================================================================
+bool ggml_cuda_cluster_available(void) {
+    const auto & info = ggml_cuda_info();
+    for (int i = 0; i < info.device_count; i++) {
+        if (info.devices[i].cluster_capable) {
+            return true;
+        }
+    }
+    return false;
+}
+
+int ggml_cuda_cluster_max_size(void) {
+    if (!ggml_cuda_cluster_available()) {
+        return 0;
+    }
+    // GB203 (sm_120a) consumer limit: 8 blocks per cluster.
+    // Datacenter Blackwell (B200/B300) supports larger clusters,
+    // but this implementation targets the consumer limit.
+    return CLUSTER_MAX_BLOCKS;
+}

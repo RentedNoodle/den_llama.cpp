@@ -1,0 +1,382 @@
+// omma_dispatch.cu — OMMA.SF.16864 runtime dispatch for NVFP4 matmul on sm_120a
+//
+// Loads omma_gemv_proven.cubin via CUDA Driver API at runtime (NOT compile-time).
+// The cubin is compiled separately with CUDA 13.3 + sm_120a and contains:
+//   - gemv_nvfp4_omma  — OMMA.SF.16864 tensor core GEMV (placeholder→SW for now)
+//   - gemv_nvfp4_sw    — software dequant GEMV (reference fallback)
+//
+// Loading order:
+//   1. Embedded cubin (linked from omma_gemv_proven_embedded.cpp via linker symbols)
+//   2. $OMMA_CUBIN environment variable (full path)
+//   3. Filesystem search paths (working dir, cubins/, bin/cubins/)
+//
+// All operations are optional — if OMMA is unavailable, all entry points
+// return false and the caller uses the normal SW dequant + cuBLAS path.
+
+#include "omma_dispatch.cuh"
+
+#include <cuda.h>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+
+// ── Embedded cubin (linked from omma_gemv_proven_embedded.cpp) ──────────────
+// The C array omma_gemv_proven_cubin[] is compiled from the _embedded.cpp into
+// the llama library via src/CMakeLists.txt (DEFAULT_EMBED_CUBINS=ON).
+// Fallback: filesystem search for omma_gemv_proven.cubin on disk.
+extern "C" {
+    // Direct C array from omma_gemv_proven_embedded.cpp
+    extern const unsigned char omma_gemv_proven_cubin[];
+}
+// Known cubin size (updated when cubin is rebuilt) — used as fallback for C array path
+#define OMMA_CUBIN_EMBEDDED_SIZE 22584
+static const char * EMBEDDED_LABEL = "<embedded>";
+
+// ── NVFP4 block constants (mirrors ggml-common.h) ────────────────────────────
+#define QK_NVFP4      256
+#define TILE_BYTES    160
+
+// ── Logging ──────────────────────────────────────────────────────────────────
+#define OMMA_LOG_INFO(...)  fprintf(stderr, "omma: " __VA_ARGS__)
+#define OMMA_LOG_WARN(...)  fprintf(stderr, "omma: " __VA_ARGS__)
+
+// ── Module state ─────────────────────────────────────────────────────────────
+static CUmodule   g_omma_module  = nullptr;
+static CUfunction g_omma_func    = nullptr;  // gemv_nvfp4_omma (primary, OMMA HW)
+static CUfunction g_omma_sw_func = nullptr;  // gemv_nvfp4_sw (fallback)
+static bool       g_omma_ready   = false;
+static bool       g_omma_tried   = false;
+
+// ── Cubin search paths ───────────────────────────────────────────────────────
+static const char * g_cubin_search_paths[] = {
+    nullptr,  // placeholder for OMMA_CUBIN env var
+    "./cubins/omma_gemv_proven.cubin",
+    "./omma_gemv_proven.cubin",
+    "../cubins/omma_gemv_proven.cubin",
+    "../bin/cubins/omma_gemv_proven.cubin",
+    nullptr   // sentinel
+};
+
+// ── Try to load cubin from a file path ───────────────────────────────────────
+// Returns CUmodule on success, nullptr on failure.
+static CUmodule try_load_cubin(const char * path) {
+    if (!path || !path[0]) return nullptr;
+
+    FILE * fp = fopen(path, "rb");
+    if (!fp) return nullptr;
+
+    // Get file size
+    fseek(fp, 0, SEEK_END);
+    long sz = ftell(fp);
+    if (sz <= 0) { fclose(fp); return nullptr; }
+    rewind(fp);
+
+    // Read entire file
+    char * buf = (char *)malloc(sz);
+    if (!buf) { fclose(fp); return nullptr; }
+    size_t read_sz = fread(buf, 1, sz, fp);
+    fclose(fp);
+    if ((long)read_sz != sz) { free(buf); return nullptr; }
+
+    // Load as cubin via Driver API
+    CUmodule mod = nullptr;
+    CUresult err = cuModuleLoadData(&mod, buf);
+    free(buf);
+
+    if (err != CUDA_SUCCESS) {
+        OMMA_LOG_WARN("cuModuleLoadData failed (%d) for %s\n", (int)err, path);
+        return nullptr;
+    }
+    return mod;
+}
+
+// ── Try to load cubin from embedded data (linked-in C array) ─────────────────
+// Returns CUmodule on success, nullptr on failure.
+// The C array omma_gemv_proven_cubin[] comes from omma_gemv_proven_embedded.cpp
+// compiled into the llama library via src/CMakeLists.txt.
+static CUmodule try_load_embedded(void) {
+    CUmodule mod = nullptr;
+
+    // Load directly from the C array in the linked _embedded.cpp
+    CUresult err = cuModuleLoadData(&mod, omma_gemv_proven_cubin);
+    if (err == CUDA_SUCCESS && mod) {
+        OMMA_LOG_INFO("loaded embedded cubin via C array (~%d bytes)\n",
+                      (int)OMMA_CUBIN_EMBEDDED_SIZE);
+        return mod;
+    }
+
+    OMMA_LOG_WARN("cuModuleLoadData(embedded C array) failed (%d)\n", (int)err);
+    return nullptr;
+}
+
+// ── Initialize OMMA ─────────────────────────────────────────────────────────
+// Called once from ggml_cuda_init(). Checks compute capability, locates and
+// loads the cubin, and extracts kernel function pointers.
+bool ggml_cuda_omma_init(void) {
+    if (g_omma_tried) return g_omma_ready;
+    g_omma_tried = true;
+
+    // ── Check compute capability: OMMA requires sm_120a (cc 12.0) ────────
+    int cc_major = 0;
+    cudaError_t ce = cudaDeviceGetAttribute(&cc_major, cudaDevAttrComputeCapabilityMajor, 0);
+    if (ce != cudaSuccess || cc_major < 12) {
+        OMMA_LOG_INFO("sm_12x required (got sm_%d), OMMA disabled\n", cc_major);
+        return false;
+    }
+    OMMA_LOG_INFO("sm_%d detected, attempting cubin load\n", cc_major);
+
+    // ── Initialize CUDA Driver API ──────────────────────────────────────
+    CUresult err = cuInit(0);
+    if (err != CUDA_SUCCESS) {
+        OMMA_LOG_WARN("cuInit failed (%d)\n", (int)err);
+        return false;
+    }
+
+    // ── Retain primary context (shared between Runtime and Driver API) ──
+    CUdevice dev;
+    CUcontext omma_ctx = nullptr;
+    err = cuDeviceGet(&dev, 0);
+    if (err != CUDA_SUCCESS) {
+        OMMA_LOG_WARN("cuDeviceGet failed (%d)\n", (int)err);
+        return false;
+    }
+    err = cuDevicePrimaryCtxRetain(&omma_ctx, dev);
+    if (err != CUDA_SUCCESS) {
+        OMMA_LOG_WARN("cuDevicePrimaryCtxRetain failed (%d)\n", (int)err);
+        return false;
+    }
+
+    // ── Load cubin: try embedded first, then filesystem paths ────────────
+    CUmodule mod = nullptr;
+    const char * load_source = nullptr;
+
+    // 1) Try embedded cubin (linked from _embedded.cpp)
+    mod = try_load_embedded();
+    if (mod) {
+        load_source = EMBEDDED_LABEL;
+    }
+
+    // 2) Try OMMA_CUBIN env var override
+    if (!mod) {
+        const char * env_path = getenv("OMMA_CUBIN");
+        if (env_path && env_path[0]) {
+            g_cubin_search_paths[0] = env_path;
+            mod = try_load_cubin(env_path);
+            if (mod) load_source = env_path;
+        }
+    }
+
+    // 3) Try filesystem search paths
+    if (!mod) {
+        for (int i = 1; g_cubin_search_paths[i]; i++) {
+            mod = try_load_cubin(g_cubin_search_paths[i]);
+            if (mod) {
+                load_source = g_cubin_search_paths[i];
+                break;
+            }
+        }
+    }
+
+    if (!mod) {
+        OMMA_LOG_WARN("cubin not found (embedded or filesystem)\n");
+        OMMA_LOG_WARN("set OMMA_CUBIN env var or copy omma_gemv_proven.cubin to working dir\n");
+        return false;
+    }
+    OMMA_LOG_INFO("loaded cubin from %s\n", load_source);
+
+    // ── Extract kernel functions ────────────────────────────────────────
+    // Primary: gemv_nvfp4_omma (OMMA tensor core path)
+    CUfunction func_omma = nullptr;
+    err = cuModuleGetFunction(&func_omma, mod, "gemv_nvfp4_omma");
+    if (err == CUDA_SUCCESS && func_omma) {
+        g_omma_func = func_omma;
+        OMMA_LOG_INFO("OMMA kernel gemv_nvfp4_omma resolved\n");
+    } else {
+        OMMA_LOG_WARN("cuModuleGetFunction(gemv_nvfp4_omma) failed (%d) — "
+                       "cubin may be outdated, OMMA path unavailable\n", (int)err);
+    }
+
+    // Fallback: gemv_nvfp4_sw (software dequant path)
+    CUfunction func_sw = nullptr;
+    err = cuModuleGetFunction(&func_sw, mod, "gemv_nvfp4_sw");
+    if (err == CUDA_SUCCESS && func_sw) {
+        g_omma_sw_func = func_sw;
+        OMMA_LOG_INFO("SW kernel gemv_nvfp4_sw resolved (fallback)\n");
+    } else {
+        OMMA_LOG_WARN("cuModuleGetFunction(gemv_nvfp4_sw) failed (%d)\n", (int)err);
+    }
+
+    // Must have at least one kernel
+    if (!g_omma_func && !g_omma_sw_func) {
+        OMMA_LOG_WARN("no usable NVFP4 GEMV kernel found in cubin\n");
+        cuModuleUnload(mod);
+        return false;
+    }
+
+    g_omma_module = mod;  // retained for module lifetime / future shutdown
+    g_omma_ready  = true;
+
+    OMMA_LOG_INFO("OMMA.SF.16864 dispatch READY (omma=%s, sw=%s)\n",
+                  g_omma_func ? "YES" : "NO",
+                  g_omma_sw_func ? "YES" : "NO");
+    return true;
+}
+
+// ── Check OMMA availability ─────────────────────────────────────────────────
+bool ggml_cuda_omma_available(void) {
+    return g_omma_ready;
+}
+
+// ── Launch OMMA GEMV for NVFP4 weight tensor ────────────────────────────────
+// Returns true on successful launch.
+// The cubin kernel signature (both SW and OMMA entry points):
+//   gemv_nvfp4_*(const uint8_t* tiles, const float* x, float* y, int N, int tpr)
+//   Grid: (N, 1, 1)   — one block per output row
+//   Block: (32, 1, 1) — one warp (no shared memory needed)
+bool ggml_cuda_omma_gemv(const struct ggml_tensor * src0,
+                          const struct ggml_tensor * src1,
+                          struct ggml_tensor * dst,
+                          cudaStream_t stream) {
+    if (!g_omma_ready) return false;
+
+    // Pick kernel: OMMA first, SW fallback
+    CUfunction func = g_omma_func ? g_omma_func : g_omma_sw_func;
+    if (!func) return false;
+
+    // Validate types
+    if (src0->type != GGML_TYPE_NVFP4) return false;
+    if (src1->type != GGML_TYPE_F32) return false;
+    if (dst->type  != GGML_TYPE_F32) return false;
+
+    // Only GEMV: single column of input
+    if (src1->ne[1] != 1) return false;
+
+    const int64_t K   = src0->ne[0];  // input dimension
+    const int64_t N   = src0->ne[1];  // output dimension (number of rows)
+    const int     tpr = (int)(K / QK_NVFP4);  // tiles per row
+
+    if (K == 0 || N == 0 || tpr == 0) return false;
+
+    // Get device pointers from CUDA-backed tensors
+    const uint8_t * d_tiles = (const uint8_t *)src0->data;
+    const float   * d_x     = (const float   *)src1->data;
+    float         * d_y     = (float         *)dst->data;
+
+    // Kernel signature: gemv_nvfp4_*(tiles, x, y, N, tpr) — 5 args
+    // Use non-const copies for cuLaunchKernel arg array (avoids -Wcast-qual)
+    int n_blocks = (int)N;
+    int tpr_val  = tpr;
+    void * args[] = {
+        (void *)&d_tiles,
+        (void *)&d_x,
+        (void *)&d_y,
+        (void *)&n_blocks,
+        (void *)&tpr_val
+    };
+
+    int blocks = (int)N;
+    if (blocks < 1) blocks = 1;
+
+    CUresult err = cuLaunchKernel(func,
+                                  (unsigned int)blocks, 1, 1,   // grid dims
+                                  32, 1, 1,                    // block dims (1 warp)
+                                  0,                            // shared mem bytes
+                                  stream,                       // stream for async launch
+                                  args,                         // kernel arguments
+                                  nullptr);                     // extra options
+
+    if (err != CUDA_SUCCESS) {
+        OMMA_LOG_WARN("cuLaunchKernel failed (%d), falling back to SW path\n", (int)err);
+        return false;
+    }
+
+    // Check for launch errors via Runtime API
+    cudaError_t ce = cudaGetLastError();
+    if (ce != cudaSuccess) {
+        OMMA_LOG_WARN("launch error (%d): %s\n", (int)ce, cudaGetErrorString(ce));
+        return false;
+    }
+
+    return true;
+}
+
+// ── Launch OMMA GEMM (multi-column) for NVFP4 weight tensor ─────────────────
+// Launches one GEMV per column.  Each column computes y[*,col] = W * x[*,col].
+// Grid: (N, 1, 1) — N blocks for rows.
+// Block: (32, 1, 1) — one warp per output element.
+bool ggml_cuda_omma_gemm(const struct ggml_tensor * src0,
+                          const struct ggml_tensor * src1,
+                          struct ggml_tensor * dst,
+                          cudaStream_t stream) {
+    if (!g_omma_ready) return false;
+
+    // Pick kernel: OMMA first, SW fallback
+    CUfunction func = g_omma_func ? g_omma_func : g_omma_sw_func;
+    if (!func) return false;
+
+    // Validate types
+    if (src0->type != GGML_TYPE_NVFP4) return false;
+    if (src1->type != GGML_TYPE_F32) return false;
+    if (dst->type  != GGML_TYPE_F32) return false;
+
+    // Multi-column matmul (M columns in input = batch dimension)
+    const int64_t K = src0->ne[0];  // input dimension
+    const int64_t N = src0->ne[1];  // output dimension
+    const int64_t M = src1->ne[1];  // number of columns (batch size)
+    const int     tpr = (int)(K / QK_NVFP4);  // tiles per row
+
+    if (K == 0 || N == 0 || M < 1 || tpr == 0) return false;
+    if (M > 32) return false;  // too many columns for per-column launch
+
+    // Validate shape consistency
+    if (src1->ne[0] != K) return false;
+    if (dst->ne[0]  != N) return false;
+    if (dst->ne[1]  != M) return false;
+
+    // Get device pointers
+    const uint8_t * d_tiles = (const uint8_t *)src0->data;
+    const float   * d_x_all = (const float   *)src1->data;
+    float         * d_y_all = (float         *)dst->data;
+
+    // Kernel signature: gemv_nvfp4_*(tiles, x, y, N, tpr) — 5 args
+    // Launch one GEMV per column, offsetting x and y pointers
+    int n_blocks = (int)N;
+    int tpr_val  = tpr;
+    for (int64_t col = 0; col < M; col++) {
+        const float * d_x = d_x_all + col * K;
+        float       * d_y = d_y_all + col * N;
+
+        void * args[] = {
+            (void *)&d_tiles,
+            (void *)&d_x,
+            (void *)&d_y,
+            (void *)&n_blocks,
+            (void *)&tpr_val
+        };
+
+        int blocks = (int)N;
+        if (blocks < 1) blocks = 1;
+
+        CUresult err = cuLaunchKernel(func,
+                                      (unsigned int)blocks, 1, 1,   // grid dims
+                                      32, 1, 1,                    // block dims (1 warp)
+                                      0,                            // shared mem bytes
+                                      stream,                       // stream for async launch
+                                      args,                         // kernel arguments
+                                      nullptr);                     // extra options
+
+        if (err != CUDA_SUCCESS) {
+            OMMA_LOG_WARN("cuLaunchKernel[col=%lld] failed (%d), falling back\n", (long long)col, (int)err);
+            return false;
+        }
+    }
+
+    // Check for launch errors via Runtime API
+    cudaError_t ce = cudaGetLastError();
+    if (ce != cudaSuccess) {
+        OMMA_LOG_WARN("GEMM launch error (%d): %s\n", (int)ce, cudaGetErrorString(ce));
+        return false;
+    }
+
+    return true;
+}

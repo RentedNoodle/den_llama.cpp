@@ -1,0 +1,524 @@
+// CUDA expert cache GPU operations.
+
+#include <cstdio>
+
+// ── Dedicated DMA stream for expert weight prefetch ─────────────────────────
+// Operations on this stream can overlap with compute on the main CUDA stream,
+// hiding expert weight PCIe transfers behind layer computation.
+static cudaStream_t g_dma_stream = nullptr;
+static cudaEvent_t  g_dma_event  = nullptr;
+
+static cudaStream_t get_dma_stream() {
+    if (!g_dma_stream) {
+        cudaStreamCreateWithFlags(&g_dma_stream, cudaStreamNonBlocking);
+        cudaEventCreate(&g_dma_event);
+    }
+    return g_dma_stream;
+}
+
+// ============================================================================
+// Global GPU router state — tracks allocated router weights per model.
+// ============================================================================
+// The router state is keyed by an opaque model pointer (llama_context *).
+// Since ggml-cuda cannot include llama-context.h, we store all necessary
+// router state here and look it up by the model pointer on each call.
+
+#define GPU_ROUTER_MAX_MODELS 8
+#define GPU_ROUTER_MAX_HOST_TENSORS 16384
+
+// Entry for a CPU-side tensor that should be registered for GPU DMA.
+struct gpu_router_host_tensor {
+    const void * ptr;    // CPU memory pointer
+    size_t       size;   // size in bytes
+};
+
+struct gpu_router_model_state {
+    void       * model;           // opaque model pointer (llama_context *) — lookup key
+    float      * weights_d;       // GPU device pointer: [n_expert, n_embd] F32
+    const float * weights_h;      // CPU host pointer: [n_expert, n_embd] F32 (set before upload)
+    int         n_expert;         // number of experts
+    int         n_embd;           // hidden dimension
+    bool        allocated;        // cudaMalloc succeeded
+    bool        uploaded;         // cudaMemcpy H2D completed
+    bool        host_registered;  // cudaHostRegister has been called for all tensors
+
+    // List of CPU tensors registered for GPU DMA access.
+    // Populated by llama_expert_cache_register_tensor() calls from the caller.
+    gpu_router_host_tensor host_tensors[GPU_ROUTER_MAX_HOST_TENSORS];
+    int n_host_tensors;
+};
+
+static struct gpu_router_model_state g_router_states[GPU_ROUTER_MAX_MODELS];
+static int g_n_router_states = 0;
+
+// Find or create the router state for the given model pointer.
+// Returns NULL if the table is full.
+static struct gpu_router_model_state * gpu_router_find_or_create(void * model) {
+    for (int i = 0; i < g_n_router_states; i++) {
+        if (g_router_states[i].model == model) {
+            return &g_router_states[i];
+        }
+    }
+    if (g_n_router_states >= GPU_ROUTER_MAX_MODELS) {
+        fprintf(stderr, "ggml-cuda-expert: router state table full (%d models)\n",
+                GPU_ROUTER_MAX_MODELS);
+        return nullptr;
+    }
+    struct gpu_router_model_state * s = &g_router_states[g_n_router_states++];
+    memset(s, 0, sizeof(*s));
+    s->model = model;
+    return s;
+}
+
+// Find an existing router state for the given model.  Returns NULL if not found.
+static struct gpu_router_model_state * gpu_router_find(void * model) {
+    for (int i = 0; i < g_n_router_states; i++) {
+        if (g_router_states[i].model == model) {
+            return &g_router_states[i];
+        }
+    }
+    return nullptr;
+}
+
+// Remove and free all resources for a model's router state.
+static void gpu_router_state_remove(void * model) {
+    for (int i = 0; i < g_n_router_states; i++) {
+        if (g_router_states[i].model == model) {
+            if (g_router_states[i].weights_d) {
+                cudaError_t err = cudaFree(g_router_states[i].weights_d);
+                if (err != cudaSuccess && err != cudaErrorCudartUnloading) {
+                    fprintf(stderr, "ggml-cuda-expert: cudaFree in remove failed: %s\n",
+                            cudaGetErrorString(err));
+                }
+            }
+            // Compact the table
+            memmove(&g_router_states[i], &g_router_states[i + 1],
+                    (size_t)(g_n_router_states - i - 1) * sizeof(g_router_states[0]));
+            g_n_router_states--;
+            return;
+        }
+    }
+}
+
+// Thin wrappers that are injected into llama_expert_cache via callbacks.
+// This file is compiled as part of the ggml CUDA backend.
+
+#include <cuda_runtime.h>
+#include <cstdio>
+#include <cstdint>
+#include <cstdlib>
+#include <cstring>
+#include <vector>
+#include <mutex>
+
+// Forward declaration — the header lives in the llama library, not in ggml's include path.
+// We only need the setter function; no types from the header are used here.
+void llama_expert_cache_set_gpu_ops(
+    void* (*alloc_fn)(size_t),
+    void  (*free_fn)(void*),
+    bool  (*copy_async_fn)(void*, const void*, size_t),
+    void  (*sync_fn)(void),
+    bool  (*mem_info_fn)(size_t*, size_t*));
+
+// Forward declare the ggml CUDA device allocator and device query
+extern cudaError_t ggml_cuda_device_malloc(void ** ptr, size_t size, int device);
+extern int         ggml_cuda_get_device(void);
+
+// VMM-style alloc: use managed memory so GPU page faults migrate data
+// transparently. No explicit DMA management needed.
+static void * cuda_alloc(size_t size) {
+    void * ptr = nullptr;
+    // Use cudaMallocManaged with default advice — GPU page faults handle migration.
+    // Combined with cudaHostRegister on CPU source data, this creates a
+    // unified virtual address space where the GPU hardware manages residency.
+    cudaError_t err = cudaMallocManaged(&ptr, size, cudaMemAttachGlobal);
+    if (err != cudaSuccess) {
+        // Fallback to regular device memory
+        int device = ggml_cuda_get_device();
+        err = ggml_cuda_device_malloc(&ptr, size, device);
+        if (err != cudaSuccess) {
+            fprintf(stderr, "ggml-cuda-expert: alloc %zu failed: %s\n", size, cudaGetErrorString(err));
+            return nullptr;
+        }
+    }
+    return ptr;
+}
+
+// GPU free wrapper
+static void cuda_free(void * ptr) {
+    if (ptr) {
+        cudaError_t err = cudaFree(ptr);
+        if (err != cudaSuccess) {
+            fprintf(stderr, "ggml-cuda-expert: free failed: %s\n", cudaGetErrorString(err));
+        }
+    }
+}
+
+// Async copy host → device
+static bool cuda_copy_async(void * dst, const void * src, size_t size) {
+    cudaError_t err = cudaMemcpyAsync(dst, src, size, cudaMemcpyHostToDevice, get_dma_stream());
+    if (err != cudaSuccess) {
+        fprintf(stderr, "ggml-cuda-expert: memcpy %zu failed: %s\n", size, cudaGetErrorString(err));
+        return false;
+    }
+    return true;
+}
+
+// Synchronize default stream
+static void cuda_sync(void) {
+    // Record event on DMA stream, wait on compute stream (true overlap)
+    if (g_dma_stream && g_dma_event) {
+        cudaEventRecord(g_dma_event, g_dma_stream);
+        cudaStreamWaitEvent(cudaStreamPerThread, g_dma_event, 0);
+    }
+    cudaStreamSynchronize(cudaStreamPerThread);
+}
+
+// Get device memory info
+static bool cuda_mem_info(size_t * free, size_t * total) {
+    cudaError_t err = cudaMemGetInfo(free, total);
+    if (err != cudaSuccess) {
+        fprintf(stderr, "ggml-cuda-expert: mem info failed: %s\n", cudaGetErrorString(err));
+        return false;
+    }
+    return true;
+}
+
+// Register CPU memory for direct GPU access (demand-paged PCIe).
+// Replaces explicit cudaMemcpy with hardware-managed on-demand transfers.
+// Called once per expert tensor during cache init.
+extern "C" bool llama_expert_cache_host_register(const void * ptr, size_t size) {
+    if (!ptr || !size) return false;
+    cudaError_t err = cudaHostRegister((void*)ptr, size, cudaHostRegisterPortable | cudaHostRegisterMapped);
+    if (err == cudaErrorHostMemoryAlreadyRegistered) return true; // idempotent
+    if (err != cudaSuccess) {
+        fprintf(stderr, "ggml-cuda-expert: cudaHostRegister(%zu) failed: %s\n", size, cudaGetErrorString(err));
+        return false;
+    }
+    return true;
+}
+
+// ============================================================================
+// Pinned-memory ring buffer for expert weight streaming + hidden-state MoE routing
+// ============================================================================
+//
+// Uses cudaHostAlloc with cudaHostAllocMapped so the buffer is both CPU-writable
+// and GPU-readable via the PCIe bus — no explicit cudaMemcpy needed for the GPU
+// router hot path.  Ring semantics: oldest entries are silently overwritten when
+// the buffer is full (FIFO with bounded capacity).
+//
+// Each "item" in the ring is item_size bytes.  For the hidden-state router,
+// item_size = n_embd * sizeof(float).  For expert weight tiles, item_size is
+// the per-expert tile payload.
+//
+// Thread-safe: all public functions lock an internal mutex.
+
+struct ring_buffer {
+    uint8_t * data;        // pinned host memory (cudaHostAllocMapped — GPU-visible)
+    uint8_t * data_d;      // device pointer to the same physical buffer
+    volatile int head;     // write cursor: next slot to write into
+    volatile int tail;     // read cursor: oldest still-valid slot
+    int capacity;          // max item count
+    int item_size;         // bytes per item
+    volatile int count;    // number of items currently stored (0..capacity)
+    std::mutex mtx;        // protects all volatile fields + data writes
+};
+
+// ── Allocate ─────────────────────────────────────────────────────────────────
+// capacity : max number of items
+// item_size: bytes per item
+// Returns an opaque ring_buffer * on success, nullptr on failure.
+extern "C" void * llama_ring_buffer_alloc(int capacity, int item_size) {
+    if (capacity <= 0 || item_size <= 0) return nullptr;
+
+    ring_buffer * rb = nullptr;
+    try {
+        rb = new ring_buffer();
+    } catch (...) {
+        return nullptr;
+    }
+
+    rb->capacity  = capacity;
+    rb->item_size = item_size;
+    rb->head      = 0;
+    rb->tail      = 0;
+    rb->count     = 0;
+
+    const size_t total_bytes = (size_t)capacity * (size_t)item_size;
+    cudaError_t err = cudaHostAlloc(&rb->data, total_bytes,
+                                     cudaHostAllocMapped | cudaHostAllocPortable);
+    if (err != cudaSuccess) {
+        fprintf(stderr, "llama_ring_buffer_alloc: cudaHostAlloc(%zu) failed: %s\n",
+                total_bytes, cudaGetErrorString(err));
+        delete rb;
+        return nullptr;
+    }
+
+    // Get the device pointer for direct GPU access (no cudaMemcpy needed).
+    err = cudaHostGetDevicePointer(&rb->data_d, rb->data, 0);
+    if (err != cudaSuccess) {
+        fprintf(stderr, "llama_ring_buffer_alloc: cudaHostGetDevicePointer failed: %s\n",
+                cudaGetErrorString(err));
+        cudaFreeHost(rb->data);
+        delete rb;
+        return nullptr;
+    }
+
+    // Zero-init the buffer so uninitialised reads are deterministic.
+    memset(rb->data, 0, total_bytes);
+
+    return (void *)rb;
+}
+
+// ── Free ─────────────────────────────────────────────────────────────────────
+extern "C" void llama_ring_buffer_free(void * buf) {
+    if (!buf) return;
+    ring_buffer * rb = (ring_buffer *)buf;
+    if (rb->data) {
+        cudaError_t err = cudaFreeHost(rb->data);
+        if (err != cudaSuccess && err != cudaErrorCudartUnloading) {
+            fprintf(stderr, "llama_ring_buffer_free: cudaFreeHost failed: %s\n",
+                    cudaGetErrorString(err));
+        }
+    }
+    delete rb;
+}
+
+// ── Push ─────────────────────────────────────────────────────────────────────
+// Copies |data| (item_size bytes) into the ring.  If the buffer is already full
+// the oldest entry is silently overwritten (ring semantics).
+// Returns true on success, false if any argument is invalid.
+extern "C" bool llama_ring_buffer_push(void * buf, const void * data) {
+    if (!buf || !data) return false;
+    ring_buffer * rb = (ring_buffer *)buf;
+
+    std::lock_guard<std::mutex> lock(rb->mtx);
+
+    // Advance tail when overwriting a full buffer.
+    if (rb->count == rb->capacity) {
+        rb->tail = (rb->tail + 1) % rb->capacity;
+    }
+
+    const size_t offset = (size_t)rb->head * (size_t)rb->item_size;
+    memcpy(rb->data + offset, data, (size_t)rb->item_size);
+
+    rb->head = (rb->head + 1) % rb->capacity;
+    if (rb->count < rb->capacity) {
+        rb->count++;
+    }
+
+    return true;
+}
+
+// ── Read last ────────────────────────────────────────────────────────────────
+// Copies the most recently pushed item into |out| (must be at least item_size).
+// Returns 0 on success, -1 if the buffer is empty.
+extern "C" int llama_ring_buffer_read_last(void * buf, void * out) {
+    if (!buf || !out) return -1;
+    ring_buffer * rb = (ring_buffer *)buf;
+
+    std::lock_guard<std::mutex> lock(rb->mtx);
+
+    if (rb->count == 0) return -1;
+
+    const int idx = (rb->head - 1 + rb->capacity) % rb->capacity;
+    const size_t offset = (size_t)idx * (size_t)rb->item_size;
+    memcpy(out, rb->data + offset, (size_t)rb->item_size);
+
+    return 0;
+}
+
+// ── Device pointer ───────────────────────────────────────────────────────────
+// Returns a GPU-accessible (device) pointer to item at |index| (0 = oldest,
+// capacity-1 = newest).  Pass index = -1 for the most recent entry.
+// Returns nullptr if the buffer is empty or |index| is out of range.
+extern "C" void * llama_ring_buffer_get_device_ptr(void * buf, int index) {
+    if (!buf) return nullptr;
+    ring_buffer * rb = (ring_buffer *)buf;
+    if (rb->count == 0) return nullptr;
+
+    // Resolve logical index into a physical slot.
+    int phys;
+    if (index < 0) {
+        // "most recent"
+        phys = (rb->head - 1 + rb->capacity) % rb->capacity;
+    } else if (index < rb->count) {
+        phys = (rb->tail + index) % rb->capacity;
+    } else {
+        return nullptr;
+    }
+
+    return rb->data_d + (size_t)phys * (size_t)rb->item_size;
+}
+
+// ── Query capacity (debug / diagnostics) ─────────────────────────────────────
+extern "C" int llama_ring_buffer_count(void * buf) {
+    if (!buf) return 0;
+    ring_buffer * rb = (ring_buffer *)buf;
+    return rb->count;
+}
+
+extern "C" int llama_ring_buffer_capacity(void * buf) {
+    if (!buf) return 0;
+    ring_buffer * rb = (ring_buffer *)buf;
+    return rb->capacity;
+}
+
+// ============================================================================
+// GPU-side MoE router — fused hidden_state × router_weight^T → softmax → top-k
+// ============================================================================
+//
+// Replaces CPU-side router (llama_expert_cpu_router_predict) with a CUDA kernel.
+// Router weights are uploaded once during init, hidden states come from the
+// GPU ring buffer.  Expert IDs are copied back to CPU for prefetch dispatch.
+
+#include "gpu_router.cuh"
+
+// Allocate GPU buffer for router weights.  Returns nullptr on failure.
+// Layout: [n_layer, n_expert, n_embd] contiguous F32 on GPU.
+// The caller fills weights with cudaMemcpy after allocation (layer-major).
+extern "C" float * llama_gpu_router_alloc_weights(size_t n_floats) {
+    if (n_floats == 0) return nullptr;
+    float * ptr = nullptr;
+    cudaError_t err = cudaMalloc(&ptr, n_floats * sizeof(float));
+    if (err != cudaSuccess) {
+        fprintf(stderr, "llama_gpu_router_alloc_weights(%zu) failed: %s\n",
+                n_floats, cudaGetErrorString(err));
+        return nullptr;
+    }
+    return ptr;
+}
+
+// Upload router weights from host to GPU in one shot.
+// Returns true on success, false on error.
+extern "C" bool llama_gpu_router_upload_weights(float * gpu_ptr, const float * host_ptr, size_t n_floats) {
+    if (!gpu_ptr || !host_ptr || n_floats == 0) return false;
+    cudaError_t err = cudaMemcpy(gpu_ptr, host_ptr,
+                                  n_floats * sizeof(float), cudaMemcpyHostToDevice);
+    if (err != cudaSuccess) {
+        fprintf(stderr, "llama_gpu_router_upload_weights(%zu) failed: %s\n",
+                n_floats, cudaGetErrorString(err));
+        return false;
+    }
+    return true;
+}
+
+extern "C" void llama_gpu_router_free_weights(float * ptr) {
+    if (ptr) {
+        cudaError_t err = cudaFree(ptr);
+        if (err != cudaSuccess && err != cudaErrorCudartUnloading) {
+            fprintf(stderr, "llama_gpu_router_free_weights: %s\n", cudaGetErrorString(err));
+        }
+    }
+}
+
+// Run GPU router: hidden_state [1, n_embd] × router_weight [n_expert, n_embd]^T
+// → softmax → top-k, returning expert IDs on CPU.
+//
+// router_weights_d:  GPU pointer to [n_layers_to_check, n_expert, n_embd] F32
+// hidden_state_d:    GPU pointer to [1, n_embd] F32 (NOT the ring buffer — raw GPU ptr)
+// out_experts:       CPU buffer for unique expert IDs (caller provides at least max_experts entries)
+// max_experts:       capacity of out_experts
+//
+// Returns number of unique expert IDs written.
+extern "C" uint32_t llama_gpu_router_predict(
+    const float * router_weights_d,  // [n_layers_to_check, n_expert, n_embd] on GPU
+    const float * hidden_state_d,    // [1, n_embd] on GPU
+    uint32_t n_layers_to_check,
+    uint32_t n_expert,
+    uint32_t n_embd,
+    uint32_t n_expert_used,
+    uint32_t * out_experts,          // CPU output buffer
+    uint32_t max_experts) {
+
+    if (!router_weights_d || !hidden_state_d || !out_experts) {
+        return 0;
+    }
+    if (n_expert < 2 || n_embd < 1 || n_expert_used < 1) {
+        return 0;
+    }
+
+    // Check n_expert is power of 2 (required by gpu_router_kernel template dispatch)
+    if ((n_expert & (n_expert - 1)) != 0 || n_expert > 512) {
+        fprintf(stderr, "llama_gpu_router_predict: n_expert=%u must be power of 2 and <= 512\n", n_expert);
+        return 0;
+    }
+
+    // Allocate temporary GPU buffers for intermediate results
+    const size_t ids_size     = (size_t)n_layers_to_check * n_expert_used * sizeof(int32_t);
+    const size_t weights_size = (size_t)n_layers_to_check * n_expert_used * sizeof(float);
+    int32_t * expert_ids_d = nullptr;
+    float   * expert_weights_d = nullptr;
+    cudaError_t err;
+
+    err = cudaMalloc(&expert_ids_d, ids_size);
+    if (err != cudaSuccess) {
+        fprintf(stderr, "llama_gpu_router_predict: ids alloc failed: %s\n", cudaGetErrorString(err));
+        return 0;
+    }
+    err = cudaMalloc(&expert_weights_d, weights_size);
+    if (err != cudaSuccess) {
+        fprintf(stderr, "llama_gpu_router_predict: weights alloc failed: %s\n", cudaGetErrorString(err));
+        cudaFree(expert_ids_d);
+        return 0;
+    }
+
+    // Launch per-layer: for each checked layer, route the same hidden state
+    for (uint32_t il = 0; il < n_layers_to_check; il++) {
+        const float * layer_weights_d = router_weights_d + (size_t)il * n_expert * n_embd;
+        int32_t *     layer_ids_d     = expert_ids_d     + (size_t)il * n_expert_used;
+        float *       layer_wts_d     = expert_weights_d + (size_t)il * n_expert_used;
+
+        launch_gpu_router_f32(hidden_state_d, layer_weights_d,
+                              layer_ids_d, layer_wts_d,
+                              1, (int)n_embd, (int)n_expert, (int)n_expert_used);
+    }
+
+    // Synchronize before reading back
+    cudaStreamSynchronize(0);
+
+    // Read back expert IDs from GPU and deduplicate into out_experts
+    std::vector<int32_t> all_ids((size_t)n_layers_to_check * n_expert_used);
+    err = cudaMemcpy(all_ids.data(), expert_ids_d, ids_size, cudaMemcpyDeviceToHost);
+    if (err != cudaSuccess) {
+        fprintf(stderr, "llama_gpu_router_predict: readback failed: %s\n", cudaGetErrorString(err));
+        cudaFree(expert_ids_d);
+        cudaFree(expert_weights_d);
+        return 0;
+    }
+
+    // Deduplicate: insert unique IDs into output buffer
+    uint32_t n_written = 0;
+    for (size_t i = 0; i < (size_t)n_layers_to_check * n_expert_used && n_written < max_experts; i++) {
+        int32_t eid = all_ids[i];
+        if (eid < 0) continue;
+        // Check if already present (linear scan — small buffer)
+        bool dup = false;
+        for (uint32_t j = 0; j < n_written; j++) {
+            if (out_experts[j] == (uint32_t)eid) {
+                dup = true;
+                break;
+            }
+        }
+        if (!dup) {
+            out_experts[n_written++] = (uint32_t)eid;
+        }
+    }
+
+    cudaFree(expert_ids_d);
+    cudaFree(expert_weights_d);
+    return n_written;
+}
+
+// Register GPU operations with the expert cache.
+// Called once during CUDA backend initialization.
+void ggml_cuda_expert_cache_init(void) {
+    llama_expert_cache_set_gpu_ops(
+        cuda_alloc,
+        cuda_free,
+        cuda_copy_async,
+        cuda_sync,
+        cuda_mem_info
+    );
+}
+

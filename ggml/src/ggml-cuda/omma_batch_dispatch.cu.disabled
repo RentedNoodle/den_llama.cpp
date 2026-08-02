@@ -1,0 +1,172 @@
+// omma_batch_dispatch.cu — OMMA batch GEMM runtime dispatch for MoE
+//
+// Loads omma_batch_gemm.cubin at runtime and dispatches batched GEMM
+// calls for MoE expert computation using OMMA.SF.16864 tensor cores.
+//
+// Falls back to false if cubin not found or sm < 12.0.
+
+#include "omma_batch_dispatch.cuh"
+#include "common.cuh"
+
+#include <cuda.h>
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+
+// Embedded cubin (from cubins/omma_batch_gemm_embedded.cpp, linked via llama library)
+// The C array omma_batch_gemm_cubin[] is compiled from _embedded.cpp into
+// the llama library via src/CMakeLists.txt.
+extern "C" {
+    extern const unsigned char omma_batch_gemm_cubin[];
+}
+// Known cubin size (for logging)
+#define OMMA_BATCH_CUBIN_EMBEDDED_SIZE 17968
+
+#define OMMA_LOG(...)  fprintf(stderr, "omma_batch: " __VA_ARGS__)
+
+// ── Module state ─────────────────────────────────────────────────────────────
+static CUmodule   g_batch_mod   = nullptr;
+static CUfunction g_batch_func  = nullptr;
+static CUfunction g_moe_func    = nullptr;
+static bool       g_batch_ready = false;
+static bool       g_batch_tried = false;
+
+// Cubin search paths
+static const char * g_search_paths[] = {
+    nullptr,  // placeholder for OMMA_CUBIN_DIR env var
+    "./cubins/omma_batch_gemm.cubin",
+    "./omma_batch_gemm.cubin",
+    "../cubins/omma_batch_gemm.cubin",
+    nullptr
+};
+
+static CUmodule try_load(const char * path) {
+    if (!path || !path[0]) return nullptr;
+    FILE * fp = fopen(path, "rb");
+    if (!fp) return nullptr;
+    fseek(fp, 0, SEEK_END);
+    long sz = ftell(fp);
+    if (sz <= 0) { fclose(fp); return nullptr; }
+    rewind(fp);
+    char * buf = (char *)malloc(sz);
+    if (!buf) { fclose(fp); return nullptr; }
+    size_t read_sz = fread(buf, 1, sz, fp);
+    fclose(fp);
+    if ((long)read_sz != sz) { free(buf); return nullptr; }
+    CUmodule mod = nullptr;
+    CUresult err = cuModuleLoadData(&mod, buf);
+    free(buf);
+    if (err != CUDA_SUCCESS) {
+        OMMA_LOG("cuModuleLoadData failed (%d) for %s\n", (int)err, path);
+        return nullptr;
+    }
+    return mod;
+}
+
+bool ggml_cuda_omma_batch_init(void) {
+    if (g_batch_tried) return g_batch_ready;
+    g_batch_tried = true;
+
+    // Check sm >= 12.0
+    int dev = 0;
+    cudaError_t ce = cudaGetDevice(&dev);
+    if (ce != cudaSuccess) return false;
+    cudaDeviceProp prop;
+    ce = cudaGetDeviceProperties(&prop, dev);
+    if (ce != cudaSuccess || prop.major < 12) {
+        OMMA_LOG("sm %d < 12, OMMA batch GEMM not available\n", prop.major);
+        return false;
+    }
+
+    // Try embedded cubin FIRST (linked via llama library, C array from _embedded.cpp)
+    {
+        CUmodule mod = nullptr;
+        CUresult err = cuModuleLoadData(&mod, omma_batch_gemm_cubin);
+        if (err == CUDA_SUCCESS && mod) {
+            g_batch_mod = mod;
+            cuModuleGetFunction(&g_batch_func, mod, "omma_batch_gemm_kernel");
+            cuModuleGetFunction(&g_moe_func,   mod, "omma_moe_batch_kernel");
+            if (g_batch_func) {
+                g_batch_ready = true;
+                OMMA_LOG("loaded embedded cubin (~%d bytes)\n",
+                         (int)OMMA_BATCH_CUBIN_EMBEDDED_SIZE);
+                return true;
+            }
+            cuModuleUnload(mod);
+            g_batch_mod = nullptr;
+        }
+    }
+
+    // Check for OMMA_CUBIN_DIR env var
+    const char * dir = getenv("OMMA_CUBIN_DIR");
+    if (dir) {
+        static char path_buf[1024];
+        snprintf(path_buf, sizeof(path_buf), "%s/omma_batch_gemm.cubin", dir);
+        g_search_paths[0] = path_buf;
+    }
+
+    // Try each filesystem search path
+    for (int i = 0; g_search_paths[i]; i++) {
+        CUmodule mod = try_load(g_search_paths[i]);
+        if (mod) {
+            g_batch_mod = mod;
+            // Extract kernel functions
+            cuModuleGetFunction(&g_batch_func, mod, "omma_batch_gemm_kernel");
+            cuModuleGetFunction(&g_moe_func,   mod, "omma_moe_batch_kernel");
+            if (g_batch_func) {
+                g_batch_ready = true;
+                OMMA_LOG("loaded from %s\n", g_search_paths[i]);
+                return true;
+            }
+            cuModuleUnload(mod);
+            g_batch_mod = nullptr;
+        }
+    }
+
+    OMMA_LOG("cubin not found, OMMA batch GEMM disabled\n");
+    return false;
+}
+
+bool ggml_cuda_omma_batch_available(void) {
+    if (g_batch_ready) return true;
+    if (g_batch_tried) return false;
+    return ggml_cuda_omma_batch_init();
+}
+
+bool ggml_cuda_omma_batch_gemm(
+    const void * input_f16,
+    const void * weight_fp4,
+    const int  * expert_ids,
+    float       * output,
+    int n_active,
+    int n_tokens,
+    int n_features,
+    int hidden_dim,
+    cudaStream_t stream)
+{
+    if (!g_batch_ready) return false;
+
+    // Launch batch GEMM kernel
+    // Grid: (ceil(n_tokens/4), ceil(n_features/1), n_active)
+    // Block: (128, 1, 1)
+    int grid_x = (n_tokens + 3) / 4;
+    int grid_y = n_features;  // one column per block
+    int grid_z = n_active;
+
+    void * args[] = {
+        &input_f16, &weight_fp4, &expert_ids,
+        &output, &n_active, &n_tokens, &n_features, &hidden_dim
+    };
+
+    CUresult err = cuLaunchKernel(g_moe_func,
+        grid_x, grid_y, grid_z,
+        128, 1, 1,
+        0,          // shared mem
+        stream,     // stream
+        args,       // kernel args
+        nullptr);   // extra options
+
+    if (err != CUDA_SUCCESS) return false;
+
+    return true;
+}

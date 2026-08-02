@@ -1,0 +1,12 @@
+# Den canonical line endings: LF everywhere (WSL-origin sources).
+# Prevents CRLF churn when syncing WSL decode fixes (2026-08-02 parity).
+*.c   text eol=lf
+*.h   text eol=lf
+*.cpp text eol=lf
+*.hpp text eol=lf
+*.cu  text eol=lf
+*.cuh text eol=lf
+*.py  text eol=lf
+*.cmake text eol=lf
+*.sh  text eol=lf
+*.ps1 text eol=lf

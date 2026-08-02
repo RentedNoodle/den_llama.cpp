@@ -1,0 +1,120 @@
+// cluster_attn.cu — Thread Block Cluster parallel attention for sm_120a+
+//
+// GB203 clusters (max 8 blocks) are used to parallelize the attention
+// softmax(Q*K^T)*V computation across the KV cache dimension.
+//
+// Architecture:
+//   Each cluster of 8 blocks handles one query token.
+//   Block b ∈ [0,8) computes attention over [b*K/8, (b+1)*K/8) KV rows.
+//   Each block: loads Q once (shared), loads its K/V slice, computes
+//               partial S = Q * K_slice^T in registers/shared, softmax
+//               over partial S (with cluster-wide max/sum reduction),
+//               then O += softmax(S) * V_slice.
+//   Cluster barrier: distributes per-block max for cross-block softmax.
+//
+// Benefits for GB203:
+//   - 8x more KV cache read requests in flight (better GDDR7 utilization)
+//   - Each block works on a smaller K slice → fits in 99KB SMEM
+//   - Cluster barrier replaces slow global-memory-based synchronization
+
+#include "common.cuh"
+#include <cooperative_groups.h>
+
+// Grid: (n_tokens, 1, n_clusters)  — one cluster per token
+// Block: (256, 1, 1)
+// Cluster: (8, 1, 1)  — 8 blocks per cluster, one per KV slice
+// Shared memory: Q (n_embd_head * n_head * sizeof(half))
+
+template<int n_head, int n_embd_head, int n_kv_per_block>
+__launch_bounds__(256, 1)
+__global__ void cluster_attn_kernel(
+    const half * __restrict__ Q,       // [n_tokens, n_head * n_embd_head]
+    const half * __restrict__ K,       // [n_kv, n_head * n_embd_head]
+    const half * __restrict__ V,       // [n_kv, n_head * n_embd_head]
+    float * __restrict__ output,       // [n_tokens, n_head * n_embd_head]
+    int n_kv_total,
+    int n_kv_stride)
+{
+    // Uses cooperative groups for cluster operations
+    namespace cg = cooperative_groups;
+    auto cluster = cg::this_cluster();
+    auto block   = cg::this_thread_block();
+    auto warp    = cg::tiled_partition(block, 32);
+
+    int token = blockIdx.x;
+    int cluster_block = cluster.block_rank();  // 0..7
+    if (token >= gridDim.x) return;
+
+    // Each block handles: kv_start = cluster_block * n_kv_per_block
+    // Total KV handled by cluster: 8 * n_kv_per_block
+    int kv_start = cluster_block * n_kv_per_block;
+    int kv_end   = min(kv_start + n_kv_per_block, n_kv_total);
+    int n_kv_local = kv_end - kv_start;
+    if (n_kv_local <= 0) return;
+
+    // Load Q once per cluster (broadcast in shared memory)
+    __shared__ half s_Q[n_head * n_embd_head];
+    if (cluster_block == 0) {
+        const half * q_row = Q + (size_t)token * n_head * n_embd_head;
+        for (int i = threadIdx.x; i < n_head * n_embd_head; i += blockDim.x) {
+            s_Q[i] = q_row[i];
+        }
+    }
+    cluster.sync();  // Ensure Q is loaded by block 0 before all blocks read
+
+    // Per-block accumulators for partial S = Q * K_slice^T
+    // We'll keep partial max and sum in registers for the cross-block softmax.
+    // For each head, each warp handles multiple KV positions.
+    
+    // For a simplified implementation, each block computes:
+    //   max_score = max over kv_local of (Q * K^T)
+    //   sum_exp   = sum over kv_local of exp(score - max_score)
+    // Then cluster-sync to get global max and sum.
+    // Then compute weighted V sum.
+
+    // This is a proof-of-concept kernel. A production version would:
+    //   1. Use WMMA for the Q*K^T tile computation
+    //   2. Fuse the softmax across the cluster
+    //   3. Use ldmatrix for efficient K/V loading
+    //   4. Handle GQA/MQA by sharing K,V across heads
+
+    // Output: each block writes its partial output, cluster reduces
+    // For now, this provides the framework for cluster-based attention.
+    // The actual Q*K^T computation follows the standard attention path
+    // but split across the cluster.
+
+    // Cluster sync barrier before final reduction
+    cluster.sync();
+}
+
+// Host-callable entry point
+// Returns true if cluster attention was used (requires device capability)
+bool ggml_cuda_cluster_attn(
+    const half * Q, const half * K, const half * V,
+    float * output,
+    int n_tokens, int n_kv, int n_head, int n_embd_head,
+    cudaStream_t stream)
+{
+    // Check cluster capability
+    int cluster_capable = 0;
+    cudaDeviceGetAttribute(&cluster_capable, cudaDevAttrClusterLaunch, 0);
+    if (!cluster_capable) return false;
+
+    // Launch with cluster of 8 blocks per token
+    const int block_size = 256;
+    const int n_kv_per_block = (n_kv + 7) / 8;  // ceil divide by 8
+
+    dim3 grid(n_tokens, 1, 1);
+    dim3 blocks(8, 1, 1);  // cluster size
+
+    void * params[] = {
+        const_cast<half **>(&Q), const_cast<half **>(&K), const_cast<half **>(&V), (void*)&output,
+        (void*)&n_kv, (void*)&n_kv_per_block
+    };
+
+    // Use the cluster launch API (requires cooperative groups)
+    // cudaLaunchCooperativeKernelMultiDevice is needed for cluster launch
+    // This requires special handling - simplified here for the framework
+
+    return false;  // Not yet implemented — kernel launch is stubbed
+}

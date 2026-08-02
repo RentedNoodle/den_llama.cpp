@@ -1,0 +1,392 @@
+#include "ggml-cuda/common.cuh"
+#include "ggml.h"
+#include "gpu_router.cuh"
+
+// ============================================================================
+// GPU MoE Router Kernel
+// ============================================================================
+// Fused: hidden_state[B, n_embd] × router_weight[n_expert, n_embd]^T
+//        → softmax → iterative argmax top-k
+//
+// Grid:  [(n_rows + rows_per_block - 1) / rows_per_block, 1, 1]
+// Block: [WARP_SIZE, rows_per_block, 1]
+//
+// Each warp handles one row (token).  Each thread in the warp owns
+// experts_per_thread = n_expert / WARP_SIZE experts.
+//
+// Phase 1: Thread-local dot products — hidden × weight_row for each owned expert
+// Phase 2: Warp softmax — reduce max, compute exp(diff), reduce sum, normalize
+// Phase 3: Iterative argmax top-k — select n_expert_used experts, zeroing each winner
+
+template <size_t n_expert, typename T>
+__launch_bounds__(4 * WARP_SIZE, 1)
+__global__ void gpu_router_kernel(
+    const T * __restrict__ hidden_state,    // [n_rows, n_embd]
+    const T * __restrict__ router_weight,   // [n_expert, n_embd]
+    int32_t * __restrict__ expert_ids,      // [n_rows, n_expert_used]
+    float   * __restrict__ expert_weights,  // [n_rows, n_expert_used]
+    const int n_rows,
+    const int n_embd,
+    const int n_expert_used) {
+
+    const int row = blockIdx.x * blockDim.y + threadIdx.y;
+    if (row >= n_rows) {
+        return;
+    }
+
+    const T * h     = hidden_state + (size_t)row * n_embd;
+    int32_t * ids   = expert_ids    + (size_t)row * n_expert_used;
+    float   * wts   = expert_weights + (size_t)row * n_expert_used;
+
+    constexpr int experts_per_thread = (n_expert > WARP_SIZE) ? n_expert / WARP_SIZE : 1;
+
+    // Phase 1: dot products — each thread computes partial dot for its experts
+    float logits_r[experts_per_thread];
+
+#pragma unroll
+    for (int e = 0; e < experts_per_thread; e++) {
+        const int expert = threadIdx.x + e * WARP_SIZE;
+        float dot = 0.0f;
+
+        if (expert < (int)n_expert) {
+            const T * w = router_weight + (size_t)expert * n_embd;
+
+            // Vectorized dot product: process 8 elements at a time via float4 when
+            // both tensors are F32; fall back to scalar for F16 (half2 is dangerous
+            // with mixed alignment across experts).
+            if constexpr (std::is_same_v<T, float>) {
+                for (int j = 0; j + 7 < n_embd; j += 8) {
+                    const float4 hv = *reinterpret_cast<const float4 *>(h + j);
+                    const float4 wv = *reinterpret_cast<const float4 *>(w + j);
+                    dot += hv.x * wv.x + hv.y * wv.y + hv.z * wv.z + hv.w * wv.w;
+                }
+                // Remainder
+                for (int j = (n_embd / 8) * 8; j < n_embd; j++) {
+                    dot += (float)h[j] * (float)w[j];
+                }
+            } else {
+                // F16 path: scalar accumulation (half2 would need aligned expert weight
+                // access patterns that vary per thread)
+                for (int j = 0; j < n_embd; j++) {
+                    dot += __half2float(h[j]) * __half2float(w[j]);
+                }
+            }
+        } else {
+            dot = -INFINITY;
+        }
+
+        logits_r[e] = dot;
+    }
+
+    // Phase 2: Softmax within warp
+    // 2a: Reduce max
+    float max_val = logits_r[0];
+#pragma unroll
+    for (int i = 1; i < experts_per_thread; i++) {
+        max_val = fmaxf(max_val, logits_r[i]);
+    }
+    max_val = warp_reduce_max(max_val);
+
+    // 2b: Compute exp(diff) and sum
+    float sum = 0.0f;
+    float wt[experts_per_thread];
+#pragma unroll
+    for (int i = 0; i < experts_per_thread; i++) {
+        wt[i] = expf(logits_r[i] - max_val);
+        sum += wt[i];
+    }
+    sum = warp_reduce_sum(sum);
+
+    // 2c: Normalize
+    const float inv_sum = 1.0f / sum;
+#pragma unroll
+    for (int i = 0; i < experts_per_thread; i++) {
+        wt[i] = wt[i] * inv_sum;
+    }
+
+    // Phase 3: Iterative argmax top-k (same algorithm as topk-moe.cu)
+    float sum_selected = 0.0f;
+    for (int k = 0; k < n_expert_used; k++) {
+        float max_wt     = wt[0];
+        int   max_expert = threadIdx.x;
+
+#pragma unroll
+        for (int i = 1; i < experts_per_thread; i++) {
+            const int expert = threadIdx.x + i * WARP_SIZE;
+            if (expert < (int)n_expert && wt[i] > max_wt) {
+                max_wt     = wt[i];
+                max_expert = expert;
+            }
+        }
+
+        // Warp reduce: find the global max across all lanes
+#pragma unroll
+        for (int mask = WARP_SIZE / 2; mask > 0; mask /= 2) {
+            const float val    = __shfl_xor_sync(0xFFFFFFFF, max_wt,     mask, WARP_SIZE);
+            const int   expert = __shfl_xor_sync(0xFFFFFFFF, max_expert, mask, WARP_SIZE);
+            if (val > max_wt) {
+                max_wt     = val;
+                max_expert = expert;
+            }
+        }
+
+        sum_selected += max_wt;
+
+        // The winning lane zeroes its local weight so it's excluded from next iteration
+        if ((max_expert & (WARP_SIZE - 1)) == threadIdx.x) {
+            wt[max_expert / WARP_SIZE] = -INFINITY;
+
+            wts[k] = max_wt;
+            ids[k] = max_expert;
+        }
+    }
+
+    // Renormalize selected weights so they sum to 1.0
+    __syncthreads();
+
+    const float norm = 1.0f / sum_selected;
+    for (int k = threadIdx.x; k < n_expert_used; k += WARP_SIZE) {
+        wts[k] *= norm;
+    }
+}
+
+// ============================================================================
+// Simple MoE router (used when n_expert_used == n_expert: return all experts)
+// ============================================================================
+template <typename T>
+__launch_bounds__(4 * WARP_SIZE, 1)
+__global__ void simple_router_kernel(
+    const T * __restrict__ hidden_state,
+    const T * __restrict__ router_weight,
+    int32_t * __restrict__ expert_ids,
+    float   * __restrict__ expert_weights,
+    const int n_rows,
+    const int n_embd,
+    const int n_expert) {
+
+    const int row = blockIdx.x * blockDim.y + threadIdx.y;
+    if (row >= n_rows) {
+        return;
+    }
+
+    const T * h   = hidden_state  + (size_t)row * n_embd;
+    int32_t * ids = expert_ids    + (size_t)row * n_expert;
+    float   * wts = expert_weights + (size_t)row * n_expert;
+
+    // Compute all dot products (each thread handles a subset of experts)
+    float max_val = -INFINITY;
+#pragma unroll
+    for (int e = threadIdx.x; e < n_expert; e += WARP_SIZE) {
+        float dot = 0.0f;
+        const T * w = router_weight + (size_t)e * n_embd;
+        if constexpr (std::is_same_v<T, float>) {
+            for (int j = 0; j + 7 < n_embd; j += 8) {
+                const float4 hv = *reinterpret_cast<const float4 *>(h + j);
+                const float4 wv = *reinterpret_cast<const float4 *>(w + j);
+                dot += hv.x * wv.x + hv.y * wv.y + hv.z * wv.z + hv.w * wv.w;
+            }
+            for (int j = (n_embd / 8) * 8; j < n_embd; j++) {
+                dot += (float)h[j] * (float)w[j];
+            }
+        } else {
+            for (int j = 0; j < n_embd; j++) {
+                dot += __half2float(h[j]) * __half2float(w[j]);
+            }
+        }
+        wts[e] = dot;
+        ids[e] = e;
+        max_val = fmaxf(max_val, dot);
+    }
+
+    max_val = warp_reduce_max(max_val);
+    float sum = 0.0f;
+#pragma unroll
+    for (int e = threadIdx.x; e < n_expert; e += WARP_SIZE) {
+        wts[e] = expf(wts[e] - max_val);
+        sum += wts[e];
+    }
+    sum = warp_reduce_sum(sum);
+    const float norm = 1.0f / sum;
+#pragma unroll
+    for (int e = threadIdx.x; e < n_expert; e += WARP_SIZE) {
+        wts[e] *= norm;
+    }
+}
+
+// ============================================================================
+// Host launcher: template dispatch over n_expert
+// ============================================================================
+template <typename T>
+void launch_gpu_router_kernel(
+    cudaStream_t stream,
+    const T * hidden_state,
+    const T * router_weight,
+    int32_t * expert_ids,
+    float   * expert_weights,
+    const int n_rows,
+    const int n_embd,
+    const int n_expert,
+    const int n_expert_used) {
+
+    const int    rows_per_block = 4;
+    const dim3   grid_dims((n_rows + rows_per_block - 1) / rows_per_block, 1, 1);
+    const dim3   block_dims(WARP_SIZE, rows_per_block, 1);
+
+    if (n_expert_used == n_expert) {
+        simple_router_kernel<T><<<grid_dims, block_dims, 0, stream>>>(
+            hidden_state, router_weight, expert_ids, expert_weights,
+            n_rows, n_embd, n_expert);
+        return;
+    }
+
+    switch (n_expert) {
+        case 1:
+            gpu_router_kernel<1,  T><<<grid_dims, block_dims, 0, stream>>>(hidden_state, router_weight, expert_ids, expert_weights, n_rows, n_embd, n_expert_used);
+            break;
+        case 2:
+            gpu_router_kernel<2,  T><<<grid_dims, block_dims, 0, stream>>>(hidden_state, router_weight, expert_ids, expert_weights, n_rows, n_embd, n_expert_used);
+            break;
+        case 4:
+            gpu_router_kernel<4,  T><<<grid_dims, block_dims, 0, stream>>>(hidden_state, router_weight, expert_ids, expert_weights, n_rows, n_embd, n_expert_used);
+            break;
+        case 8:
+            gpu_router_kernel<8,  T><<<grid_dims, block_dims, 0, stream>>>(hidden_state, router_weight, expert_ids, expert_weights, n_rows, n_embd, n_expert_used);
+            break;
+        case 16:
+            gpu_router_kernel<16, T><<<grid_dims, block_dims, 0, stream>>>(hidden_state, router_weight, expert_ids, expert_weights, n_rows, n_embd, n_expert_used);
+            break;
+        case 32:
+            gpu_router_kernel<32, T><<<grid_dims, block_dims, 0, stream>>>(hidden_state, router_weight, expert_ids, expert_weights, n_rows, n_embd, n_expert_used);
+            break;
+        case 64:
+            gpu_router_kernel<64, T><<<grid_dims, block_dims, 0, stream>>>(hidden_state, router_weight, expert_ids, expert_weights, n_rows, n_embd, n_expert_used);
+            break;
+        case 128:
+            gpu_router_kernel<128,T><<<grid_dims, block_dims, 0, stream>>>(hidden_state, router_weight, expert_ids, expert_weights, n_rows, n_embd, n_expert_used);
+            break;
+        case 256:
+            gpu_router_kernel<256,T><<<grid_dims, block_dims, 0, stream>>>(hidden_state, router_weight, expert_ids, expert_weights, n_rows, n_embd, n_expert_used);
+            break;
+        case 512:
+            gpu_router_kernel<512,T><<<grid_dims, block_dims, 0, stream>>>(hidden_state, router_weight, expert_ids, expert_weights, n_rows, n_embd, n_expert_used);
+            break;
+        default:
+            GGML_ASSERT(false && "gpu_router: n_expert must be power of 2 and <= 512");
+            break;
+    }
+}
+
+// ============================================================================
+// Public entry point: ggml_cuda_op_gpu_router
+// ============================================================================
+void ggml_cuda_op_gpu_router(
+    ggml_backend_cuda_context & ctx,
+    const ggml_tensor * hidden_state,
+    const ggml_tensor * router_weight,
+    ggml_tensor * expert_ids,
+    ggml_tensor * expert_weights) {
+
+    GGML_ASSERT(hidden_state->type == GGML_TYPE_F32 || hidden_state->type == GGML_TYPE_F16);
+    GGML_ASSERT(router_weight->type == GGML_TYPE_F32 || router_weight->type == GGML_TYPE_F16);
+    GGML_ASSERT(expert_ids->type == GGML_TYPE_I32);
+    GGML_ASSERT(expert_weights->type == GGML_TYPE_F32);
+
+    const int n_embd   = (int)router_weight->ne[0];       // ne[0] = n_embd (fastest)
+    const int n_expert = (int)router_weight->ne[1];       // ne[1] = n_expert
+    const int n_rows   = (int)hidden_state->ne[1];        // ne[1] = n_tokens
+    const int n_expert_used = (int)expert_ids->ne[0];     // ne[0] = n_expert_used (VIEW output)
+
+    GGML_ASSERT(hidden_state->ne[0] == (int64_t)n_embd);
+    // Weights may be [n_expert_used] (flat), [n_expert_used, n_tokens] (2D),
+    // or [1, n_expert_used, n_tokens] (3D from GET_ROWS after reshape).
+    // The kernel writes n_expert_used floats per row, so the flat count must match.
+    GGML_ASSERT((int64_t)ggml_nelements(expert_weights) >= (int64_t)n_rows * n_expert_used);
+
+    const void * hidden_d  = hidden_state->data;
+    const void * router_d  = router_weight->data;
+    int32_t *    ids_d     = (int32_t *)expert_ids->data;
+    float *      wts_d     = (float *)expert_weights->data;
+
+    if (hidden_state->type == GGML_TYPE_F32 && router_weight->type == GGML_TYPE_F32) {
+        launch_gpu_router_kernel<float>(ctx.stream(),
+            (const float *)hidden_d, (const float *)router_d,
+            ids_d, wts_d, n_rows, n_embd, n_expert, n_expert_used);
+    } else if (hidden_state->type == GGML_TYPE_F16 && router_weight->type == GGML_TYPE_F16) {
+        // Both F16: dispatch directly
+        launch_gpu_router_kernel<half>(ctx.stream(),
+            (const half *)hidden_d, (const half *)router_d,
+            ids_d, wts_d, n_rows, n_embd, n_expert, n_expert_used);
+    } else {
+        // Mixed F32/F16: not yet supported with direct kernel dispatch.
+        // Log a warning and return without computing — the caller should
+        // cast tensors to a uniform type before invoking the GPU router.
+        // This is a graceful degradation, not a fatal abort.
+        fprintf(stderr,
+            "gpu_router: WARNING — mixed F32/F16 types not supported "
+            "(hidden=%s, router=%s). Skipping GPU router; use ggml_cast to "
+            "match types before the mul_mat.\n",
+            hidden_state->type == GGML_TYPE_F32 ? "f32" : "f16",
+            router_weight->type == GGML_TYPE_F32 ? "f32" : "f16");
+        return;
+    }
+}
+
+// ============================================================================
+// Heuristic: should we use the GPU router for this node pattern?
+// ============================================================================
+bool ggml_cuda_should_use_gpu_router(
+    const ggml_tensor * logits,
+    const ggml_tensor * router_w,
+    const ggml_tensor * hidden) {
+
+    // Type checks: logits must be F32 or F16 (output of mul_mat)
+    if (logits->type != GGML_TYPE_F32 && logits->type != GGML_TYPE_F16) {
+        return false;
+    }
+
+    // Router weight must be contiguous and F32/F16
+    if (!ggml_is_contiguous(router_w)) {
+        return false;
+    }
+    if (router_w->type != GGML_TYPE_F32 && router_w->type != GGML_TYPE_F16) {
+        return false;
+    }
+
+    // Hidden state must be contiguous and F32/F16
+    if (hidden && !ggml_is_contiguous(hidden)) {
+        return false;
+    }
+
+    const int n_expert = (int)logits->ne[0];  // ne[0] = n_expert after mul_mat
+    // n_expert must be a power of 2 and <= 512
+    if ((n_expert & (n_expert - 1)) != 0 || n_expert > 512 || n_expert <= 0) {
+        return false;
+    }
+
+    // Hidden state must be 2D: [n_embd, n_tokens] with n_embd == router_w->ne[0]
+    if (hidden && !(hidden->ne[2] <= 1 && hidden->ne[3] <= 1)) {
+        return false;
+    }
+
+    return true;
+}
+
+// ============================================================================
+// Extern "C" wrapper — callable from llama.cpp without ggml types
+// ============================================================================
+extern "C" void launch_gpu_router_f32(
+    const float * hidden_state,
+    const float * router_weight,
+    int32_t * expert_ids,
+    float * expert_weights,
+    int n_rows,
+    int n_embd,
+    int n_expert,
+    int n_expert_used) {
+
+    launch_gpu_router_kernel<float>(
+        0, // default CUDA stream
+        hidden_state, router_weight,
+        expert_ids, expert_weights,
+        n_rows, n_embd, n_expert, n_expert_used);
+}

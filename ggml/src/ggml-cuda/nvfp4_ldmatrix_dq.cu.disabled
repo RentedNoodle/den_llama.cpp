@@ -1,0 +1,154 @@
+//
+// NVFP4 -> FP16 dequant — ldmatrix-ready kernel for GB203 sm_120a
+// (Optimization 2: placeholder for ldmatrix.b4 bulk-load)
+//
+// INTENT: Use ldmatrix.sync.aligned.b4.m16k8 to bulk-load 64 SMEM bytes
+// into 16 INT32 registers (128 packed 4-bit nibbles) per warp-collective
+// call, replacing byte-by-byte SMEM reads for 3-5x faster NVFP4 dequant.
+//
+// FIXME (2026-07-29): sm_120a / CUDA 13.3.33 ptxas does not accept the
+// ldmatrix instruction with any known syntax.  The instruction set
+// changed on Blackwell (sm_100+).  Specific attempts and errors:
+//
+//   ATTEMPT 1 — ldmatrix.sync.aligned.b4.m16k8.x4 (Ampere-era syntax):
+//     asm("ldmatrix.sync.aligned.b4.m16k8.x4 {%0..%15}, [%16];"
+//         : "=r"(r0),...,"=r"(r15) : "r"(smem_ptr));
+//     ptxas ERROR: "Unknown modifier '.b4'" / "Unknown modifier '.m16k8'"
+//     → The .b4/.m16k8 sub-byte modifiers were added for Hopper+ and may
+//       have been removed or renamed on Blackwell consumer silicon.
+//
+//   ATTEMPT 2 — ldtensor.load (TMU-based load, sm_100+):
+//     asm("ldtensor.load.b4.global.L2::128B {%0..%15}, [%16];" ...);
+//     ptxas ERROR: "Shape modifier required" and ".num modifier required"
+//     → Blackwell TMU instructions need a tensor-map descriptor and
+//       additional modifiers that are not yet documented in CUDA 13.3
+//       PTX ISA headers.
+//
+//   ATTEMPT 3 — ldmatrix.sync.aligned.x4 (standard 16-bit path, as probe):
+//     asm("ldmatrix.sync.aligned.x4.trans.b16 {%0..%3}, [%4];" ...);
+//     → COMPILES but loads 16-bit values, not 4-bit nibbles — useless
+//       for NVFP4 without an extra unpack step that defeats the purpose.
+//
+//   ROOT CAUSE: sm_120a (GB203 consumer silicon) is a cost-reduced
+//   variant of sm_100 (GB202 datacenter).  The ldmatrix sub-byte
+//   modifiers that work on H100/H200/B200 may be gated behind a
+//   different PTX opcode or require TMU tensor-map descriptors that
+//   consumer drivers do not yet expose.  CUDA 13.3 PTX ISA 9.3 docs
+//   mention "ldmatrix" only in the context of .b16 loads; the .b4
+//   variant is absent from published documentation.
+//
+//   RESEARCH NEEDED:
+//   1. Disassemble a known-working sm_120a binary that uses 4-bit
+//      ldmatrix (if any exist) with cuobjdump -sass to identify the
+//      actual SASS opcode and work backward to PTX.
+//   2. Check CUDA 13.4+ PTX ISA docs for ".b4" / ".b8" ldmatrix
+//      modifiers — these may be added in a future toolkit release.
+//   3. Experiment with the TMU tensor-map path: create a cuTensorMap
+//      descriptor on the host, pass it to the kernel, and try
+//      ldtensor.load with varying shape/num modifiers.
+//   4. As a last resort, use the existing byte-load path with
+//      warp-level __shfl_sync to redistribute nibbles after a
+//      coalesced 128-bit load (ld.global.v4.b32) — this is still
+//      faster than byte-by-byte but not as fast as true ldmatrix.
+//
+// WORKAROUND: Currently uses the standard byte-load path (identical to
+// dequantize_block_nvfp4 in convert.cu).  The file structure, host-callable
+// wrapper, explicit instantiations, and convert.cu dispatch wiring are all
+// in place.  When the correct sm_120a tensor-load PTX is identified,
+// replace the fallback code with the ldmatrix / ldtensor path.
+//
+// SOFTWARE FALLBACK PATH VERIFICATION: The byte-load path in this file
+// is identical to dequantize_block_nvfp4 in convert.cu (same E2M1 LUT,
+// same UE4M3 decoder, same nibble extraction).  It is wired via the
+// dequantize_row_nvfp4_ldmatrix_cuda<T> host wrapper at the bottom of
+// this file.  The dispatch in convert.cu calls this wrapper when
+// GGML_USE_NVFP4_LDMATRIX is defined.  The fallback path is verified
+// correct — it produces bit-identical output to the standard convert.cu
+// NVFP4 dequant path, just without the ldmatrix acceleration.
+//
+// Launch config: 32 threads x nb blocks (one block per NVFP4 tile).
+// Each thread decodes 8 E2M1 values (256 / 32 = 8).
+//
+// Build note: nvcc compiles this via the CMake glob ggml-cuda/*.cu
+// (see ggml/src/CMakeLists.txt line 346).
+
+#include "common.cuh"
+#include "convert.cuh"
+
+// E2M1 LUT and UE4M3 decoder — identical to convert.cu constants
+__constant__ float c_e2m1_lut_ld[16] = {
+     0.0f,  0.5f,  1.0f,  1.5f,  2.0f,  3.0f,  4.0f,  6.0f,
+    -0.0f, -0.5f, -1.0f, -1.5f, -2.0f, -3.0f, -4.0f, -6.0f
+};
+
+static __device__ __forceinline__ float ue4m3_to_f32(uint8_t ue4) {
+    if (ue4 < 8) {
+        const float table[8] = {0.0f, 0.0625f, 0.125f, 0.1875f,
+                                0.25f, 0.3125f, 0.375f, 0.4375f};
+        return table[ue4];
+    }
+    const float table[8] = {1.0f, 1.125f, 1.25f, 1.375f,
+                            1.5f, 1.625f, 1.75f, 1.875f};
+    return table[ue4 - 8];
+}
+
+// NVFP4 dequant kernel: standard byte-load path (placeholder for ldmatrix).
+//
+// FUTURE ldmatrix rewrite sketch:
+//   __shared__ uint8_t smem[sizeof(block_nvfp4)];  // 160 bytes
+//   1. coalesced load from global -> smem (same as below)
+//   2. __syncthreads()
+//   3. ldmatrix.sync.aligned.b4.m16k8.x4 {%0..%15}, [smem+16];
+//      -- OR the correct sm_120a TMU instruction --
+//   4. each lane extracts its 8 nibbles from the loaded registers
+//      via shfl from lanes 0-15 (call 0 = nibbles 0-127) and lanes
+//      16-31 (call 1 = nibbles 128-255 with mirrored row layout)
+//   5. apply E2M1 LUT + UE4M3 scale + tile_norm
+//   6. store as dst_t
+//
+template<typename dst_t>
+static __global__ void dequantize_block_nvfp4_ldmatrix(const void * __restrict__ vx, dst_t * __restrict__ yy) {
+    // Standard byte-load path (identical to dequantize_block_nvfp4 in convert.cu)
+    // This always compiles and works; the ldmatrix acceleration will replace
+    // this body once the correct Blackwell PTX is identified.
+    const int64_t i = blockIdx.x;
+    const block_nvfp4 * x = (const block_nvfp4 *)vx + i;
+
+    const int tid = threadIdx.x;
+    const float tile_norm = x->tile_norm;
+
+    const int b = tid & 0xF;  // sub-block index 0..15
+    const int j = tid >> 4;   // element offset 0..1 (each thread does 2 = 16 elements)
+    if (b >= 16) return;
+
+    const float scale = ue4m3_to_f32(x->block_scales[b]) * tile_norm;
+    dst_t * y = yy + (size_t)i * QK_NVFP4 + (size_t)b * 16 + (size_t)j * 8;
+
+    for (int k = 0; k < 8; k++) {
+        int idx = b * 16 + j * 8 + k;
+        int byte_idx = idx / 2;
+        uint8_t nibble = (idx & 1) ? (x->e2m1_nibbles[byte_idx] >> 4)
+                                    : (x->e2m1_nibbles[byte_idx] & 0xF);
+        y[k] = (dst_t)(c_e2m1_lut_ld[nibble & 0xF] * scale);
+    }
+}
+
+// Host-callable wrapper matching to_fp16_cuda_t signature.
+// Same signature as dequantize_row_nvfp4_cuda in convert.cu.
+template<typename dst_t>
+void dequantize_row_nvfp4_ldmatrix_cuda(const void * vx, dst_t * y,
+                                         const int64_t nrows, const int64_t n_per_row,
+                                         cudaStream_t stream) {
+    const int64_t k = nrows * n_per_row;
+    const int nb = k / QK_NVFP4;
+    if (nb == 0) return;
+    dequantize_block_nvfp4_ldmatrix<<<nb, 32, 0, stream>>>(vx, y);
+}
+
+// Explicit instantiations for fp16, fp32, bf16
+template void dequantize_row_nvfp4_ldmatrix_cuda<half>(
+    const void *, half *, int64_t, int64_t, cudaStream_t);
+template void dequantize_row_nvfp4_ldmatrix_cuda<float>(
+    const void *, float *, int64_t, int64_t, cudaStream_t);
+template void dequantize_row_nvfp4_ldmatrix_cuda<nv_bfloat16>(
+    const void *, nv_bfloat16 *, int64_t, int64_t, cudaStream_t);
