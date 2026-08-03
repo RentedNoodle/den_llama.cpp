@@ -3,11 +3,17 @@
 # Auto-detects pip-installed nvidia-cu13 nvcc.exe and sets it as the CUDA compiler.
 # The system CUDA 13.3 installer has a buggy nvcc.profile (-isystem incompatible with MSVC).
 # The pip nvidia-cu13 package provides a clean nvcc.exe that works.
+#
+# Hardened 2026-08-02 (post D:-drive recovery): multi-root search includes the
+# live Python314 site-packages (D: venv is dead), and CCCL is resolved from
+# either the standalone nvidia/cuda_cccl package OR the CUDA-13.x wheel layout
+# nvidia/cu13/include/cccl (cub / libcudacxx / thrust nested there).
 
 # Find pip CUDA 13.3 nvcc
 set(PIP_CUDA_PATHS
-    "D:/Den/den-pytorch/Lib/site-packages/nvidia/cu13"
+    "C:/Users/james/AppData/Local/Programs/Python/Python314/Lib/site-packages/nvidia/cu13"
     "C:/Den/den-pytorch/Lib/site-packages/nvidia/cu13"
+    "D:/Den/dencli/.venv/Lib/site-packages/nvidia/cu13"
 )
 
 foreach(PIP_PATH ${PIP_CUDA_PATHS})
@@ -20,29 +26,40 @@ foreach(PIP_PATH ${PIP_CUDA_PATHS})
     endif()
 endforeach()
 
-if(NOT EXISTS "${CMAKE_CUDA_COMPILER}")
+if(NOT CMAKE_CUDA_COMPILER OR NOT EXISTS "${CMAKE_CUDA_COMPILER}")
     message(FATAL_ERROR
         "msvc_toolchain: pip CUDA 13.3 not found.\n"
-        "Install: pip install nvidia-cuda-nvcc nvidia-cu13 cuda-cccl\n"
-        "Expected at: D:/Den/den-pytorch/Lib/site-packages/nvidia/cu13/bin/nvcc.exe"
+        "Install: pip install nvidia-cuda-nvcc nvidia-cu13\n"
+        "Searched: ${PIP_CUDA_PATHS}"
     )
 endif()
 
-# CCCL headers: use pip nvidia-cuda-cccl to avoid version conflicts
+# CCCL headers (cub / libcudacxx / thrust). Two possible layouts:
+#   legacy : nvidia/cuda_cccl/include/cub/cub.cuh  -> add -I<root>/include
+#   cu13   : nvidia/cu13/include/cccl/cub/cub.cuh  -> add -I<cccl-root>
 set(CCCL_PATHS
-    "D:/Den/den-pytorch/Lib/site-packages/nvidia/cuda_cccl"
+    "C:/Users/james/AppData/Local/Programs/Python/Python314/Lib/site-packages/nvidia/cuda_cccl"
+    "C:/Users/james/AppData/Local/Programs/Python/Python314/Lib/site-packages/nvidia/cu13/include/cccl"
     "C:/Den/den-pytorch/Lib/site-packages/nvidia/cuda_cccl"
-    "D:/Den/den-pytorch/Lib/site-packages/nvidia/cuda-cccl"
-    "C:/Den/den-pytorch/Lib/site-packages/nvidia/cuda-cccl"
 )
 
+set(CCCL_FOUND FALSE)
 foreach(CCCL_PATH ${CCCL_PATHS})
-    if(EXISTS "${CCCL_PATH}/include")
+    if(EXISTS "${CCCL_PATH}/include/cub/cub.cuh")
         set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} -I${CCCL_PATH}/include")
         message(STATUS "msvc_toolchain: CCCL headers at ${CCCL_PATH}/include")
+        set(CCCL_FOUND TRUE)
+        break()
+    elseif(EXISTS "${CCCL_PATH}/cub/cub.cuh")
+        set(CMAKE_CUDA_FLAGS "${CMAKE_CUDA_FLAGS} -I${CCCL_PATH}")
+        message(STATUS "msvc_toolchain: CCCL headers at ${CCCL_PATH}")
+        set(CCCL_FOUND TRUE)
         break()
     endif()
 endforeach()
+if(NOT CCCL_FOUND)
+    message(WARNING "msvc_toolchain: CCCL headers not found — cub/libcudacxx includes may fail")
+endif()
 
 # Ensure sm_120a is set
 if(NOT CMAKE_CUDA_ARCHITECTURES)
