@@ -20,10 +20,8 @@ Write-Host "========================================" -ForegroundColor Cyan
 
 # --- Multi-root pip CUDA search (fail loudly if none found) ---
 $pipRoots = @(
-    "D:\Den\den-pytorch\Lib\site-packages\nvidia\cu13",
-    "D:\Den\dencli\.venv\Lib\site-packages\nvidia\cu13",
     "C:\Users\james\AppData\Local\Programs\Python\Python314\Lib\site-packages\nvidia\cu13",
-    "C:\Den\den-pytorch\Lib\site-packages\nvidia\cu13"
+    "C:\Den\den-py314\Lib\site-packages\nvidia\cu13"
 )
 $pipCuda = $null
 foreach ($root in $pipRoots) {
