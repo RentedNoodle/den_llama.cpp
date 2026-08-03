@@ -2237,6 +2237,7 @@ static void ggml_backend_sched_copy_inputs(ggml_backend_sched_t sched, ggml_back
                     for (int64_t i1 = 0; i1 < ids_tensor->ne[1]; i1++) {
                         for (int64_t i0 = 0; i0 < ids_tensor->ne[0]; i0++) {
                             int32_t id = ids[i1 * ids_tensor->nb[1]/sizeof(int32_t) + i0 * ids_tensor->nb[0]/sizeof(int32_t)];
+                            if (id < 0 || id >= n_expert) { continue; }
                             unique_ids[id >> 5] |= (1u << (id & 31));
                         }
                     }
@@ -2247,7 +2248,25 @@ static void ggml_backend_sched_copy_inputs(ggml_backend_sched_t sched, ggml_back
                 const size_t expert_size = input->ne[2] > 1 ? input->nb[2] : input->nb[1];
 
                 if (input->ne[2] > 1) {
-
+                    bool issued_d2d = false;
+                    bool issued_h2d = false;
+                    if (ids_tensor->ne[0] >= n_expert) {
+                        // Warmup / all-experts graph (n_expert_used == n_expert):
+                        // the ids enumerate EVERY expert, so a selective upload is
+                        // pointless AND unsafe — the warmup's single-BOS pass can
+                        // produce garbage per-layer routing ids (e.g. all-identical)
+                        // that under-upload the experts → NaN in the MoE reduction
+                        // → corrupts the SSM state → garbled decode. Fall back to a
+                        // full upload; the ~8-active-expert decode keeps the
+                        // selective path below.
+                        ggml_backend_tensor_set_async(split_backend, input_cpy, input->data, 0, ggml_nbytes(input));
+                        issued_h2d = true;
+                    } else {
+                    // ── Zero the full expert buffer BEFORE the selective upload ──
+                    // only_active_experts uploads ONLY the ~8 ACTIVE experts; the
+                    // graph reads the whole tensor, so the non-active slices must
+                    // be 0 (not stale data from prior decodes) → NaN → garble.
+                    ggml_backend_tensor_memset(input_cpy, 0, 0, (size_t)expert_size * n_expert);
                     // ── cache-aware expert upload ─────────────────────────────
                     // With the VRAM expert cache enabled, cache HITs are D2D
                     // (cache pool → input_cpy, fast) and cache MISSes are H2D
@@ -2258,8 +2277,6 @@ static void ggml_backend_sched_copy_inputs(ggml_backend_sched_t sched, ggml_back
                     const int  cache_dev = 0; // single-GPU fork (RTX 5070 Ti)
                     expert_cache_entry * ce = nullptr;
                     void * cache_base = nullptr;
-                    bool issued_d2d = false;
-                    bool issued_h2d = false;
                     if (use_cache) {
                         ce = ggml_backend_sched_expert_cache_find(sched, input->name);
                         ggml_backend_sched_expert_cache_reserve(sched, ce, (size_t)n_expert, expert_size);
@@ -2332,6 +2349,7 @@ static void ggml_backend_sched_copy_inputs(ggml_backend_sched_t sched, ggml_back
                             ggml_backend_synchronize(split_backend);
                         }
                     }
+                    } // end selective-upload else
 
                 } else {
                     auto copy_size = ggml_nbytes(input);
