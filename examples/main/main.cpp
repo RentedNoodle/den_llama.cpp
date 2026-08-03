@@ -812,9 +812,18 @@ int main(int argc, char ** argv) {
                 }
             }
             if (!cats_accepted) {
-                id = common_sampler_sample_legacy(ctx_sampling, ctx, ctx_guidance);
-                common_sampler_accept(ctx_sampling, ctx, id, /* apply_grammar= */ true);
-                embd.push_back(id);
+                // U3 (2026-08-03): the on-device greedy argmax replaces the CPU sampler
+                // (DEN_GPU_SAMPLE=1). Skips the per-token logits D2H + the CPU sampling chain.
+                uint32_t gpu_token = 0;
+                if (getenv("DEN_GPU_SAMPLE") != nullptr && llama_get_gpu_sampled_token(ctx, &gpu_token)) {
+                    id = (llama_token) gpu_token;
+                    // GPU sampler: the logits never left the device — skip the accept.
+                    embd.push_back(id);
+                } else {
+                    id = common_sampler_sample_legacy(ctx_sampling, ctx, ctx_guidance);
+                    common_sampler_accept(ctx_sampling, ctx, id, /* apply_grammar= */ true);
+                    embd.push_back(id);
+                }
             }
 
             LOG("last: %s\n", LOG_TOKENS_TOSTR_PRETTY(ctx, ctx_sampling->prev).c_str());

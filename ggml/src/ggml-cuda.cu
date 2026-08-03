@@ -4561,11 +4561,16 @@ static bool check_node_graph_compatibility_and_refresh_copy_ops(ggml_cuda_graph 
             break;
         }
 
-        if (node->op == GGML_OP_MUL_MAT_ID && (node->ne[2] != 1 || node->src[2]->ne[0] != 1)) {
-            use_cuda_graph = false; // This node type is not supported by CUDA graph capture
+        // U3 (2026-08-03): allow single-token MoE decode graph capture. The ids
+        // (src[2]) changes per token, but with graph reuse the ids BUFFER is
+        // stable (same pointer, updated contents) so a captured graph replays the
+        // current expert selection. Only the multi-token (prompt) MUL_MAT_ID is
+        // excluded (grid/batch changes break the capture).
+        if (node->op == GGML_OP_MUL_MAT_ID && (node->ne[2] != 1)) {
+            use_cuda_graph = false; // multi-token/batched MoE not capturable
 #ifndef NDEBUG
-            GGML_CUDA_LOG_DEBUG("%s(%s): disabling CUDA graphs due to unsupported node type %ld %ld\n",
-                    __func__, node->src[0]->name, node->ne[2], node->src[2]->ne[0]);
+            GGML_CUDA_LOG_DEBUG("%s(%s): disabling CUDA graphs for batched MUL_MAT_ID %ld\n",
+                    __func__, node->src[0]->name, node->ne[2]);
 #endif
         }
         if (node->op == GGML_OP_MOE_FUSED_UP_GATE) {

@@ -1097,6 +1097,10 @@ extern "C" {
     // returns NULL for invalid ids.
     LLAMA_API float * llama_get_logits_ith(struct llama_context * ctx, int32_t i);
 
+    // U3 (2026-08-03): the on-device greedy argmax token from the last llama_decode
+    // (when DEN_GPU_SAMPLE=1). Returns false if the GPU sampler wasn't active.
+    LLAMA_API bool llama_get_gpu_sampled_token(const struct llama_context * ctx, uint32_t * token);
+
     // Get all output token embeddings.
     // when pooling_type == LLAMA_POOLING_TYPE_NONE or when using a generative model,
     // the embeddings for which llama_batch.logits[i] != 0 are stored contiguously

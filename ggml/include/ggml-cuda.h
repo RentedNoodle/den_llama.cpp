@@ -48,6 +48,11 @@ GGML_API GGML_CALL bool ggml_backend_cuda_register_host_buffer(void * buffer, si
 GGML_API GGML_CALL void ggml_backend_cuda_unregister_host_buffer(void * buffer);
 
 GGML_API void ggml_backend_cuda_log_set_callback(ggml_log_callback log_callback, void * user_data);
+
+// U3 (2026-08-03): on-device greedy argmax over the vocab — replaces the per-token
+// CPU sampler + the 608KB logits D2H with a 4-byte token readback (the host-serialization fix).
+GGML_API GGML_CALL void den_gpu_argmax(const float * logits, uint32_t * token_out, int vocab_size, cudaStream_t stream);
+
 #ifdef  __cplusplus
 }
 #endif

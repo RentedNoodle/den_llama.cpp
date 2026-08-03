@@ -224,6 +224,11 @@ struct llama_context {
 
     bool has_evaluated_once = false;
 
+    // U3 (2026-08-03): the GPU-resident argmax token (DEN_GPU_SAMPLE=1) — replaces
+    // the per-token CPU sampler + the 608KB logits D2H with a 4-byte token readback.
+    uint32_t gpu_sampled_token = 0;
+    bool     gpu_sampled       = false;
+
     int64_t t_start_us;
     int64_t t_load_us;
     int64_t t_p_eval_us = 0;

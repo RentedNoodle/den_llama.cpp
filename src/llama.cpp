@@ -5285,6 +5285,15 @@ static int llama_decode_internal(
         printf("graph_compute(...): %d us\n", int(tim2-tim1));
 #endif
         llama_synchronize(&lctx); // ensure GPU compute done before reading tensors back
+        // U3 (2026-08-03): GPU-resident argmax sampler (env-gated). The on-device
+        // greedy argmax replaces the per-token CPU sampler + the 608KB logits D2H
+        // with a 4-byte token readback (the host-serialization fix).
+        if (getenv("DEN_GPU_SAMPLE") != nullptr && res != nullptr) {
+            lctx.gpu_sampled       = true;
+            lctx.gpu_sampled_token = 0;
+            den_gpu_argmax((const float*) res->data, &lctx.gpu_sampled_token,
+                           (int) model.hparams.n_vocab, 0);
+        }
         den_dump_hidden(gf, n_embd);
 
         bool reset_previous = false;
@@ -5312,7 +5321,11 @@ static int llama_decode_internal(
             tim1 = ggml_time_us();
 #endif
             // Do not process logits if MTP is only updating the KV cache.
-            if (cparams.mtp_op_type != MTP_OP_WARMUP) { // && cparams.mtp_op_type != MTP_OP_UPDATE_ACCEPTED) {
+            // U3: with the GPU-resident argmax, the token is already on-device — skip
+            // the 608KB logits D2H entirely (the host-serialization fix).
+            if (lctx.gpu_sampled && getenv("DEN_GPU_SAMPLE") != nullptr) {
+                // GPU sampler produced the token; the logits stay on-device.
+            } else if (cparams.mtp_op_type != MTP_OP_WARMUP) { // && cparams.mtp_op_type != MTP_OP_UPDATE_ACCEPTED) {
                 ggml_backend_t backend_res = ggml_backend_sched_get_tensor_backend(lctx.sched, res);
                 GGML_ASSERT(backend_res != nullptr);
                 GGML_ASSERT(lctx.logits != nullptr);
@@ -9444,6 +9457,14 @@ float * llama_get_logits(struct llama_context * ctx) {
     llama_synchronize(ctx);
 
     return ctx->logits;
+}
+
+bool llama_get_gpu_sampled_token(const struct llama_context * ctx, uint32_t * token) {
+    if (ctx->gpu_sampled && token) {
+        *token = ctx->gpu_sampled_token;
+        return true;
+    }
+    return false;
 }
 
 float * llama_get_logits_ith(struct llama_context * ctx, int32_t i) {
