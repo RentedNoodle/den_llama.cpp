@@ -2791,7 +2791,12 @@ static int ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor 
         // argmax — both garble the output. The Q4_0 model (Q8_1 activations) is
         // coherent, so these two NVFP4 groups are computed with the exact
         // software dequant (identical to dequantize_row_nvfp4 / the CPU path).
-        // The MoE experts stay on the fast OMMA path (they don't feed the GDN).
+        // NVFP4 attention + lm_head + experts use the exact software dequant
+        // (matches dequantize_row_nvfp4 / the CPU path). The OMMA kernels are NOT
+        // used here: their E2M1 activation quantization garbles the GDN-fed
+        // projections, and the GGUF experts' grouped NULLGLASS nibble layout does
+        // not match the .den m16n8k64 fragment packing the OMMA expects
+        // (verified 2026-08-03: OMMA on GGUF experts -> garbled).
         if (strstr(src0->name, "attn") != nullptr || strstr(src0->name, "output.weight") != nullptr ||
             strstr(src0->name, "exps") != nullptr) {
             const int K = (int)src0->ne[0];
