@@ -3935,6 +3935,24 @@ static ggml_type kv_cache_type_from_str(const std::string & s) {
     if (s == "nvfp4") {
         return GGML_TYPE_NVFP4;
     }
+    if (s == "turbo2_0") {
+        return GGML_TYPE_TURBO2_0;
+    }
+    if (s == "turbo3_0") {
+        return GGML_TYPE_TURBO3_0;
+    }
+    if (s == "turbo4_0") {
+        return GGML_TYPE_TURBO4_0;
+    }
+    if (s == "turbo2_tcq") {
+        return GGML_TYPE_TURBO2_TCQ;
+    }
+    if (s == "turbo3_tcq") {
+        return GGML_TYPE_TURBO3_TCQ;
+    }
+    if (s == "turbo4_tcq") {
+        return GGML_TYPE_TURBO4_TCQ;
+    }
     if (s == "q8_0") {
         return GGML_TYPE_Q8_0;
     }
