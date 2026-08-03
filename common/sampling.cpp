@@ -10,10 +10,21 @@
 #include <immintrin.h>
 
 // ── Den Governor emotion router (weak — overridden by libggml.so if linked) ──
+#if defined(_MSC_VER)
+// MSVC has no __attribute__((weak)). selectany emits a COMDAT stub so the real
+// definition (ggml-cuda.cu, in ggml.dll) links without a duplicate-symbol error.
+// On Windows DLLs do not interpose, so the stub is the active implementation —
+// PAD emotion routing stays dormant (no-op), per the PAD HARD-RULE.
+extern "C" __declspec(selectany) void den_governor_emotion_route_apply(
+    float* temperature, float* top_p, float* repetition_penalty) {
+    (void)temperature; (void)top_p; (void)repetition_penalty; // no-op stub
+}
+#else
 extern "C" __attribute__((weak)) void den_governor_emotion_route_apply(
     float* temperature, float* top_p, float* repetition_penalty) {
     (void)temperature; (void)top_p; (void)repetition_penalty; // no-op stub
 }
+#endif
 #endif
 #include <nlohmann/json.hpp>
 using json = nlohmann::ordered_json;
