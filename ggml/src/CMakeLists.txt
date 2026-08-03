@@ -509,8 +509,8 @@ if (GGML_CUDA)
 
         # Exclude SM120 kernel .cu files from main build (they use sm_120a PTX)
         # den_decode_sm120_aot.cu is also stale — superseded by den_mxf4nvf4_decode_sm120.cu fatbin
-        # den_fattn_nvfp4.cu uses OMMA mxf4nvf4 block-scale instructions (requires sm_120a)
-        list(FILTER GGML_SOURCES_CUDA EXCLUDE REGEX "den_(mxf4nvf4_decode_sm120|decode_sm120_aot|fattn_nvfp4)\\.cu$|nvfp4_omma\\.cu$")
+        # den_fattn_nvfp4.cu IS compiled in (sm_120a OMMA NVFP4 flash attention — active)
+        list(FILTER GGML_SOURCES_CUDA EXCLUDE REGEX "den_(mxf4nvf4_decode_sm120|decode_sm120_aot)\\.cu$|nvfp4_omma\\.cu$")
         message(STATUS "OMMA: nvfp4_omma.cu excluded from main build (compiled as standalone cubin)")
         message(STATUS "OMMA: nvfp4_omma_dispatch.cu stays in main build (host-only code)")
 

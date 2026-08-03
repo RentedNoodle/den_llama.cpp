@@ -5678,9 +5678,5 @@ GGML_CALL int ggml_backend_cuda_reg_devices() {
     return device_count;
 }
 
-// ── CUDA 13.3 stub for sm_120a-only op ──
-// den_fattn_nvfp4.cu requires sm_120a (OMMA mxf4nvf4 block-scale) and is
-// excluded from the default build.  This stub satisfies the link-time
-// reference so the nvfp4 flash-attention path defaults to the standard
-// ggml-cuda fallback at runtime.
-void ggml_cuda_flash_attn_ext_nvfp4(ggml_backend_cuda_context &, ggml_tensor *, float) {}
+// ggml_cuda_flash_attn_ext_nvfp4() is provided by den_fattn_nvfp4.cu,
+// compiled into the main build (sm_120a). Declaration in fattn.cuh.
