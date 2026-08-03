@@ -755,10 +755,13 @@ bool llama_model_loader::load_den_model(const std::string & fname) {
             ggml_tensor * t = ggml_new_tensor(ctx_den, type, (int) ndim, ne);
             ggml_set_name(t, name.c_str());
             weights.emplace_back(0, (size_t)(hdr.data_offset + e.data_offset), t);
-            if (sub == 15) { // A_log -> ssm_a transform
-                weights.back().xform = llama_tensor_weight::XFORM_NEG_EXP;
-                den_has_xform = true;
-            } else if (sub == 17) { // conv1d BF16 -> F32
+            // NOTE (2026-08-03): ssm_a (slot 15) is ALREADY stored as -exp(A_log)
+            // by the converter (convert_hf_to_gguf.py "A_log -> A = -exp(A_log)").
+            // The GGUF path reads it as-is. Applying XFORM_NEG_EXP here double-
+            // neg-exponents it -> corrupt delta-net gates for every .den model.
+            // Single-source contract: converters emit -exp(A_log); loaders do NOT
+            // transform ssm_a.
+            if (sub == 17) { // conv1d BF16 -> F32
                 weights.back().xform = llama_tensor_weight::XFORM_BF16_TO_F32;
                 den_has_xform = true;
             }
