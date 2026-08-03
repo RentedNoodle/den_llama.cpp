@@ -2752,7 +2752,12 @@ static int ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor 
     use_mul_mat_q           = use_mul_mat_q           && ggml_cuda_should_use_mmq(src0->type, cc, src1->ne[1]);
     any_gpus_with_slow_fp16 = any_gpus_with_slow_fp16 || !fast_fp16_available(cc);
 
-    if ((use_mul_mat_vec_q || use_mul_mat_q) && src0->type != GGML_TYPE_NVFP4 && src1->ne[2]*src1->ne[3] == 1) {
+    if ((use_mul_mat_vec_q || use_mul_mat_q) && src1->ne[2]*src1->ne[3] == 1 &&
+        (src0->type != GGML_TYPE_NVFP4 || strstr(src0->name, "exps") != nullptr)) {
+        // NVFP4 experts route to the plain mmq path (native Blackwell OMMA);
+        // NVFP4 attention/lm_head stay on the soft-gemv (E2M1 activation too
+        // coarse for the GDN). Test: does the native OMMA apply the per-expert
+        // norm correctly? If garbled, revert exps to soft-gemv.
         return ggml_cuda_mul_mat_q(ctx, src0, src1, dst, cgraph, node_n, use_mul_mat_vec_q);
     }
 

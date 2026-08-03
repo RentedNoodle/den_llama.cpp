@@ -506,15 +506,23 @@ static __global__ void den_nvfp4_soft_gemv_kernel(
         const uint8_t* blk = base + (size_t)kt * 160;
         float norm = 1.0f;
         memcpy(&norm, blk + 152, 4);
-        for (int k = 0; k < 256; k++) {
-            float sc = ue4m3_byte_to_f32(blk[k / 16]) * norm;
-            // CPU dequant convention (dequantize_row_nvfp4 NULLGLASS path):
-            // element k lives in byte 16 + (k/16)*8 + (k%8); nibble is upper
-            // half for k%16>=8 else lower. (The old byte k/2 read was a
-            // permutation of the on-disk layout -> wrong activation pairing.)
-            uint8_t qb = blk[16 + (k / 16) * 8 + (k % 8)];
-            uint8_t nib = ((k % 16) >= 8) ? (uint8_t)(qb >> 4) : (uint8_t)(qb & 0x0F);
-            sum += e2m1_std[nib] * sc * x[kt*256 + k];
+        const float* __restrict__ xk = x + (size_t)kt * 256;
+        // CPU dequant convention (dequantize_row_nvfp4 NULLGLASS path):
+        // 16 sub-groups of 16 elements each; sub-group `sub` uses UE4M3 scale
+        // byte blk[sub]; element sub*16+j = LOW nibble of qs[sub*8+j], and
+        // element sub*16+8+j = HIGH nibble. Hoisting the per-sub-group scale
+        // avoids 256 ue4m3 conversions per block (only 16 needed).
+        #pragma unroll
+        for (int sub = 0; sub < 16; sub++) {
+            const float sc = ue4m3_byte_to_f32(blk[sub]) * norm;
+            const uint8_t* __restrict__ qs = blk + 16 + sub * 8;
+            const int kbase = sub * 16;
+            #pragma unroll
+            for (int j = 0; j < 8; j++) {
+                const uint8_t qb = qs[j];
+                sum += e2m1_std[qb & 0x0F] * sc * xk[kbase + j];
+                sum += e2m1_std[qb >> 4]    * sc * xk[kbase + 8 + j];
+            }
         }
     }
     y[row] = sum;
