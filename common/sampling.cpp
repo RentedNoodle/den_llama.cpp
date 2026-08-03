@@ -6,16 +6,17 @@
 
 #include <limits>
 #include <random>
-#if defined(__GNUC__) && (defined(__x86_64__) || defined(__i386__))
+#if defined(_MSC_VER) || (defined(__GNUC__) && (defined(__x86_64__) || defined(__i386__)))
 #include <immintrin.h>
 
 // ── Den Governor emotion router (weak — overridden by libggml.so if linked) ──
 #if defined(_MSC_VER)
-// MSVC has no __attribute__((weak)). selectany emits a COMDAT stub so the real
-// definition (ggml-cuda.cu, in ggml.dll) links without a duplicate-symbol error.
-// On Windows DLLs do not interpose, so the stub is the active implementation —
-// PAD emotion routing stays dormant (no-op), per the PAD HARD-RULE.
-extern "C" __declspec(selectany) void den_governor_emotion_route_apply(
+// MSVC has no __attribute__((weak)). A plain strong stub in common is fine:
+// ggml is a separate DLL (common does not import this symbol), so there is no
+// duplicate-symbol conflict and PAD emotion routing stays dormant (no-op) —
+// per the PAD HARD-RULE. On Linux the weak stub below is overridden by the
+// real definition in ggml-cuda.cu when linked.
+extern "C" void den_governor_emotion_route_apply(
     float* temperature, float* top_p, float* repetition_penalty) {
     (void)temperature; (void)top_p; (void)repetition_penalty; // no-op stub
 }
