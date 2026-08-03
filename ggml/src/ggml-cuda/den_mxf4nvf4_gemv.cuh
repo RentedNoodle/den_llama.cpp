@@ -75,17 +75,14 @@ __forceinline__ __device__ void load_tile_data(
 #endif
     #pragma unroll
     for (int mm = 0; mm < 4; mm++) {
-        // NULLGLASS 160B in-memory is INTERLEAVED (matches the loader + CPU oracle
-        // dequantize_row_nvfp4): sub-block mm's 32 nibble bytes at 36*mm+4, its
-        // 4 UE4M3 scale bytes at 36*mm. The 152B DENSCALE_V path stays legacy.
-        const uint32_t * q0 = (const uint32_t *)(tile0 + (tile_bytes == 160 ? 36*mm + 4 : nib_offset + mm*32));
-        const uint32_t * q1 = (const uint32_t *)(tile1 + (tile_bytes == 160 ? 36*mm + 4 : nib_offset + mm*32));
+        const uint32_t * q0 = (const uint32_t *)(tile0 + nib_offset + mm * 32);
+        const uint32_t * q1 = (const uint32_t *)(tile1 + nib_offset + mm * 32);
         td.a0[mm] = __ldg(&q0[kg]);
         td.a2[mm] = __ldg(&q0[4 + kg]);
         td.a1[mm] = __ldg(&q1[kg]);
         td.a3[mm] = __ldg(&q1[4 + kg]);
-        td.sfa[mm]  = __ldg(&((const uint32_t *)(tile0 + (tile_bytes == 160 ? 36*mm : sfa_offset)))[tile_bytes == 160 ? 0 : mm]);
-        td.sfa1[mm] = __ldg(&((const uint32_t *)(tile1 + (tile_bytes == 160 ? 36*mm : sfa_offset)))[tile_bytes == 160 ? 0 : mm]);
+        td.sfa[mm]  = __ldg(&((const uint32_t *)(tile0 + sfa_offset))[mm]);
+        td.sfa1[mm] = __ldg(&((const uint32_t *)(tile1 + sfa_offset))[mm]);
     }
 #ifdef DENSCALE_V
     // Load 8 UE8M0 coarse scales from tile bytes 128-135 (152B tiles only)

@@ -1402,11 +1402,12 @@ bool llama_model_loader::load_all_data(
             uint8_t * dst = expanded.data();
             const uint8_t * srcp = raw.data();
             for (int64_t b = 0; b < nblocks; ++b) {
-                // In-memory layout = INTERLEAVED (matches on-disk, the CPU oracle
-                // dequantize_row_nvfp4, and the soft_gemv/iqk/convert/dmmv consumers).
-                // Copy verbatim; do NOT de-interleave to contiguous — that mismatch
-                // made every INTERLEAVED reader garble (the 2026-08-02 decode bug).
-                memcpy(dst, srcp, 144);
+                // De-interleave 4x [4 scales][32 nibbles] -> scales[0:16] + nibbles[16:144]
+                for (int sb = 0; sb < 4; ++sb) {
+                    const uint8_t * s = srcp + sb * 36;
+                    memcpy(dst + sb * 4, s, 4);            // scales -> dst[0:16]
+                    memcpy(dst + 16 + sb * 32, s + 4, 32); // nibbles -> dst[16:144]
+                }
                 memset(dst + 144, 0, 16);                  // NULLGLASS header
                 srcp += 144; dst += 160;
             }
