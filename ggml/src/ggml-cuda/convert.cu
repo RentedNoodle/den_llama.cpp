@@ -1676,9 +1676,13 @@ static __global__ void dequantize_block_nvfp4(const void * __restrict__ vx, dst_
     const int64_t tid = threadIdx.x;
     dst_t * y = yy + i * QK_NVFP4 + tid * 16;
 
-    const int d4_idx = tid / 4;
-    const int byte_idx = tid % 4;
-    const uint8_t scale_byte = (uint8_t)(x->d4[d4_idx] >> (8 * byte_idx));
+    // TRUE interleaved 144B layout (validator dequant_nvfp4, cos 0.9955):
+    // 4 sub-blocks of [4 scale bytes][32 nibble bytes]. scale for group g =
+    // raw byte (g/4)*36 + (g%4); nibble byte j of group g = raw byte
+    // (g/4)*36 + 4 + (g%4)*8 + j; nibble byte j -> element 16*g+j (low),
+    // 16*g+8+j (high). Thread tid handles group g = tid.
+    const uint8_t * raw = (const uint8_t *)x;
+    const uint8_t scale_byte = raw[(tid/4)*36 + (tid%4)];
     // tile_norm at bytes [152:155] (float32): per-tensor/per-expert global
     // scale folded at load time (OMMA_NATIVE_FUSED_SCALE). Same slot the OMMA
     // kernel reads, so GPU software + OMMA share one source of truth.
@@ -1689,7 +1693,7 @@ static __global__ void dequantize_block_nvfp4(const void * __restrict__ vx, dst_
     const float s = ggml_cuda_ue4m3_to_fp32(scale_byte) * norm * 0.5f;
 
     for (int j = 0; j < 8; ++j) {
-        const uint8_t q = x->qs[tid * 8 + j];
+        const uint8_t q = raw[(tid/4)*36 + 4 + (tid%4)*8 + j];
         y[j]      = s * kvalues_mxfp4[q & 0x0F];
         y[j + 8]  = s * kvalues_mxfp4[q >> 4];
     }

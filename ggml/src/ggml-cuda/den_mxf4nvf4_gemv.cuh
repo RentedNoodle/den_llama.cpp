@@ -507,12 +507,14 @@ static __global__ void den_nvfp4_soft_gemv_kernel(
         float norm = 1.0f;
         memcpy(&norm, blk + 152, 4);
         for (int k = 0; k < 256; k++) {
-            float sc = ue4m3_byte_to_f32(blk[k / 16]) * norm;
-            // CPU dequant convention (dequantize_row_nvfp4 NULLGLASS path):
-            // element k lives in byte 16 + (k/16)*8 + (k%8); nibble is upper
-            // half for k%16>=8 else lower. (The old byte k/2 read was a
-            // permutation of the on-disk layout -> wrong activation pairing.)
-            uint8_t qb = blk[16 + (k / 16) * 8 + (k % 8)];
+            const int g = k / 16;    // group g (0..15)
+            // TRUE interleaved 144B layout (validator dequant_nvfp4, cos
+            // 0.9955): scale for group g = raw byte (g/4)*36 + (g%4); nibble
+            // byte j of group g = raw byte (g/4)*36 + 4 + (g%4)*8 + j; nibble
+            // byte j -> element 16g+j (low), 16g+8+j (high).
+            float sc = ue4m3_byte_to_f32(blk[(g/4)*36 + (g%4)]) * norm;
+            const int jb = k % 8;
+            uint8_t qb = blk[(g/4)*36 + 4 + (g%4)*8 + jb];
             uint8_t nib = ((k % 16) >= 8) ? (uint8_t)(qb >> 4) : (uint8_t)(qb & 0x0F);
             sum += e2m1_std[nib] * sc * x[kt*256 + k];
         }

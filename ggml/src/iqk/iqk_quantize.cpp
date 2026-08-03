@@ -4367,13 +4367,14 @@ void dequantize_row_nvfp4(const block_nvfp4 * x, float * y, int64_t k) {
     // NULLGLASS 160B format path
     int nblock = k / QK_NVFP4;
     for (int ib = 0; ib < nblock; ++ib) {
+        // TRUE interleaved 144B block layout (validator dequant_nvfp4, cos
+        // 0.9955): 4 sub-blocks of [4 scale bytes][32 nibble bytes].  scale for
+        // group g = raw byte (g/4)*36 + (g%4); nibble byte j of group g = raw
+        // byte (g/4)*36 + 4 + (g%4)*8 + j.
+        const uint8_t * raw = (const uint8_t *)&x[ib];
         float scales[16];
-        for (int s = 0; s < 4; ++s) {
-            uint32_t d = x[ib].d4[s];
-            scales[4*s + 0] = nvfp4_ue4m3_to_fp32((uint8_t)(d));
-            scales[4*s + 1] = nvfp4_ue4m3_to_fp32((uint8_t)(d >> 8));
-            scales[4*s + 2] = nvfp4_ue4m3_to_fp32((uint8_t)(d >> 16));
-            scales[4*s + 3] = nvfp4_ue4m3_to_fp32((uint8_t)(d >> 24));
+        for (int g = 0; g < 16; ++g) {
+            scales[g] = nvfp4_ue4m3_to_fp32(raw[(g/4)*36 + (g%4)]);
         }
         // tile_norm at bytes 152-155 (float32): the per-tensor/per-expert
         // global scale, folded at load time (OMMA_NATIVE_FUSED_SCALE). Same
@@ -4387,7 +4388,9 @@ void dequantize_row_nvfp4(const block_nvfp4 * x, float * y, int64_t k) {
         for (int sub = 0; sub < 16; ++sub) {
             float s = scales[sub] * norm * 0.5f;
             for (int j = 0; j < 8; ++j) {
-                uint8_t q = x[ib].qs[sub * 8 + j];
+                // nibble byte j of group sub -> element sub*16+j (low),
+                // element sub*16+8+j (high), at TRUE interleaved offset.
+                uint8_t q = raw[(sub/4)*36 + 4 + (sub%4)*8 + j];
                 y[sub * 16 + j]       = s * kvalues_mxfp4[q & 0x0F];
                 y[sub * 16 + 8 + j]   = s * kvalues_mxfp4[q >> 4];
             }
