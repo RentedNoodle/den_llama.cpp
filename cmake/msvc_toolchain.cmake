@@ -12,7 +12,6 @@
 # Find pip CUDA 13.3 nvcc
 set(PIP_CUDA_PATHS
     "C:/Users/james/AppData/Local/Programs/Python/Python314/Lib/site-packages/nvidia/cu13"
-    "C:/Den/den-py314/Lib/site-packages/nvidia/cu13"
 )
 
 foreach(PIP_PATH ${PIP_CUDA_PATHS})
@@ -39,7 +38,6 @@ endif()
 set(CCCL_PATHS
     "C:/Users/james/AppData/Local/Programs/Python/Python314/Lib/site-packages/nvidia/cuda_cccl"
     "C:/Users/james/AppData/Local/Programs/Python/Python314/Lib/site-packages/nvidia/cu13/include/cccl"
-    "C:/Den/den-py314/Lib/site-packages/nvidia/cuda_cccl"
 )
 
 set(CCCL_FOUND FALSE)
