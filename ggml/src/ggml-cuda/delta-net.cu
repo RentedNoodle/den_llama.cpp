@@ -134,7 +134,7 @@ __global__ void delta_net_recurrent_f32(
         float beta_val = sigmoid_f(beta_ptr[t*n_heads]);
         // gate = softplus(alpha+dt) * (-ssm_a) is POSITIVE -> decay must be exp(-gate).
         // exp(+gate) amplifies the SSM state instead of decaying it (GPU garble, Fix B).
-        float decay    = expf(-fminf(g_ptr[t*n_heads], 50.0f));
+        float decay    = expf(-g_ptr[t*n_heads]); // match CPU iqk_mul_mat.cpp:1701 expf(-g) — CPU-is-oracle, no clamp
 
         float sum1 = 0, sum2 = 0;
 #pragma unroll
