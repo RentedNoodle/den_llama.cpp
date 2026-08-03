@@ -501,6 +501,12 @@ void ggml_cuda_mul_mat_q_id(ggml_backend_cuda_context & ctx, const ggml_tensor *
 }
 
 bool ggml_cuda_can_use_mmq_id(enum ggml_type type, int cc, int64_t ne11) {
+    if (type == GGML_TYPE_NVFP4) {
+        // NVFP4 mmq_id dequant is broken (load_tiles_nvfp4 scale<->k pairing).
+        // Route to the correct soft-gemv / OMMA path instead.
+        return false;
+    }
+
     bool mmq_supported;
 
     switch (type) {

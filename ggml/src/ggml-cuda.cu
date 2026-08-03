@@ -2752,7 +2752,7 @@ static int ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor 
     use_mul_mat_q           = use_mul_mat_q           && ggml_cuda_should_use_mmq(src0->type, cc, src1->ne[1]);
     any_gpus_with_slow_fp16 = any_gpus_with_slow_fp16 || !fast_fp16_available(cc);
 
-    if ((use_mul_mat_vec_q || use_mul_mat_q) && src1->ne[2]*src1->ne[3] == 1) {
+    if ((use_mul_mat_vec_q || use_mul_mat_q) && src0->type != GGML_TYPE_NVFP4 && src1->ne[2]*src1->ne[3] == 1) {
         return ggml_cuda_mul_mat_q(ctx, src0, src1, dst, cgraph, node_n, use_mul_mat_vec_q);
     }
 
@@ -3054,7 +3054,8 @@ static bool ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
     }
 
     if (src1->ne[2] <= ctx.mmq_id_thresh*src0->ne[2] &&
-        ggml_is_quantized(src0->type) && ggml_cuda_can_use_mmq_id(src0->type, ggml_cuda_info().devices[ctx.device].cc, src1->ne[2])) {
+        ggml_is_quantized(src0->type) && src0->type != GGML_TYPE_NVFP4 &&
+        ggml_cuda_can_use_mmq_id(src0->type, ggml_cuda_info().devices[ctx.device].cc, src1->ne[2])) {
         ggml_cuda_mul_mat_q_id(ctx, src0, src1, ids, dst, nullptr, nullptr);
         return false;
     }
@@ -3137,7 +3138,7 @@ static bool ggml_cuda_mul_mat_id(ggml_backend_cuda_context & ctx, ggml_tensor * 
         dst_row.nb[2] = num_src1_rows*nb1;
         dst_row.nb[3] = num_src1_rows*nb1;
 
-        if (ggml_is_quantized(src0->type) &&
+        if (ggml_is_quantized(src0->type) && src0->type != GGML_TYPE_NVFP4 &&
             ggml_cuda_should_use_mmq(src0->type, ggml_cuda_info().devices[ctx.device].cc, num_src1_rows)) {
             auto src1_padded_num_cols = GGML_PAD(src1->ne[0], MATRIX_ROW_PADDING);
             auto src1_padded_row_size = src1_padded_num_cols/ggml_blck_size(GGML_TYPE_Q8_1)*ggml_type_size(GGML_TYPE_Q8_1);
@@ -4566,6 +4567,13 @@ static bool check_node_graph_compatibility_and_refresh_copy_ops(ggml_cuda_graph 
         // stable (same pointer, updated contents) so a captured graph replays the
         // current expert selection. Only the multi-token (prompt) MUL_MAT_ID is
         // excluded (grid/batch changes break the capture).
+        if ((node->op == GGML_OP_MUL_MAT_ID || node->op == GGML_OP_MOE_FUSED_UP_GATE) &&
+            node->src[0] && node->src[0]->type == GGML_TYPE_NVFP4) {
+            // NVFP4 experts route through the generic MUL_MAT_ID / fused-up-gate
+            // path (prepare_row_mappigs host-side id sync), which cannot be
+            // captured. Coherence first; capture-safe OMMA bridge lands later.
+            use_cuda_graph = false;
+        }
         if (node->op == GGML_OP_MUL_MAT_ID && (node->ne[2] != 1)) {
             use_cuda_graph = false; // multi-token/batched MoE not capturable
 #ifndef NDEBUG
