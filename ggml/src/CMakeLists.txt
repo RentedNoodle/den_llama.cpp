@@ -1626,6 +1626,15 @@ endif()
 
 # ggml
 
+# CPU-only build: ggml-backend.cpp references the CUDA expert-offload helpers
+# (den_expert_* in ggml-cuda/den_expert_offload.cu) unconditionally. Provide
+# no-op stubs when CUDA is disabled so the CPU build links.
+if (NOT GGML_CUDA)
+    set(GGML_SOURCES_EXPERT_STUB den_expert_cpu_stubs.cpp)
+else()
+    set(GGML_SOURCES_EXPERT_STUB)
+endif()
+
 add_library(ggml
             ../include/ggml.h
             ../include/ggml-alloc.h
@@ -1635,6 +1644,7 @@ add_library(ggml
             ggml-backend.cpp
             ggml-quants.c
             ggml-quants.h
+            ${GGML_SOURCES_EXPERT_STUB}
             ${GGML_SOURCES_CUDA}      ${GGML_HEADERS_CUDA}
             ${GGML_SOURCES_METAL}     ${GGML_HEADERS_METAL}
             ${GGML_SOURCES_RPC}       ${GGML_HEADERS_RPC}
