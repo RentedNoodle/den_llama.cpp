@@ -342,7 +342,10 @@ if (GGML_CUDA)
 
         if (GGML_MUSA)
             set(CMAKE_CUDA_COMPILER ${MUSAToolkit_MCC_EXECUTABLE})
-        elseif(NOT CMAKE_CUDA_COMPILER)
+        else()
+            # UNCONDITIONAL: build.ps1 pins -DCMAKE_CUDA_COMPILER to pip nvcc, so the
+            # old "elseif(NOT CMAKE_CUDA_COMPILER)" gate here would skip this call and
+            # silently disable ALL .cu compilation → unresolved CUDA symbols at link.
             enable_language(CUDA)
         endif()
 
