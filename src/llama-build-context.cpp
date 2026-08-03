@@ -51,11 +51,7 @@ llm_build_context::llm_build_context(
         n_embd_head_v    (hparams.n_embd_head_v(0)),
         n_embd_v_gqa     (hparams.n_embd_v_gqa()),
         n_expert         (hparams.n_expert),
-        // Warmup must use the SAME n_expert_used as real decode: using n_expert
-        // (all 256) for the warmup's single-BOS pass produces per-layer routing
-        // ids that the GPU expert-offload path misreads → NaN in the MoE reduction
-        // → corrupts the SSM state → garbled decode (2026-08-02 35B NVFP4 blocker).
-        n_expert_used    (hparams.n_expert_used),
+        n_expert_used    (warmup ? hparams.n_expert : hparams.n_expert_used),
         freq_base        (cparams.rope_freq_base),
         freq_scale       (cparams.rope_freq_scale),
         ext_factor       (cparams.yarn_ext_factor),

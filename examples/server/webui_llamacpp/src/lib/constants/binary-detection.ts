@@ -1,4 +1,3 @@
-<<<<<<< Updated upstream
 export interface BinaryDetectionOptions {
 	/** Number of characters to check from the beginning of the file */
 	prefixLength: number;
@@ -13,12 +12,3 @@ export const DEFAULT_BINARY_DETECTION_OPTIONS: BinaryDetectionOptions = {
 	suspiciousCharThresholdRatio: 0.15, // Allow up to 15% suspicious chars
 	maxAbsoluteNullBytes: 2
 };
-=======
-import type { BinaryDetectionOptions } from '$lib/types';
-
-export const DEFAULT_BINARY_DETECTION_OPTIONS: BinaryDetectionOptions = {
-	prefixLength: 1024 * 10, // Check the first 10KB of the string
-	suspiciousCharThresholdRatio: 0.15, // Allow up to 15% suspicious chars
-	maxAbsoluteNullBytes: 2
-};
->>>>>>> Stashed changes

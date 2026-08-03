@@ -5,11 +5,11 @@
 #include <cstdlib>
 #include <cstring>
 #include <vector>
-#include <chrono>  // portable timing (replaces POSIX sys/time.h for Windows)
+#include <sys/time.h>
 
 static double now_ms() {
-    using namespace std::chrono;
-    return duration<double, std::milli>(steady_clock::now().time_since_epoch()).count();
+    struct timeval tv; gettimeofday(&tv, NULL);
+    return tv.tv_sec * 1000.0 + tv.tv_usec / 1000.0;
 }
 
 static llama_token greedy_sample(struct llama_context * ctx, int logit_idx) {

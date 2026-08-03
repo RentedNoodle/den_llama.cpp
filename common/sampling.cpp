@@ -14,11 +14,6 @@ extern "C" __attribute__((weak)) void den_governor_emotion_route_apply(
     float* temperature, float* top_p, float* repetition_penalty) {
     (void)temperature; (void)top_p; (void)repetition_penalty; // no-op stub
 }
-#else
-// MSVC: __attribute__((weak)) is GCC-only. The implementation lives in
-// ggml-cuda.cu (ggml library) — declare for linkage.
-extern "C" void den_governor_emotion_route_apply(
-    float* temperature, float* top_p, float* repetition_penalty);
 #endif
 #include <nlohmann/json.hpp>
 using json = nlohmann::ordered_json;

@@ -7130,16 +7130,8 @@ struct llama_context * llama_init_from_model(
         // host-pinned (e.g. -ot exps=CPU), only the ACTIVE experts are streamed
         // to the GPU and computed there (selective-upload thesis). Inert for
         // dense / all-GPU models.
-        // Expert offload (only_active_experts) is OPT-IN via DEN_EXPERT_OFFLOAD=1.
-        // The GPU mmq_id MoE path has a ~0.43x scale divergence vs the CPU iqk path
-        // (2026-08-02: 35B NVFP4 decode garbles on GPU MoE; CPU MoE is correct). The
-        // selective-upload infra stays for when the mmq_id scale is fixed.
-        if (getenv("DEN_EXPERT_OFFLOAD") != nullptr) {
-            LLAMA_LOG_INFO("%s: DEN_EXPERT_OFFLOAD set - enabling only_active_experts scheduling (expert offload)\n", __func__);
-            ggml_backend_sched_set_only_active_experts(ctx->sched, true);
-        } else {
-            LLAMA_LOG_INFO("%s: expert offload disabled (GPU mmq_id MoE scale divergence; CPU MoE is correct)\n", __func__);
-        }
+        LLAMA_LOG_INFO("%s: enabling only_active_experts scheduling (expert offload)\n", __func__);
+        ggml_backend_sched_set_only_active_experts(ctx->sched, true);
         if (cparams.expert_cache_mb > 0) {
             LLAMA_LOG_INFO("%s: expert LRU cache enabled: %d MiB\n", __func__, cparams.expert_cache_mb);
             ggml_backend_sched_set_expert_cache_mb(ctx->sched, cparams.expert_cache_mb);

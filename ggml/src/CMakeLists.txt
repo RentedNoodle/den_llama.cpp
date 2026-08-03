@@ -342,10 +342,7 @@ if (GGML_CUDA)
 
         if (GGML_MUSA)
             set(CMAKE_CUDA_COMPILER ${MUSAToolkit_MCC_EXECUTABLE})
-        else()
-            # Unconditional: the msvc_toolchain pre-sets CMAKE_CUDA_COMPILER, so
-            # "NOT CMAKE_CUDA_COMPILER" was false and CUDA silently never enabled
-            # (ggml-cuda built empty). This is the Windows-native silent-disable fix.
+        elseif(NOT CMAKE_CUDA_COMPILER)
             enable_language(CUDA)
         endif()
 
