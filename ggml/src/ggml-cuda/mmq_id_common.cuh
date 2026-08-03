@@ -1111,41 +1111,26 @@ template <int mmq_y, bool need_check> static __device__ __forceinline__ void loa
         }
 
         const block_nvfp4 * bxi = (const block_nvfp4 *)(x + i*stride) + kbx0;
-        // TRUE interleaved 144B block layout (validator dequant_nvfp4, cos
-        // 0.9955): 4 sub-blocks of [4 scale bytes][32 nibble bytes]. scale for
-        // group g = raw byte (g/4)*36 + (g%4); nibble byte j of group g = raw
-        // byte (g/4)*36 + 4 + (g%4)*8 + j. nibble byte j -> element 16g+j (low),
-        // 16g+8+j (high).
-        const uint8_t * raw = (const uint8_t *)bxi;
 
 #pragma unroll
         for (int l = 0; l < iters; ++l) {
-            // Thread kqsx owns one sub-block s = kqsx>>1, split by parity:
-            // even kqsx -> groups {4s,4s+1}, odd kqsx -> groups {4s+2,4s+3}.
-            // l selects (group-in-sub-block l>>1, byte-half l&1). One uint32
-            // spans the 4 nibble bytes j..j+3 of that group at raw byte
-            // 36*s + 4 + (g%4)*8 + 4*(l>>1)  ==  36*s + 4 + 16*(kqsx&1) + 4*l.
-            const int grp = 4*(kqsx>>1) + (l>>1) + 2*(kqsx&1); // group g (0..15)
-            const int aux_q4 = get_int_b1(raw, 9*(kqsx>>1) + 1 + 4*(kqsx&1) + l);
+            const int aux_q4 = get_int_b1(bxi->qs, kqsx*iters + l);
             const int2 v = get_int_from_table_16(aux_q4, kvalues_mxfp4);
 
 #if defined(AMD_MFMA_AVAILABLE) || defined(TURING_MMA_AVAILABLE)
-            // x_qs slot p holds K-elements 4p..4p+3 (dequantized int8). Group g
-            // fills slots 4g..4g+3: v.x -> {16g+j..16g+j+3}, v.y -> {16g+8+j..}.
-            x_qs[i*MMQ_MMA_TILE_X_K_Q3_K + 4*grp + (l&1) + 0] = v.x;
-            x_qs[i*MMQ_MMA_TILE_X_K_Q3_K + 4*grp + 2 + (l&1)] = v.y;
+            x_qs[i*MMQ_MMA_TILE_X_K_Q3_K + 8*kqsx + l + 0] = v.x;
+            x_qs[i*MMQ_MMA_TILE_X_K_Q3_K + 8*kqsx + l + 4] = v.y;
 #else
-            x_qs[i*(2*MMQ_TILE_NE_K + 1) + 4*grp + (l&1) + 0] = v.x;
-            x_qs[i*(2*MMQ_TILE_NE_K + 1) + 4*grp + 2 + (l&1)] = v.y;
+            x_qs[i*(2*MMQ_TILE_NE_K + 1) + 8*kqsx + l + 0] = v.x;
+            x_qs[i*(2*MMQ_TILE_NE_K + 1) + 8*kqsx + l + 4] = v.y;
 #endif
         }
 
-        // TRUE layout: scale for group g = raw byte (g/4)*36 + (g%4). Thread
-        // kqsx owns groups {2*kqsx, 2*kqsx+1} (same as the pre-interleave code).
-        const int grp0 = 2*kqsx;
-        const int grp1 = 2*kqsx + 1;
-        const float s0 = ggml_cuda_ue4m3_to_fp32(raw[(grp0/4)*36 + (grp0%4)]);
-        const float s1 = ggml_cuda_ue4m3_to_fp32(raw[(grp1/4)*36 + (grp1%4)]);
+        const int d4_idx = kqsx / 2;
+        const int byte_pos = (kqsx % 2) * 2;
+        const uint32_t d4_val = bxi->d4[d4_idx];
+        const float s0 = ggml_cuda_ue4m3_to_fp32((uint8_t)(d4_val >> (8 * byte_pos)));
+        const float s1 = ggml_cuda_ue4m3_to_fp32((uint8_t)(d4_val >> (8 * (byte_pos + 1))));
 
         // ── Per-tile norm fold (bytes 152:155) ──────────────────────────────
         // CPU dequantize_row_nvfp4 multiplies every value by the per-tensor /

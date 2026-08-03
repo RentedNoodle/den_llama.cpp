@@ -965,42 +965,41 @@ static __global__ void dequantize_mul_mat_vec_nvfp4(
 
     for (int kb = 0; kb < ncols_qk; kb++) {
         const block_nvfp4 * b = &bq[row * ncols_qk + kb];
-        const uint8_t * raw = (const uint8_t *)b;  // TRUE interleaved 144B layout
         // Per-tile norm (global/per-expert scale) at header bytes 152:155.
         float norm = 1.0f;
         memcpy(&norm, b->padding + 8, 4);
+        float scales[16];
+        for (int s = 0; s < 16; s++)
+            scales[s] = ggml_cuda_ue4m3_to_fp32((uint8_t)(b->d4[s/4] >> ((s%4)*8))) * norm;
         const float * e2m1 = e2m1_std;
 
-        // TRUE layout (validator dequant_nvfp4, cos 0.9955): 4 sub-blocks of
-        // [4 scale bytes][32 nibble bytes]. scale for group g = raw byte
-        // (g/4)*36 + (g%4); nibble byte j of group g = raw byte
-        // (g/4)*36 + 4 + (g%4)*8 + j. nibble byte j -> element 16g+j (low),
-        // 16g+8+j (high).
+        // Vectorized decode: 4 bytes = 8 nibbles per iteration via uint32
         const int k_off = kb * QK_NVFP4;
+        for (int j = 0; j < QK_NVFP4/2; j += 4) {
+            uint32_t qw = *(const uint32_t *)(b->qs + j);
 #ifdef GGML_CUDA_F16
-        const half * act_h = (const half *)yy + row * ncols;
-        for (int g = 0; g < 16; g++) {
-            const float s = ggml_cuda_ue4m3_to_fp32(raw[(g/4)*36 + (g%4)]) * norm;
-            for (int jb = 0; jb < 8; jb++) {
-                const uint8_t qb = raw[(g/4)*36 + 4 + (g%4)*8 + jb];
-                const int e0 = k_off + g*16 + jb;
-                const int e1 = k_off + g*16 + 8 + jb;
-                sumf += e2m1[qb & 0x0F] * s * __half2float(act_h[e0]);
-                sumf += e2m1[qb >> 4]    * s * __half2float(act_h[e1]);
-            }
-        }
+            const half * act_h = (const half *)yy + row * ncols;
+            half2 a0 = ((const half2 *)act_h)[(k_off + 2*j)/2];
+            half2 a1 = ((const half2 *)act_h)[(k_off + 2*j + 2)/2];
+            half2 a2 = ((const half2 *)act_h)[(k_off + 2*j + 4)/2];
+            half2 a3 = ((const half2 *)act_h)[(k_off + 2*j + 6)/2];
+            sumf += e2m1[(qw>> 0)&0xF] * scales[(2*j+0)/16] * __half2float(a0.x);
+            sumf += e2m1[(qw>> 4)&0xF] * scales[(2*j+0)/16] * __half2float(a0.y);
+            sumf += e2m1[(qw>> 8)&0xF] * scales[(2*j+2)/16] * __half2float(a1.x);
+            sumf += e2m1[(qw>>12)&0xF] * scales[(2*j+2)/16] * __half2float(a1.y);
+            sumf += e2m1[(qw>>16)&0xF] * scales[(2*j+4)/16] * __half2float(a2.x);
+            sumf += e2m1[(qw>>20)&0xF] * scales[(2*j+4)/16] * __half2float(a2.y);
+            sumf += e2m1[(qw>>24)&0xF] * scales[(2*j+6)/16] * __half2float(a3.x);
+            sumf += e2m1[(qw>>28)&0xF] * scales[(2*j+6)/16] * __half2float(a3.y);
 #else
-        for (int g = 0; g < 16; g++) {
-            const float s = ggml_cuda_ue4m3_to_fp32(raw[(g/4)*36 + (g%4)]) * norm;
-            for (int jb = 0; jb < 8; jb++) {
-                const uint8_t qb = raw[(g/4)*36 + 4 + (g%4)*8 + jb];
-                const int e0 = k_off + g*16 + jb;
-                const int e1 = k_off + g*16 + 8 + jb;
-                sumf += e2m1[qb & 0x0F] * s * yy[row*ncols + e0];
-                sumf += e2m1[qb >> 4]    * s * yy[row*ncols + e1];
+            for (int k = 0; k < 4; k++) {
+                const uint8_t bv = (qw >> (k*8)) & 0xFF;
+                const int bi = (j+k)*2;
+                sumf += e2m1[bv & 0xF] * scales[bi/16]   * yy[row*ncols + k_off + bi];
+                sumf += e2m1[bv >> 4]  * scales[(bi+1)/16] * yy[row*ncols + k_off + bi+1];
             }
-        }
 #endif
+        }
     }
     dst[row] = sumf;
 }
