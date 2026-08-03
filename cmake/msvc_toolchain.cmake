@@ -65,18 +65,16 @@ endif()
 # both libs and DLLs). Import libs live in lib/x64, runtime DLLs in bin/x64.
 set(SYS_CUDA_ROOT "C:/Program Files/NVIDIA GPU Computing Toolkit/CUDA/v13.3")
 if(EXISTS "${SYS_CUDA_ROOT}/lib/x64/cublas.lib" AND NOT TARGET CUDA::cublas)
-    add_library(CUDA::cublas SHARED IMPORTED)
+    add_library(CUDA::cublas UNKNOWN IMPORTED)
     set_target_properties(CUDA::cublas PROPERTIES
-        IMPORTED_IMPLIB   "${SYS_CUDA_ROOT}/lib/x64/cublas.lib"
-        IMPORTED_LOCATION "${SYS_CUDA_ROOT}/bin/x64/cublas64_13.dll"
+        IMPORTED_LOCATION "${SYS_CUDA_ROOT}/lib/x64/cublas.lib"
         INTERFACE_INCLUDE_DIRECTORIES "${SYS_CUDA_ROOT}/include")
     message(STATUS "msvc_toolchain: CUDA::cublas <- system CUDA (${SYS_CUDA_ROOT})")
 endif()
 if(EXISTS "${SYS_CUDA_ROOT}/lib/x64/cublasLt.lib" AND NOT TARGET CUDA::cublasLt)
-    add_library(CUDA::cublasLt SHARED IMPORTED)
+    add_library(CUDA::cublasLt UNKNOWN IMPORTED)
     set_target_properties(CUDA::cublasLt PROPERTIES
-        IMPORTED_IMPLIB   "${SYS_CUDA_ROOT}/lib/x64/cublasLt.lib"
-        IMPORTED_LOCATION "${SYS_CUDA_ROOT}/bin/x64/cublasLt64_13.dll"
+        IMPORTED_LOCATION "${SYS_CUDA_ROOT}/lib/x64/cublasLt.lib"
         INTERFACE_INCLUDE_DIRECTORIES "${SYS_CUDA_ROOT}/include")
     message(STATUS "msvc_toolchain: CUDA::cublasLt <- system CUDA (${SYS_CUDA_ROOT})")
 endif()
