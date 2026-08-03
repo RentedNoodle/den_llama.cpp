@@ -1,4 +1,4 @@
-# ============================================================================
+﻿# ============================================================================
 # den_llama.cpp NVFP4 Blood Proof Test
 # Verifies NVFP4 OMMA inference on consumer Blackwell (RTX 5070 Ti, sm_120a)
 #
