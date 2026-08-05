@@ -77,6 +77,7 @@
 #include "ggml-cuda/tri.cuh"
 #include "ggml-cuda/delta-net.cuh"
 #include "ggml-cuda/gated_delta_net.cuh"
+#include "ggml-cuda/den_run_mode.h"
 
 #include <algorithm>
 #include <array>
@@ -97,6 +98,35 @@
 #include <string>
 #include <vector>
 #include <sstream>
+
+// ── runtime engine mode (den_run_mode.h) ──
+// Default = DEN_MODE_NORMAL: the fork (llama/beellama/ik features) WITHOUT den's
+// NVFP4 additions. --mode super opts into the full den NVFP4 stack; --mode
+// basic is the stock/ik base. Defined here (ggml lib) so ggml dispatch AND
+// llama/common can both reach it.
+static den_run_mode g_den_run_mode = DEN_MODE_NORMAL; // default: trust the fork, not den's NVFP4 yet
+
+void den_set_run_mode(den_run_mode mode) { g_den_run_mode = mode; }
+den_run_mode den_get_run_mode(void)      { return g_den_run_mode; }
+
+// Map the current mode -> the set of den features it enables. This is the
+// single place to change when adding/removing a feature. Cached at first call.
+den_mode_policy den_mode_policy_get(void) {
+    static const den_mode_policy policy = [] {
+        switch (den_get_run_mode()) {
+            case DEN_MODE_SUPER:
+                return den_mode_policy{true, true, true, true, true, true, true, true}; // full den
+            case DEN_MODE_NORMAL:
+                // fork features + coherence software dequant + expert offload,
+                // but NOT the OMMA/NULLGLASS tensor-core or NVFP4-KV super features
+                return den_mode_policy{false, false, true, true, false, true, false, false};
+            case DEN_MODE_BASIC:
+            default:
+                return den_mode_policy{false, false, false, false, false, false, false, false}; // stock
+        }
+    }();
+    return policy;
+}
 
 #define IK_PRINT_TIMING 0
 
@@ -2494,6 +2524,30 @@ static void ggml_cuda_mul_mat_batched_cublas(ggml_backend_cuda_context & ctx, co
     }
 }
 
+// ── NVFP4 per-tensor global scale, applied at the matmul output (graph-level) ──
+// The native-FP4 MMQ path reads ONLY the per-16 UE4M3 block scales (d4) for the
+// mxf4nvf4 instruction and NEVER sees the per-tensor GLOBAL scale (~1e-4, from
+// the ".scale" companion / nvfp4_norm_factors). The global scale cannot be folded
+// into the 4-bit block (UE4M3 underflow) and cannot be applied pre-MMA (overflow),
+// so it is applied here, post-matmul, on the output — mirroring upstream's
+// graph-level approach. No-op when the tensor has no scale entry.
+static __global__ void k_scale_f32_by_ptr(float * __restrict__ dst, const float * __restrict__ scale_ptr, int n) {
+    const float s = __ldg(scale_ptr);
+    if (s == 1.0f) return;
+    int i = blockIdx.x * blockDim.x + threadIdx.x;
+    const int stride = gridDim.x * blockDim.x;
+    for (; i < n; i += stride) dst[i] *= s;
+}
+
+static void den_nvfp4_apply_global_scale(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, ggml_tensor * dst) {
+    if (src0->type != GGML_TYPE_NVFP4) return;
+    size_t n_norms = 0;
+    const float * norms = den_get_nvfp4_norm_array(src0->name, n_norms);
+    if (!norms || n_norms < 1) return;   // no global scale registered for this tensor
+    const int n = (int) ggml_nelements(dst);
+    k_scale_f32_by_ptr<<<n > 0 ? (n + 255) / 256 : 1, 256, 0, ctx.stream()>>>((float *) dst->data, norms, n);
+}
+
 static int ggml_cuda_mul_mat_q(ggml_backend_cuda_context & ctx, const ggml_tensor * src0, const ggml_tensor * src1, ggml_tensor * dst,
         const ggml_cgraph * cgraph, int node_n, bool is_gemv) {
 
@@ -2519,7 +2573,9 @@ static int ggml_cuda_mul_mat_q(ggml_backend_cuda_context & ctx, const ggml_tenso
         // Intercepts GGML_TYPE_NVFP4 before q8_1 quantize — routes through
         // the SASS-proven OMMA.SF.16864 cubin (nvfp4_omma.cubin).
         // Falls through to software dequant path for fusion cases (QKV / bias).
-        if (src0->type == GGML_TYPE_NVFP4) {
+        // Gated by mode policy nvfp4_omma: only --mode super uses the OMMA cubin;
+        // normal/basic fall through to the standard dequantize / upstream GEMV.
+        if (src0->type == GGML_TYPE_NVFP4 && den_mode_policy_get().nvfp4_omma) {
             // Check if this is a fusion case — if so, fall through to software
             bool is_qkv_fusion = (fusion && cgraph && node_n + 5 < cgraph->n_nodes &&
                 cgraph->nodes[node_n+1]->op == GGML_OP_MUL_MAT &&
@@ -2627,9 +2683,17 @@ static int ggml_cuda_mul_mat_q(ggml_backend_cuda_context & ctx, const ggml_tenso
             CUDA_CHECK(cudaGetLastError());
         }
     } else {
-        if (src0->type == GGML_TYPE_NVFP4 && ggml_cuda_info().devices[ctx.device].cc >= CC_BLACKWELL) {
+        if (src0->type == GGML_TYPE_NVFP4 && ggml_cuda_info().devices[ctx.device].cc >= CC_BLACKWELL &&
+            den_mode_policy_get().nvfp4_mmq) {
             // Use the native FP4 activation quantizer that produces uint32-packed
             // UE4M3 scales — the format mxf4nvf4 MMA expects for the B matrix.
+            // Only --mode super (den NVFP4); normal/basic use q8_1 (upstream).
+            static int den_native_mmq_log = 0;
+            if (den_native_mmq_log < 8) {
+                fprintf(stderr, "[DEN] NVFP4 -> native-FP4 MMQ: %s M=%lld K=%lld (global scale applied at output)\n",
+                        src0->name, (long long) src1->ne[1], (long long) src0->ne[0]);
+                den_native_mmq_log++;
+            }
             const int64_t ne0 = src1->ne[0];
             const int64_t ne1 = src1->ne[1];
             quantize_mmq_fp4_cuda((const float *)src1->data, nullptr, src1_quantized.get(), src0->type,
@@ -2643,6 +2707,9 @@ static int ggml_cuda_mul_mat_q(ggml_backend_cuda_context & ctx, const ggml_tenso
         ggml_cuda_op_mul_mat_q(ctx, src0, src1, dst, (const char *)src0->data, nullptr, src1_quantized.get(), (float *)dst->data,
                 0, src0->ne[1], src1->ne[1], ne10_padded, stream);
         CUDA_CHECK(cudaGetLastError());
+        // NVFP4 native-FP4 MMQ reads only per-16 d4 scales; apply the per-tensor
+        // global scale (~1e-4) at the output so results are coherent.
+        den_nvfp4_apply_global_scale(ctx, src0, dst);
     }
 
     if (!cgraph) return node_n;
@@ -2674,6 +2741,8 @@ static int ggml_cuda_mul_mat_q(ggml_backend_cuda_context & ctx, const ggml_tenso
         } else {
             ggml_cuda_op_mul_mat_q(ctx, dst->src[0], src1, dst, (const char *)dst->src[0]->data, nullptr, src1_quantized.get(),
                     (float *)dst->data, 0, dst->src[0]->ne[1], src1->ne[1], ne10_padded, stream);
+            // Same per-tensor global scale for the fused NVFP4 native-FP4 MMQ.
+            den_nvfp4_apply_global_scale(ctx, dst->src[0], dst);
         }
         CUDA_CHECK(cudaGetLastError());
         ++node_n;
@@ -2788,7 +2857,7 @@ static int ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor 
         if (debug) printf("%s(%s): ggml_cuda_mul_mat_batched_cublas\n", __func__, dst->name);
         // KQ + KQV multi-batch without FlashAttention
         ggml_cuda_mul_mat_batched_cublas(ctx, src0, src1, dst);
-    } else if (src0->type == GGML_TYPE_NVFP4) {
+    } else if (src0->type == GGML_TYPE_NVFP4 && den_mode_policy_get().nvfp4_softgemv) {
         // ── NVFP4 attention + lm_head: SOFTWARE dequant GEMV ────────────────
         // The OMMA kernels quantize activations to 4-bit E2M1. For the attention
         // projections the resulting ~1% per-element error is amplified by the GDN
@@ -2810,12 +2879,36 @@ static int ggml_cuda_mul_mat(ggml_backend_cuda_context & ctx, const ggml_tensor 
             const int M = (int)src1->ne[1];
             cudaStream_t stream = ctx.stream();
             if (g_rms_fusion_src != nullptr) g_rms_fusion_src = nullptr;  // fusion disabled at RMS_NORM dispatch
-            for (int m = 0; m < M; m++) {
-                den_nvfp4_soft_gemv_launch(
-                    src0->data,
-                    (const float*)src1->data + (size_t)m * K,
-                    (float*)dst->data  + (size_t)m * N,
-                    N, K, stream);
+            // Parallel split-K soft-GEMV: opt-in via DEN_SOFTGEMV_SPLITK=1.
+            // Default (flag absent) keeps the legacy serial soft-GEMV until the
+            // parallel path's coherence is confirmed.
+            static const int den_softgemv_splitk =
+                getenv("DEN_SOFTGEMV_SPLITK") && atoi(getenv("DEN_SOFTGEMV_SPLITK")) > 0;
+            static bool den_softgemv_splitk_logged = false;
+            if (den_softgemv_splitk) {
+                if (!den_softgemv_splitk_logged) {
+                    fprintf(stderr, "[DEN] soft-GEMV: parallel split-K (DEN_SOFTGEMV_SPLITK) N=%d K=%d M=%d\n",
+                            N, K, M);
+                    den_softgemv_splitk_logged = true;
+                }
+                // ONE launch per tensor: grid-stride covers all N rows per token,
+                // split-K across 4 warps/row, all SMs busy. Keep the per-token
+                // launch (decode M=1; batched prefill stays a thin M-loop).
+                for (int m = 0; m < M; m++) {
+                    den_nvfp4_soft_gemv_splitk_launch(
+                        src0->data,
+                        (const float*)src1->data + (size_t)m * K,
+                        (float*)dst->data  + (size_t)m * N,
+                        N, K, stream);
+                }
+            } else {
+                for (int m = 0; m < M; m++) {
+                    den_nvfp4_soft_gemv_launch(
+                        src0->data,
+                        (const float*)src1->data + (size_t)m * K,
+                        (float*)dst->data  + (size_t)m * N,
+                        N, K, stream);
+                }
             }
             return node_n;
         }

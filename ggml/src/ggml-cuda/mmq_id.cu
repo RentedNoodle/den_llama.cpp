@@ -501,11 +501,10 @@ void ggml_cuda_mul_mat_q_id(ggml_backend_cuda_context & ctx, const ggml_tensor *
 }
 
 bool ggml_cuda_can_use_mmq_id(enum ggml_type type, int cc, int64_t ne11) {
-    if (type == GGML_TYPE_NVFP4) {
-        // NVFP4 mmq_id dequant is broken (load_tiles_nvfp4 scale<->k pairing).
-        // Route to the correct soft-gemv / OMMA path instead.
-        return false;
-    }
+    // NVFP4 re-enabled 2026-08-04 (Path B): on sm_120a (BLACKWELL_MMA_AVAILABLE)
+    // den's mul_mat_q_case<NVFP4> uses load_tiles_nvfp4_nvfp4 (native NULLGLASS
+    // OMMA loader, mma_nvfp4_native.cuh) — the DP4A load_tiles_nvfp4 scale<->k
+    // bug is only the non-Blackwell fallback, never reached on GB203.
 
     bool mmq_supported;
 

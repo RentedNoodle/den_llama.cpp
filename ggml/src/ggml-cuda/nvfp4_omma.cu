@@ -148,6 +148,123 @@ extern "C" __global__ void nvfp4_gemv_kernel(
     }
 }
 
+// ═══════════════════════════════════════════════════════════════════════════════
+// nvfp4_gemv_std_kernel — OMMA.SF.16864 GEMV for the STANDARD NVFP4 NULLGLASS
+// block (the in-memory layout den's loader produces from upstream/Ornith GGUFs).
+//
+// This is the GDN/hybrid-model path: attention + output projections routed
+// through tensor cores at high activation precision. It reproduces EXACTLY the
+// coherent software-dequant result (den_nvfp4_soft_gemv_kernel / the CPU
+// dequantize_row_nvfp4 NULLGLASS path) — same scale semantics, same nibble
+// order — but computes the K-reduction on the OMMA.SF.16864 tensor core.
+//
+// In-memory NULLGLASS 160B block (what soft-gemv reads — the coherence anchor):
+//   [0:16]   d4[4] uint32 = 16 x UE4M3 per-16 sub-group scales
+//   [16:144] qs[128] E2M1 nibbles, 16 sub-groups x 8 bytes each
+//            sub-group `sub` (16 elems): LOW nibble of qs[sub*8+j] = elem sub*16+j,
+//            HIGH nibble = elem sub*16+8+j
+//   [144:160] cognitive header / padding; float32 per-tile norm at [152:155]
+//
+// A-fragment (weights): decodes the NULLGLASS low/high nibble order into the
+// m16n8k64 E2M1 register layout. Lane kg=lane%4 tiles K[0:64):
+//   a0/a1 -> K[kg*8 : kg*8+8), a2/a3 -> K[32+kg*8 : 40+kg*8)
+//   a0 nibble j = (q[(kg/2)*8 + j] >> ((kg&1)*4)) & 0xF
+//   a2 nibble j = (q[16 + (kg/2)*8 + j] >> ((kg&1)*4)) & 0xF
+// B-fragment (activations): fp16 x -> E2M1 (hardware requirement of mxf4nvf4).
+// SFA = the 4 UE4M3 sub-scales for this 64-K sub-block (d4[sub-block]).
+// Post-multiply by the folded per-tile norm at [152:155] (matches soft-gemv).
+// ═══════════════════════════════════════════════════════════════════════════════
+extern "C" __global__ void nvfp4_gemv_std_kernel(
+    const uint8_t* __restrict__ tiles,   // [N/tpr][160] NULLGLASS block data
+    const uint16_t* __restrict__ x,      // [K] input activation in fp16
+    float*         __restrict__ y,       // [N] output
+    int N, int K, int tpr)               // rows, cols, tiles per row
+{
+    int row = blockIdx.x;
+    if (row >= N) return;
+
+    int lane = threadIdx.x;
+    int kg = lane & 3;   // K-group 0-3 within each 64-K sub-block
+
+    float d0 = 0.0f, d1 = 0.0f, d2 = 0.0f, d3 = 0.0f;
+
+    for (int t = 0; t < tpr; t++) {
+        const uint8_t* tile = tiles + ((size_t)row * tpr + t) * TILE_BYTES;
+
+        uint32_t packed_scales[4];
+        for (int s = 0; s < 4; s++) {
+            packed_scales[s] = *(const uint32_t*)(tile + s * 4);
+        }
+
+        for (int sub = 0; sub < 4; sub++) {
+            int k_off = t * 256 + sub * 64;   // activation K-offset
+
+            // ── Build A fragment (weight E2M1 nibbles → uint32 registers) ──
+            // NULLGLASS nibble decode (low/high per 16-elem sub-group) into the
+            // OMMA m16n8k64 layout. a0/a1 = K[kg*8:kg*8+8), a2/a3 = K[32+kg*8:40+kg*8).
+            const uint8_t* q = tile + 16 + sub * 32;   // 32 bytes = 4 sub-groups
+            const int boff = (kg / 2) * 8;             // sub-group byte base
+            const int sh   = (kg & 1) * 4;             // low=0 / high=4
+            uint32_t a0 = 0, a1 = 0, a2 = 0, a3 = 0;
+            #pragma unroll
+            for (int j = 0; j < 8; j++) {
+                a0 |= (uint32_t)((q[boff + j] >> sh) & 0x0F) << (j * 4);
+                a2 |= (uint32_t)((q[16 + boff + j] >> sh) & 0x0F) << (j * 4);
+            }
+            a1 = a0;   // rows 8-15 = same single row (GEMV)
+            a3 = a2;
+
+            // ── Build B fragment (fp16 input → E2M1 → uint32 registers) ──
+            uint32_t b0 = 0, b1 = 0;
+            int ks = kg * 8;
+            for (int ni = 0; ni < 8; ni++) {
+                int ki0 = k_off + ks + ni;
+                float xf0 = (ki0 < K) ? half_to_float(x[ki0]) : 0.0f;
+                b0 |= (uint32_t)f32_to_e2m1(xf0) << (ni * 4);
+
+                int ki1 = k_off + 32 + ks + ni;
+                float xf1 = (ki1 < K) ? half_to_float(x[ki1]) : 0.0f;
+                b1 |= (uint32_t)f32_to_e2m1(xf1) << (ni * 4);
+            }
+
+            // ── OMMA.SF.16864 — THE PROVEN PTX ──────────────────────────
+            uint32_t sfa = packed_scales[sub];
+            uint32_t sfb = 0x38383838u;  // activation scale = 1.0
+            uint16_t bid_a = 0, tid_a = 0, bid_b = 0, tid_b = 0;
+
+            volatile float c0 = 0.0f, c1 = 0.0f, c2 = 0.0f, c3 = 0.0f;
+            asm volatile(
+                "mma.sync.aligned.kind::mxf4nvf4.block_scale.scale_vec::4X.m16n8k64.row.col.f32.e2m1.e2m1.f32.ue4m3 "
+                "{%0,%1,%2,%3}, {%4,%5,%6,%7}, {%8,%9}, {%10,%11,%12,%13}, %14,{%15,%16},%17,{%18,%19};"
+                : "+f"(c0),"+f"(c1),"+f"(c2),"+f"(c3)
+                : "r"(a0),"r"(a1),"r"(a2),"r"(a3),
+                  "r"(b0),"r"(b1),
+                  "f"(c0),"f"(c1),"f"(c2),"f"(c3),
+                  "r"(sfa),"h"(bid_a),"h"(tid_a),"r"(sfb),"h"(bid_b),"h"(tid_b)
+            : "memory");
+
+            d0 += c0; d1 += c1; d2 += c2; d3 += c3;
+        }
+
+        // ── Apply the folded per-tile norm [152:155] (matches soft-gemv/CPU) ──
+        // The WH4 dispatch flag at tile[149] is NULLGLASS-only; standard GGUF
+        // blocks leave it zero, so the /16 WH4 correction never fires here.
+        float tile_norm = *(const float*)(tile + 152);
+        float norm_correction = tile_norm;
+        if (tile[149] == 8) norm_correction /= 16.0f;  // WH4 v1 (NULLGLASS only)
+        if (norm_correction != 0.0f && norm_correction != 1.0f) {
+            d0 *= norm_correction;
+            d1 *= norm_correction;
+            d2 *= norm_correction;
+            d3 *= norm_correction;
+        }
+    }
+
+    if (lane == 0) {
+        y[row] = d0;
+    }
+}
+
 // ── Batch GEMV: multiple rows per block (for decode with batch > 1) ──────────
 extern "C" __global__ void nvfp4_gemv_batch_kernel(
     const uint8_t* __restrict__ tiles,

@@ -4,6 +4,10 @@
 // MIT license
 // SPDX-License-Identifier: MIT
 //
+// Include guard: this file has non-inline device function DEFINITIONS and was
+// included twice by the vendored native_fp4 module (mmq.cuh + mmq-vec-dot.cuh),
+// which the no-guard version tripped on. Added 2026-08-04.
+#pragma once
 
 #include "common.cuh"
 #include <cstdint>

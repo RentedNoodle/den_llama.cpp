@@ -22,6 +22,7 @@
 #include "unicode.h"
 
 #include "ggml.h"
+#include "ggml-cuda/den_run_mode.h"
 #include "ggml-alloc.h"
 #include "ggml-backend.h"
 
@@ -7147,7 +7148,8 @@ struct llama_context * llama_init_from_model(
         // The GPU mmq_id MoE path has a ~0.43x scale divergence vs the CPU iqk path
         // (2026-08-02: 35B NVFP4 decode garbles on GPU MoE; CPU MoE is correct). The
         // selective-upload infra stays for when the mmq_id scale is fixed.
-        if (getenv("DEN_EXPERT_OFFLOAD") != nullptr) {
+        // Gated by mode policy expert_offload: disabled in --mode basic (stock).
+        if (getenv("DEN_EXPERT_OFFLOAD") != nullptr && den_mode_policy_get().expert_offload) {
             LLAMA_LOG_INFO("%s: DEN_EXPERT_OFFLOAD set - enabling only_active_experts scheduling (expert offload)\n", __func__);
             ggml_backend_sched_set_only_active_experts(ctx->sched, true);
         } else {

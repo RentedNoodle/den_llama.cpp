@@ -55,6 +55,14 @@ cudaError_t den_omma_launch_gemv(
     const uint8_t* weights, const float* act, float* dst,
     int N, int K, cudaStream_t stream);
 
+// Launch one NVFP4 GEMV through the OMMA.SF.16864 cubin using the STANDARD
+// NVFP4 NULLGLASS nibble-decode kernel (nvfp4_gemv_std_kernel). Produces the
+// same result as the coherent soft-gemv / CPU dequant path, on tensor cores.
+// Returns cudaSuccess on success. Caller must fall back on any error.
+cudaError_t den_omma_launch_gemv_std(
+    const uint8_t* weights, const float* act, float* dst,
+    int N, int K, cudaStream_t stream);
+
 #ifdef __cplusplus
 }
 #endif

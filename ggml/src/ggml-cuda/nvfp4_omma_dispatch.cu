@@ -16,6 +16,7 @@
 // ── Global cubin state ──────────────────────────────────────────────────
 static CUmodule   g_nvfp4_module   = nullptr;
 static CUfunction g_nvfp4_func       = nullptr;  // original (tile-based)
+static CUfunction g_nvfp4_std_func   = nullptr;  // standard NULLGLASS nibble-decode GEMV
 static CUfunction g_nvfp4_fused_func  = nullptr;  // fused (block-based, Innovation #1)
 static CUfunction g_nvfp4_wh4_func    = nullptr;  // fused WH4 (WHT inline, Innovation #5)
 static CUfunction g_nvfp4_probe_func  = nullptr;  // debug probe (pointer validation)
@@ -97,6 +98,13 @@ cudaError_t nvfp4_omma_init(void) {
     cu_err = cuModuleGetFunction(&g_nvfp4_batch_func, g_nvfp4_module, "nvfp4_gemv_batch_kernel");
     if (cu_err != CUDA_SUCCESS) {
         g_nvfp4_batch_func = nullptr;
+    }
+
+    // Load standard NULLGLASS nibble-decode GEMV (standard NVFP4 block path)
+    cu_err = cuModuleGetFunction(&g_nvfp4_std_func, g_nvfp4_module, "nvfp4_gemv_std_kernel");
+    if (cu_err != CUDA_SUCCESS) {
+        g_nvfp4_std_func = nullptr;
+        fprintf(stderr, "nvfp4_omma_init: cuModuleGetFunction(gemv_std) failed: %d\n", cu_err);
     }
 
     // Load fused kernel (Innovation #1 — block_nvfp4 → OMMA directly)
@@ -283,6 +291,45 @@ cudaError_t den_omma_launch_gemv(
     if (cu_err != CUDA_SUCCESS) {
         const char* es; cuGetErrorString(cu_err, &es);
         fprintf(stderr, "nvfp4_omma: governor launch failed: %s\n", es);
+        return cudaErrorLaunchFailure;
+    }
+    return cudaSuccess;
+}
+
+// ── Standard NVFP4 NULLGLASS GEMV (GDN/hybrid attn + output path) ────────────
+// Same launch shape as den_omma_launch_gemv, but uses nvfp4_gemv_std_kernel:
+// the corrected NULLGLASS nibble decode that reproduces the coherent
+// soft-gemv / CPU dequant result on the OMMA.SF.16864 tensor core.
+// fp32 activations are staged to fp16 (mxf4nvf4 requires an E2M1 B operand).
+// Global scale is NOT applied here — the folded per-tile norm [152:155] is
+// read in-kernel, exactly matching the proven-coherent soft-gemv path.
+cudaError_t den_omma_launch_gemv_std(
+    const uint8_t* weights, const float* act, float* dst,
+    int N, int K, cudaStream_t stream)
+{
+    if (nvfp4_omma_init() != cudaSuccess || g_nvfp4_std_func == nullptr) {
+        return cudaErrorUnknown;
+    }
+    int tpr = (K + 255) / 256;
+
+    // Stage fp16 activations in the persistent buffer (grow on demand).
+    const size_t need = (size_t)K;
+    if (need > g_x_f16_cap) {
+        if (g_x_f16) cudaFree(g_x_f16);
+        g_x_f16_cap = need;
+        if (cudaMalloc(&g_x_f16, g_x_f16_cap * sizeof(half)) != cudaSuccess) {
+            g_x_f16_cap = 0;
+            return cudaErrorMemoryAllocation;
+        }
+    }
+    nvfp4_f32_to_f16(act, g_x_f16, K, stream);
+
+    const uint8_t* blocks = weights;
+    void* kargs[] = { (void*)&blocks, (void*)&g_x_f16, (void*)&dst, &N, &K, &tpr };
+    CUresult cu_err = cuLaunchKernel(g_nvfp4_std_func, (unsigned)N, 1, 1, 32, 1, 1, 0, stream, kargs, nullptr);
+    if (cu_err != CUDA_SUCCESS) {
+        const char* es; cuGetErrorString(cu_err, &es);
+        fprintf(stderr, "nvfp4_omma: standard-launch failed: %s\n", es);
         return cudaErrorLaunchFailure;
     }
     return cudaSuccess;

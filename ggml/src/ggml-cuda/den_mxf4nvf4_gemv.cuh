@@ -537,3 +537,146 @@ static void den_nvfp4_soft_gemv_launch(
         (const uint8_t*)weights, act, dst, N, K);
     CUDA_CHECK(cudaGetLastError());
 }
+
+// ─────────────────────────────────────────────────────────────────────────────
+// den_nvfp4_soft_gemv_splitk — PARALLELIZED split-K / multi-warp NVFP4 soft-GEMV
+//
+// Same coherent dequant formula as den_nvfp4_soft_gemv_kernel (the ~38 t/s
+// baseline):
+//   weight = ue4m3_byte_to_f32(blk[sub]) * norm[152:155] * e2m1_std(nibble)
+//   FP32 activations, FP32 accumulate (NO E2M1 activation quantization — the
+//   GDN recurrence + lm_head argmax demand high-precision activations).
+//
+// Why it's faster (memory-bound decode, ~896 GB/s on the 5070 Ti):
+//   1. SPLIT_WARPS warps per row divide the K-reduction (split-K): a row's
+//      K tiles are split across 4 warps, each computing a disjoint partial sum.
+//   2. Persistent grid-stride loop over rows: ONE launch covers all N rows and
+//      keeps all 70 SMs busy, instead of the baseline's (N/32) tiny 1-warp
+//      blocks that under-occupy the GPU.
+//   3. Vectorized loads: each sub-group's 8 qs bytes load as one uint64, and
+//      its 16 activations load as 4× float4 (128-bit) — far fewer memory
+//      transactions than the baseline's scalar byte/float loads.
+//   4. Two-stage reduction: warp shuffle → cross-warp shared-memory tree, so
+//      partial fp32 sums are summed deterministically (no atomic races).
+//
+// Flag: opt-in via env DEN_SOFTGEMV_SPLITK=1 (checked in ggml-cuda.cu). The
+// baseline soft-gemv remains the default until coherence is confirmed.
+// ─────────────────────────────────────────────────────────────────────────────
+
+// e2m1_std[n] — bit-exact with the baseline's local const table, but computed
+// arithmetically (magnitude = {0,.5,1,1.5,2,3,4,6} at code n&7, sign = bit 3)
+// so the compiler keeps it in registers instead of spilling a dynamic-indexed
+// local array to local memory. -0.0 (code 8) is preserved via the sign multiply.
+static __device__ __forceinline__ float den_e2m1_dec(int n) {
+    float m;
+    switch (n & 7) {
+        case 0: m = 0.0f;  break;
+        case 1: m = 0.5f;  break;
+        case 2: m = 1.0f;  break;
+        case 3: m = 1.5f;  break;
+        case 4: m = 2.0f;  break;
+        case 5: m = 3.0f;  break;
+        case 6: m = 4.0f;  break;
+        default: m = 6.0f; break;
+    }
+    return (n & 8) ? -m : m;
+}
+
+#define DEN_SOFTGEMV_SPLIT_WARPS 4
+
+template <int SPLIT_WARPS>
+static __global__ void den_nvfp4_soft_gemv_splitk_kernel(
+    const uint8_t* __restrict__ w,   // NULLGLASS 160B tiles, [N][kt_per_row][160]
+    const float*   __restrict__ x,   // activation [K], FP32 high-precision
+    float*         __restrict__ y,   // output [N]
+    int N, int K)
+{
+    const int kt_per_row = K / 256;
+    if (kt_per_row <= 0) return;
+
+    const int warp_in_blk = threadIdx.x >> 5;   // 0..SPLIT_WARPS-1
+    const int lane        = threadIdx.x & 31;
+
+    __shared__ float s_part[SPLIT_WARPS];
+
+    // K-slice for this warp: contiguous run of tiles [kt_begin, kt_end)
+    const int kt_per_warp = (kt_per_row + SPLIT_WARPS - 1) / SPLIT_WARPS;
+    const int kt_begin    = warp_in_blk * kt_per_warp;
+    const int kt_end      = min(kt_begin + kt_per_warp, kt_per_row);
+
+    // Persistent grid-stride over rows — ONE launch covers all N rows.
+    // All warps in the block visit the same rows (gridDim + blockIdx only),
+    // so the __syncthreads() barriers below are safe.
+    for (int row = blockIdx.x; row < N; row += gridDim.x) {
+        const uint8_t* base = w + (size_t)row * kt_per_row * 160;
+        float sum = 0.0f;
+
+        // grid-stride over sub-group tasks in this warp's K-slice.
+        // Task = (tile-local, sub-group); 16 sub-groups per tile keep all 32
+        // lanes busy when the slice holds >= 2 tiles.
+        const int n_tasks = (kt_end - kt_begin) * 16;
+        for (int task = lane; task < n_tasks; task += 32) {
+            const int kt_local = task >> 4;       // tile within slice
+            const int sub      = task & 15;       // sub-group 0..15
+            const int kt       = kt_begin + kt_local;
+
+            const uint8_t* blk = base + (size_t)kt * 160;
+            float norm = 1.0f;
+            memcpy(&norm, blk + 152, 4);
+            const float sc = ue4m3_byte_to_f32(blk[sub]) * norm;
+
+            // vectorized loads: 8 qs bytes as one uint64, 16 activations as
+            // 4× float4 (128-bit). xk is 16-byte aligned (K multiple of 256,
+            // sub*16 multiple of 16).
+            uint64_t q64;
+            memcpy(&q64, blk + 16 + sub * 8, 8);
+            const float* __restrict__ xk = x + (size_t)kt * 256 + sub * 16;
+            const float4 a0 = *reinterpret_cast<const float4*>(xk + 0);
+            const float4 a1 = *reinterpret_cast<const float4*>(xk + 4);
+            const float4 a2 = *reinterpret_cast<const float4*>(xk + 8);
+            const float4 a3 = *reinterpret_cast<const float4*>(xk + 12);
+
+            // Same element mapping as baseline: element sub*16+j = LOW nibble
+            // of qs[j]; element sub*16+8+j = HIGH nibble.
+            float act[16] = {a0.x,a0.y,a0.z,a0.w, a1.x,a1.y,a1.z,a1.w,
+                             a2.x,a2.y,a2.z,a2.w, a3.x,a3.y,a3.z,a3.w};
+            #pragma unroll
+            for (int j = 0; j < 8; j++) {
+                const uint8_t qb = (uint8_t)((q64 >> (8 * j)) & 0xFF);
+                sum += den_e2m1_dec(qb & 0x0F) * sc * act[j];
+                sum += den_e2m1_dec(qb >> 4)    * sc * act[8 + j];
+            }
+        }
+
+        // ── two-stage reduction ──
+        // Stage 1: warp-shuffle reduce this warp's partial (lane 0 holds it).
+        sum = warp_reduce_sum(sum);
+        if (lane == 0) s_part[warp_in_blk] = sum;
+        __syncthreads();
+        // Stage 2: cross-warp tree — lane 0 of warp 0 sums the SPLIT_WARPS
+        // partials deterministically (no atomics, no races).
+        if (warp_in_blk == 0 && lane == 0) {
+            float t = 0.0f;
+            #pragma unroll
+            for (int i = 0; i < SPLIT_WARPS; i++) t += s_part[i];
+            y[row] = t;
+        }
+        __syncthreads();
+    }
+}
+
+static void den_nvfp4_soft_gemv_splitk_launch(
+    const void* weights, const float* act, float* dst,
+    int N, int K, cudaStream_t stream)
+{
+    // Fill the GPU: target ~8 resident 128-thread blocks/SM across 70 SMs.
+    // grid-stride handles any N (grid clamped to N for tiny tensors).
+    constexpr int SPLIT_WARPS = DEN_SOFTGEMV_SPLIT_WARPS;
+    const int target_blocks = 70 * 8;
+    const int blocks = (N < target_blocks) ? N : target_blocks;
+    if (blocks < 1) return;
+    den_nvfp4_soft_gemv_splitk_kernel<SPLIT_WARPS>
+        <<<blocks, SPLIT_WARPS * 32, 0, stream>>>(
+        (const uint8_t*)weights, act, dst, N, K);
+    CUDA_CHECK(cudaGetLastError());
+}
