@@ -430,6 +430,8 @@ if (MSVC)
     set(MSVC_COMPILE_OPTIONS
         "$<$<COMPILE_LANGUAGE:C>:/utf-8>"
         "$<$<COMPILE_LANGUAGE:CXX>:/utf-8>"
+        "$<$<COMPILE_LANGUAGE:CUDA>:-Xcompiler=/utf-8>"
+        "$<$<COMPILE_LANGUAGE:CUDA>:-Xcudafe;--diag_suppress=177>"
     )
     function(configure_msvc_target target_name)
         if(TARGET ${target_name})

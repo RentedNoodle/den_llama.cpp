@@ -431,6 +431,7 @@ template <ggml_type type, int J, bool fallback> static __device__ __forceinline_
     constexpr int warp_size = ggml_cuda_get_physical_warp_size();
     constexpr int nwarps    = ggml_cuda_mmq_get_nthreads(type, J, fallback) / warp_size;
     constexpr int I         = ggml_cuda_mmq_get_I(type, J, fallback);
+    (void)nwarps; (void)I;
 
     const bool y_scale_used = y_scale != nullptr;
 
@@ -478,6 +479,7 @@ static __device__ __forceinline__ void ggml_cuda_mmq_write_back_mma(
     constexpr int warp_size     = ggml_cuda_get_physical_warp_size();
     constexpr int nwarps        = ggml_cuda_mmq_get_nthreads(type, J, fallback) / warp_size;
     constexpr int I             = ggml_cuda_mmq_get_I(type, J, fallback);
+    (void)nwarps; (void)I;
     constexpr int rows_per_warp = ggml_cuda_mmq_get_rows_per_warp(type, J, fallback);
     constexpr int ntx           = rows_per_warp/tile_C::I; // Number of x minitiles per warp.
 
