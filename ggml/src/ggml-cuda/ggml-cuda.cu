@@ -30,6 +30,8 @@
 #include "ggml-cuda/fwht.cuh"
 #include "ggml-cuda/getrows.cuh"
 #include "ggml-cuda/im2col.cuh"
+#include "ggml-cuda/kvarn-wht.cuh"
+#include "ggml-cuda/kvarn.cuh"
 #include "ggml-cuda/mmf.cuh"
 #include "ggml-cuda/mmq.cuh"
 #include "ggml-cuda/mmvf.cuh"
@@ -2377,6 +2379,17 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
         case GGML_OP_LIGHTNING_INDEXER:
             ggml_cuda_lightning_indexer(ctx, dst);
             break;
+#if defined(GGML_CUDA_KVARN)
+        case GGML_OP_KVARN_WHT:
+            ggml_cuda_op_kvarn_wht(ctx, dst);
+            break;
+        case GGML_OP_KVARN_STORE:
+            ggml_cuda_op_kvarn_store(ctx, dst);
+            break;
+        case GGML_OP_KVARN_MATERIALIZE:
+            ggml_cuda_op_kvarn_materialize(ctx, dst);
+            break;
+#endif
         default:
             return false;
     }
@@ -5171,6 +5184,14 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
                 op->type == GGML_TYPE_F32;
         case GGML_OP_FLASH_ATTN_EXT:
             return ggml_cuda_flash_attn_ext_supported(dev_ctx->device, op);
+        case GGML_OP_KVARN_WHT:
+        case GGML_OP_KVARN_STORE:
+        case GGML_OP_KVARN_MATERIALIZE:
+#if defined(GGML_CUDA_KVARN)
+            return true;
+#else
+            return false;
+#endif
         case GGML_OP_CROSS_ENTROPY_LOSS:
         case GGML_OP_CROSS_ENTROPY_LOSS_BACK:
         case GGML_OP_OPT_STEP_ADAMW:
@@ -5343,6 +5364,57 @@ static ggml_backend_feature * ggml_backend_cuda_get_features(ggml_backend_reg_t 
     GGML_UNUSED(reg);
 }
 
+// KVarN KV-cache backend capability handshake (Phase 3: store/materialize kernels only).
+// Phase 4 fills the attention route families once the fattn-kvarn decode kernels are ported.
+static bool ggml_backend_cuda_kvarn_capabilities(
+        ggml_backend_dev_t dev,
+        ggml_backend_kvarn_capabilities * result) {
+#if !defined(GGML_CUDA_KVARN) || defined(GGML_USE_MUSA)
+    GGML_UNUSED(dev);
+    GGML_UNUSED(result);
+    return false;
+#else
+    if (dev == nullptr || dev->context == nullptr || result == nullptr ||
+            result->struct_size < sizeof(*result) ||
+            result->abi_version != GGML_BACKEND_KVARN_CAPABILITIES_ABI_VERSION) {
+        return false;
+    }
+    const int device = ((ggml_backend_cuda_device_context *) dev->context)->device;
+    const auto & info = ggml_cuda_info();
+    if (device < 0 || device >= info.device_count) {
+        return false;
+    }
+
+    // Phase 3: the KVARN_STORE / KVARN_MATERIALIZE / KVARN_WHT kernels are present.
+    // Attention decode route families are added in Phase 4 (fattn-kvarn).
+    const uint32_t head_dims =
+        GGML_BACKEND_KVARN_HEAD_DIM_128 |
+        GGML_BACKEND_KVARN_HEAD_DIM_256 |
+        GGML_BACKEND_KVARN_HEAD_DIM_512;
+
+    *result = {
+        /* .struct_size                      = */ sizeof(*result),
+        /* .abi_version                      = */ GGML_BACKEND_KVARN_CAPABILITIES_ABI_VERSION,
+        /* .route_families                   = */ 0,
+        /* .supported_head_dims              = */ head_dims,
+        /* .store_materialize                = */ 1,
+        /* .portable_direct_body             = */ 0,
+        /* .portable_integrated_tail_f16     = */ 0,
+        /* .portable_integrated_tail_bf16    = */ 0,
+        /* .specialized_generic_mma          = */ 0,
+        /* .specialized_decode_split         = */ 0,
+        /* .specialized_decode_vector        = */ 0,
+        /* .original_v_domain                = */ 0,
+        /* .rotated_query_max_portable       = */ 0,
+        /* .rotated_query_max_specialized    = */ 0,
+        /* .physical_warp_size               = */ (uint32_t) info.devices[device].warp_size,
+        /* .reserved                         = */ 0,
+        /* .minimum_dynamic_shared_bytes     = */ ggml_cuda_kvarn_required_shared_bytes(),
+    };
+    return true;
+#endif
+}
+
 static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, const char * name) {
     GGML_UNUSED(reg);
     if (strcmp(name, "ggml_backend_comm_init") == 0) {
@@ -5362,6 +5434,9 @@ static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, con
     }
     if (strcmp(name, "ggml_backend_get_features") == 0) {
         return (void *)ggml_backend_cuda_get_features;
+    }
+    if (strcmp(name, "ggml_backend_kvarn_capabilities") == 0) {
+        return (void *)ggml_backend_cuda_kvarn_capabilities;
     }
     return nullptr;
 }
