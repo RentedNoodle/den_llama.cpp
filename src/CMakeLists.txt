@@ -22,7 +22,10 @@ add_library(llama
             llama-hparams.cpp
             llama-impl.cpp
             llama-io.cpp
+            llama-kvarn.cpp
             llama-kv-cache.cpp
+            llama-kv-cache-tail.cpp
+            llama-kv-cache-kvarn.cpp
             llama-kv-cache-iswa.cpp
             llama-kv-cache-dsa.cpp
             llama-kv-cache-msa.cpp
