@@ -77,12 +77,28 @@ llama_kv_cache::llama_kv_cache(
            llama_memory_t   mem_other,
     const layer_filter_cb & filter,
     const  layer_reuse_cb & reuse,
-    const  layer_share_cb & share) :
+    const  layer_share_cb & share,
+                 uint32_t   n_ubatch,
+                 uint32_t   tail_tokens,
+                ggml_type   tail_type,
+                 uint32_t   tail_tokens_requested,
+                     bool   tail_metadata_only,
+                 uint32_t   tail_rollback_tokens,
+                 uint32_t   tail_visibility_window) :
     model(model), hparams(hparams), v_trans(v_trans),
     n_seq_max(n_seq_max), n_stream(unified ? 1 : n_seq_max), n_pad(n_pad), n_swa(n_swa), swa_type(swa_type),
     other(static_cast<llama_kv_cache *>(mem_other)),
     v_cells_impl(other ? other->v_cells_impl : std::make_shared<llama_kv_cells_vec>()),
-    v_cells(*v_cells_impl) {
+    v_cells(*v_cells_impl),
+    tail_tokens(tail_tokens), tail_type(tail_type), tail_rollback_tokens(tail_rollback_tokens),
+    tail_arena_stride(tail_tokens > 0 ? tail_tokens : 0),
+    tail_slots(tail_tokens > 0 ? tail_tokens : 0),
+    tail_kind(tail_tokens > 0 ? LLAMA_KV_TAIL_STORAGE_COMPACT_OVERLAY : LLAMA_KV_TAIL_STORAGE_DISABLED) {
+
+    GGML_UNUSED(n_ubatch);
+    GGML_UNUSED(tail_tokens_requested);
+    GGML_UNUSED(tail_metadata_only);
+    GGML_UNUSED(tail_visibility_window);
 
     // shared cells view the source cache's K/V tensors, so the cell count
     // follows the source allocation: a fitted target can be smaller than the

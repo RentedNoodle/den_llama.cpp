@@ -2016,6 +2016,16 @@ bool llama_model::has_tensor_overrides() const {
     return pimpl->has_tensor_overrides;
 }
 
+bool llama_model::self_attention_uses_explicit_bias(uint32_t il) const {
+    if (il >= layers.size()) {
+        return false;
+    }
+    const auto & layer = layers[il];
+    const auto & fallback = layers.front();
+    return layer.attn_rel_b != nullptr || fallback.attn_rel_b != nullptr ||
+           layer.attn_rel_b_enc != nullptr || fallback.attn_rel_b_enc != nullptr;
+}
+
 const ggml_tensor * llama_model::get_tensor(const char * name) const {
     auto it = std::find_if(tensors_by_name.begin(), tensors_by_name.end(),
             [name](const std::pair<std::string, ggml_tensor *> & it) {

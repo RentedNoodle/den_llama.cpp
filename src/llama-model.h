@@ -675,6 +675,9 @@ struct llama_model {
 
     bool has_tensor_overrides() const;
 
+    // whether self-attention for layer il uses an explicit (learned) bias
+    bool self_attention_uses_explicit_bias(uint32_t il) const;
+
     const struct ggml_tensor * get_tensor(const char * name) const;
 
     float get_rope_freq_base (const llama_cparams & cparams, int il) const;

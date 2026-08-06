@@ -63,5 +63,9 @@ struct llama_cparams {
     ggml_backend_sched_eval_callback cb_eval;
     void * cb_eval_user_data;
 
+    // Structured KVarN cache settings.  Kept in the internal context params so
+    // memory creation does not need to depend on the public params object.
+    llama_kvarn_params kvarn;
+
     llama_context * ctx_other;
 };
