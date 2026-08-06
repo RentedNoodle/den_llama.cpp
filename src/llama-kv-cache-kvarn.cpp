@@ -2401,12 +2401,7 @@ ggml_tensor * llama_kv_cache_kvarn::store_tail(
         ggml_tensor * level_idxs = indices->ne[1] == 1
             ? indices
             : ggml_view_1d(ctx, indices, n_tokens, level*indices->nb[1]);
-        GGML_UNUSED(level_idxs);
-        // Den Phase-1 stub: ggml_set_rows_ordered is a beellama ggml KVarN op
-        // (Phase 2 ggml/CUDA work). KVarN is not wired into any cache path yet,
-        // so the exact-tail write is a no-op returning the destination unchanged.
-        // TODO(Phase 2): replace with the real ordered-rows ggml op.
-        written = current;
+        written = ggml_set_rows_ordered(ctx, written, current, level_idxs, dependency);
         dependency = written;
     }
     return ggml_view_4d(ctx, written,
@@ -2434,16 +2429,16 @@ ggml_tensor * llama_kv_cache_kvarn::store(
         current = ggml_reshape_3d(ctx, current, KVAR_N_GROUP, layer.n_head_kv * slices, current->ne[2]);
     }
 
-    // Den Phase-1 stub: ggml_kvarn_store is a beellama ggml KVarN op (Phase 2
-    // ggml/CUDA work, forbidden here). KVarN is not wired into any cache path,
-    // so store() returns the staged input unchanged; the op_params wiring below
-    // is preserved verbatim so the KVarN store contract survives for Phase 2.
-    // TODO(Phase 2): replace with ggml_kvarn_store(ctx, current, indices,
-    //   value ? layer.v_stage : layer.k_stage,
-    //   value ? layer.v_records : layer.k_records,
-    //   value ? params.value_bits : params.key_bits,
-    //   params.sinkhorn_iters, value, int32_t(stage_groups));
-    ggml_tensor * result = current;
+    ggml_tensor * result = ggml_kvarn_store(
+        ctx,
+        current,
+        indices,
+        value ? layer.v_stage : layer.k_stage,
+        value ? layer.v_records : layer.k_records,
+        value ? params.value_bits : params.key_bits,
+        params.sinkhorn_iters,
+        value,
+        int32_t(stage_groups));
     result->op_params[3] = kvarn_contiguous_tokens_per_stream_hint(sinfo);
     result->op_params[4] = swa ? 1 : 0; // SWA sliding-window ring store
     result->op_params[5] = (int32_t) slices; // KVarN head-wide Hadamard slice count
@@ -2465,15 +2460,17 @@ ggml_tensor * llama_kv_cache_kvarn::view(
     const uint32_t stream_count = sinfo.s1 - sinfo.s0 + 1;
     ggml_tensor * indices = swa ? mat_idxs : stored->src[1];
 
-    // Den Phase-1 stub: ggml_kvarn_view is a beellama ggml KVarN op (Phase 2
-    // ggml/CUDA work, forbidden here). KVarN is not wired into any cache path,
-    // so view() returns the stored record tensor unchanged; the op_params wiring
-    // below is preserved verbatim for Phase 2.
-    // TODO(Phase 2): replace with ggml_kvarn_view(ctx,
-    //   value ? layer.v_records : layer.k_records, stored, indices,
-    //   n_kv, stream_start, stream_count,
-    //   value ? params.value_bits : params.key_bits, value, int32_t(stage_groups));
-    ggml_tensor * result = stored;
+    ggml_tensor * result = ggml_kvarn_view(
+        ctx,
+        value ? layer.v_records : layer.k_records,
+        stored,
+        indices,
+        n_kv,
+        stream_start,
+        stream_count,
+        value ? params.value_bits : params.key_bits,
+        value,
+        int32_t(stage_groups));
     result->op_params[6] = swa ? 1 : 0;
     result->op_params[8] = int32_t(tail_groups);
     result->op_params[9] = 1;
@@ -2505,15 +2502,17 @@ ggml_tensor * llama_kv_cache_kvarn::materialize(
     ggml_tensor * indices = swa ? mat_idxs : stored->src[1];
     GGML_ASSERT(indices != nullptr);
 
-    // Den Phase-1 stub: ggml_kvarn_materialize is a beellama ggml KVarN op
-    // (Phase 2 ggml/CUDA work, forbidden here). KVarN is not wired into any
-    // cache path, so materialize() returns the stored record tensor unchanged;
-    // the op_params wiring below is preserved verbatim for Phase 2.
-    // TODO(Phase 2): replace with ggml_kvarn_materialize(ctx,
-    //   value ? layer.v_records : layer.k_records, stored, indices,
-    //   n_kv, stream_start, stream_count,
-    //   value ? params.value_bits : params.key_bits, value, int32_t(stage_groups));
-    ggml_tensor * result = stored;
+    ggml_tensor * result = ggml_kvarn_materialize(
+        ctx,
+        value ? layer.v_records : layer.k_records,
+        stored,
+        indices,
+        n_kv,
+        stream_start,
+        stream_count,
+        value ? params.value_bits : params.key_bits,
+        value,
+        int32_t(stage_groups));
     // Materialized fallback attention stays in the same rotated domain as the
     // persistent KVarN body. This avoids a full inverse transform per layer.
     result->op_params[4] = 1;

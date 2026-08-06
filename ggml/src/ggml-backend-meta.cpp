@@ -782,6 +782,42 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
         return {GGML_BACKEND_SPLIT_AXIS_0, {0}, {1}, 1};
     };
 
+    auto handle_kvarn_wht = [&](const std::vector<ggml_backend_meta_split_state> & src_ss) -> ggml_backend_meta_split_state {
+        ggml_backend_meta_split_state result = handle_generic(src_ss, /*scalar_only =*/ false);
+        if (result.axis == GGML_BACKEND_SPLIT_AXIS_0) {
+            int head_width;
+            memcpy(&head_width, tensor->op_params, sizeof(head_width));
+            GGML_ASSERT(head_width == 128 || head_width == 256 || head_width == 512);
+
+            for (size_t segment = 0; segment < result.n_segments; ++segment) {
+                for (size_t buffer = 0; buffer < n_bufs; ++buffer) {
+                    GGML_ASSERT(result.ne[segment*n_bufs + buffer] % head_width == 0);
+                }
+            }
+        }
+        return result;
+    };
+
+    auto handle_kvarn_cache = [&](const std::vector<ggml_backend_meta_split_state> & src_ss) -> ggml_backend_meta_split_state {
+        ggml_backend_meta_split_state result = {
+            GGML_BACKEND_SPLIT_AXIS_NONE, {0}, {1}, 1
+        };
+        for (size_t i = 0; i < GGML_MAX_SRC; ++i) {
+            if (tensor->src[i] == nullptr || tensor->src[i] == tensor ||
+                    src_ss[i].axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED) {
+                continue;
+            }
+            if (result.axis == GGML_BACKEND_SPLIT_AXIS_NONE) {
+                result = src_ss[i];
+            } else {
+                GGML_ASSERT(split_states_equal(result, src_ss[i]));
+            }
+        }
+        GGML_ASSERT(result.axis >= GGML_BACKEND_SPLIT_AXIS_0 &&
+                result.axis <= GGML_BACKEND_SPLIT_AXIS_3);
+        return result;
+    };
+
     auto calculate_split_state = [&]() -> ggml_backend_meta_split_state {
         if (ggml_nelements(tensor) == 0) {
             return {GGML_BACKEND_SPLIT_AXIS_UNKNOWN, {0}, {1}, 1};
@@ -989,6 +1025,14 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(
             case GGML_OP_DSV4_HC_POST: {
                 split_state = handle_generic(src_ss, /*scalar_only =*/ true);
             } break;
+            case GGML_OP_KVARN_WHT: {
+                split_state = handle_kvarn_wht(src_ss);
+            } break;
+            case GGML_OP_KVARN_STORE:
+            case GGML_OP_KVARN_VIEW:
+            case GGML_OP_KVARN_MATERIALIZE: {
+                split_state = handle_kvarn_cache(src_ss);
+            } break;
             case GGML_OP_UNARY: {
                 split_state = handle_generic(src_ss, /*scalar_only =*/ false);
             } break;
@@ -1124,6 +1168,32 @@ static struct ggml_backend_meta_split_state ggml_backend_meta_get_split_state(co
 static void * ggml_backend_meta_buffer_get_base(ggml_backend_buffer_t buffer) {
     GGML_UNUSED(buffer);
     return (void *) 0x1000000000000000; // FIXME
+}
+
+static ggml_backend_buffer_t ggml_backend_meta_tensor_owner_buffer(
+        const ggml_tensor * tensor, int depth = 0) {
+    if (tensor == nullptr || depth >= GGML_MAX_SRC) {
+        return nullptr;
+    }
+    if (ggml_backend_buffer_is_meta(tensor->buffer)) {
+        return tensor->buffer;
+    }
+    if (tensor->view_src != nullptr && tensor->view_src != tensor) {
+        if (ggml_backend_buffer_t owner = ggml_backend_meta_tensor_owner_buffer(
+                    tensor->view_src, depth + 1)) {
+            return owner;
+        }
+    }
+    for (size_t i = 0; i < GGML_MAX_SRC; ++i) {
+        if (tensor->src[i] == nullptr || tensor->src[i] == tensor) {
+            continue;
+        }
+        if (ggml_backend_buffer_t owner = ggml_backend_meta_tensor_owner_buffer(
+                    tensor->src[i], depth + 1)) {
+            return owner;
+        }
+    }
+    return nullptr;
 }
 
 static enum ggml_status ggml_backend_meta_buffer_init_tensor_impl(ggml_backend_meta_simple_tensor_container & stc, ggml_tensor * tensor) {
@@ -1782,8 +1852,50 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
     const size_t n_backends = ggml_backend_meta_n_backends(backend);
     ggml_backend_meta_context * backend_ctx = (ggml_backend_meta_context *) backend->context;
 
+    std::set<ggml_backend_buffer_t> dynamic_kvarn_buffers;
+    std::set<ggml_backend_buffer_t> dependency_meta_buffers;
+    std::set<const ggml_tensor *> visited_dependencies;
+    std::vector<const ggml_tensor *> dependencies;
+    dependencies.reserve(cgraph->n_nodes + cgraph->n_leafs);
+    for (int i = 0; i < cgraph->n_nodes; ++i) {
+        dependencies.push_back(cgraph->nodes[i]);
+    }
+    for (int i = 0; i < cgraph->n_leafs; ++i) {
+        dependencies.push_back(cgraph->leafs[i]);
+    }
+    while (!dependencies.empty()) {
+        const ggml_tensor * tensor = dependencies.back();
+        dependencies.pop_back();
+        if (tensor == nullptr || !visited_dependencies.insert(tensor).second) {
+            continue;
+        }
+        if (ggml_backend_buffer_t owner = ggml_backend_meta_tensor_owner_buffer(tensor)) {
+            dependency_meta_buffers.insert(owner);
+        }
+        if (tensor->op == GGML_OP_KVARN_STORE ||
+                tensor->op == GGML_OP_KVARN_VIEW ||
+                tensor->op == GGML_OP_KVARN_MATERIALIZE) {
+            if (ggml_backend_buffer_t owner = ggml_backend_meta_tensor_owner_buffer(tensor)) {
+                dynamic_kvarn_buffers.insert(owner);
+            }
+        }
+        if (tensor->view_src != nullptr && tensor->view_src != tensor) {
+            dependencies.push_back(tensor->view_src);
+        }
+        for (size_t i = 0; i < GGML_MAX_SRC; ++i) {
+            if (tensor->src[i] != nullptr && tensor->src[i] != tensor) {
+                dependencies.push_back(tensor->src[i]);
+            }
+        }
+    }
+
     // If the previous cgraph had a defined UID it can be used to skip rebuilding the subgraphs per simple backend.
-    const bool needs_rebuild = (cgraph->uid == 0) || (cgraph->uid != backend_ctx->uid);
+    // KVarN graph-local nodes are rebuilt in place between decode steps while
+    // the scheduler intentionally retains the parent graph UID. Their source
+    // tensors and operation parameters are therefore part of the executable
+    // identity even when the parent UID is unchanged.
+    const bool needs_rebuild = (cgraph->uid == 0) ||
+            (cgraph->uid != backend_ctx->uid) || !dynamic_kvarn_buffers.empty();
 
     bool max_nnodes_raised = false;
     if (cgraph->n_nodes > backend_ctx->max_nnodes) {
@@ -1809,9 +1921,20 @@ static enum ggml_status ggml_backend_meta_graph_compute(ggml_backend_t backend, 
                 used_buffers.emplace(cgraph->nodes[i]->buffer);
             }
         }
+        used_buffers.insert(dynamic_kvarn_buffers.begin(), dynamic_kvarn_buffers.end());
+        used_buffers.insert(dependency_meta_buffers.begin(), dependency_meta_buffers.end());
         for (ggml_backend_buffer_t buf : used_buffers) {
             ggml_backend_meta_buffer_context * buf_ctx = (ggml_backend_meta_buffer_context *) buf->context;
-            buf_ctx->stc_compute_index_next = buf_ctx->stc_compute_index ^ 1;
+            // Ordinary scheduler-created views select the prepared container
+            // from init_tensor. A KVarN-triggered rebuild can happen without
+            // that callback, so advance every participating meta buffer as one
+            // graph generation before projecting any of its nodes.
+            if (!dynamic_kvarn_buffers.empty() &&
+                    buf_ctx->stc_compute_index != buf_ctx->stc_compute_index_next) {
+                buf_ctx->stc_compute_index = buf_ctx->stc_compute_index_next;
+            }
+            buf_ctx->stc_compute_index_next =
+                    (buf_ctx->stc_compute_index + 1) % 2; // stc_compute is a rotating pair of compute containers
             ggml_backend_meta_simple_tensor_container & stc = buf_ctx->stc_compute[buf_ctx->stc_compute_index_next];
             for (ggml_context_ptr & ctx : stc.ctxs) {
                 ggml_reset(ctx.get());

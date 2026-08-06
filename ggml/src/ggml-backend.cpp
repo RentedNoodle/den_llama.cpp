@@ -776,7 +776,32 @@ static struct ggml_tensor * ggml_dup_tensor_layout(struct ggml_context * ctx, co
 }
 
 static bool ggml_is_view_op(enum ggml_op op) {
-    return op == GGML_OP_VIEW || op == GGML_OP_RESHAPE || op == GGML_OP_PERMUTE || op == GGML_OP_TRANSPOSE;
+    return op == GGML_OP_VIEW || op == GGML_OP_RESHAPE || op == GGML_OP_PERMUTE || op == GGML_OP_TRANSPOSE || op == GGML_OP_KVARN_VIEW;
+}
+
+static const struct ggml_tensor * ggml_backend_sched_kvarn_view_base(const struct ggml_tensor * t) {
+    while (t != NULL && (t->op == GGML_OP_RESHAPE || t->op == GGML_OP_PERMUTE)) {
+        t = t->src[0];
+    }
+
+    return t != NULL && t->op == GGML_OP_KVARN_VIEW ? t : NULL;
+}
+
+static struct ggml_tensor * ggml_backend_sched_kvarn_view_base_mut(struct ggml_tensor * t) {
+    while (t != NULL && (t->op == GGML_OP_RESHAPE || t->op == GGML_OP_PERMUTE)) {
+        t = t->src[0];
+    }
+
+    return t != NULL && t->op == GGML_OP_KVARN_VIEW ? t : NULL;
+}
+
+static bool ggml_backend_sched_allows_bufferless_kvarn_src(
+        const struct ggml_tensor * node,
+        int src_index,
+        const struct ggml_tensor * src) {
+    return node->op == GGML_OP_FLASH_ATTN_EXT &&
+        (src_index == 1 || src_index == 2) &&
+        ggml_backend_sched_kvarn_view_base(src) != NULL;
 }
 
 // scheduler
@@ -1350,6 +1375,39 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
                     if (src == NULL) {
                         continue;
                     }
+                    if (ggml_backend_sched_allows_bufferless_kvarn_src(node, j, src)) {
+                        // FLASH_ATTN_EXT consumes KVarN view descriptors directly; the view
+                        // output stays bufferless, but its hidden records/stage/indices sources
+                        // must still drive the split decision.
+                        struct ggml_tensor * kvarn_view = ggml_backend_sched_kvarn_view_base_mut(src);
+                        GGML_ASSERT(kvarn_view != NULL);
+                        for (int ks = 0; ks < 3; ++ks) {
+                            struct ggml_tensor * hsrc = kvarn_view->src[ks];
+                            if (hsrc == NULL) {
+                                continue;
+                            }
+                            if (hsrc->buffer != NULL && hsrc->buffer->usage == GGML_BACKEND_BUFFER_USAGE_WEIGHTS) {
+                                int hsrc_backend_id = tensor_backend_id(hsrc);
+                                if (hsrc_backend_id != cur_backend_id && !ggml_backend_sched_buffer_supported(sched, hsrc, cur_backend_id)) {
+                                    need_new_split = true;
+                                    break;
+                                }
+                            }
+                            if (split->n_inputs >= split->inputs_capacity) {
+                                const size_t hid = hash_id(hsrc);
+                                int hsrc_backend_id = sched->hv_tensor_backend_ids[hid];
+                                bool supported = ggml_backend_sched_buffer_supported(sched, hsrc, cur_backend_id);
+                                if (hsrc_backend_id != cur_backend_id && tensor_id_copy(hid, cur_backend_id, 0) == NULL && !supported) {
+                                    need_new_split = true;
+                                    break;
+                                }
+                            }
+                        }
+                        if (need_new_split) {
+                            break;
+                        }
+                        continue;
+                    }
                     // check if a weight is on a different and incompatible backend
                     // by starting a new split, the memory of the previously offloaded weights can be reused
                     if (src->buffer != NULL && src->buffer->usage == GGML_BACKEND_BUFFER_USAGE_WEIGHTS) {
@@ -1397,6 +1455,46 @@ void ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgra
             for (int j = 0; j < GGML_MAX_SRC; j++) {
                 struct ggml_tensor * src = node->src[j];
                 if (src == NULL) {
+                    continue;
+                }
+
+                if (ggml_backend_sched_allows_bufferless_kvarn_src(node, j, src)) {
+                    // FLASH_ATTN_EXT consumes KVarN view descriptors directly; the view
+                    // output stays bufferless, but its hidden records/stage/indices sources
+                    // must still be visible from the split.
+                    struct ggml_tensor * kvarn_view = ggml_backend_sched_kvarn_view_base_mut(src);
+                    GGML_ASSERT(kvarn_view != NULL);
+                    for (int ks = 0; ks < 3; ++ks) {
+                        struct ggml_tensor * dep_src = kvarn_view->src[ks];
+                        if (dep_src == NULL) {
+                            continue;
+                        }
+                        const size_t dep_src_id = hash_id(dep_src);
+                        const int dep_src_backend_id = sched->hv_tensor_backend_ids[dep_src_id];
+                        GGML_ASSERT(dep_src_backend_id != -1);
+                        if (dep_src_backend_id != cur_backend_id &&
+                                !ggml_backend_sched_buffer_supported(sched, dep_src, cur_backend_id)) {
+                            if (tensor_id_copy(dep_src_id, cur_backend_id, 0) == NULL) {
+                                ggml_backend_t backend = sched->backends[cur_backend_id];
+                                for (int c = 0; c < sched->n_copies; c++) {
+                                    struct ggml_tensor * tensor_copy = ggml_dup_tensor_layout(sched->ctx, dep_src);
+                                    ggml_format_name(tensor_copy, "%s#%s#%d", ggml_backend_name(backend), dep_src->name, c);
+                                    if (sched->n_copies > 1) {
+                                        ggml_set_input(tensor_copy);
+                                        ggml_set_output(tensor_copy); // prevent ggml-alloc from overwriting the tensor
+                                    }
+                                    tensor_id_copy(dep_src_id, cur_backend_id, c) = tensor_copy;
+                                    SET_CAUSE(tensor_copy, "4.cpy");
+                                }
+                                int n_inputs = split->n_inputs++;
+                                if (n_inputs >= split->inputs_capacity) {
+                                    ggml_backend_sched_split_inputs_grow(split);
+                                }
+                                split->inputs[n_inputs] = dep_src;
+                            }
+                            kvarn_view->src[ks] = tensor_id_copy(dep_src_id, cur_backend_id, sched->cur_copy);
+                        }
+                    }
                     continue;
                 }
 

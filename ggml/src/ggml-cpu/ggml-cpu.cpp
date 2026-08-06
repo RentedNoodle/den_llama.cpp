@@ -424,7 +424,7 @@ static bool ggml_backend_cpu_device_supports_op(ggml_backend_dev_t dev, const st
     const struct ggml_tensor * src0 = op->src[0];
     const struct ggml_tensor * src1 = op->src[1];
 
-    if (op->op == GGML_OP_NONE || op->op == GGML_OP_RESHAPE || op->op == GGML_OP_VIEW || op->op == GGML_OP_PERMUTE || op->op == GGML_OP_TRANSPOSE) {
+    if (op->op == GGML_OP_NONE || op->op == GGML_OP_RESHAPE || op->op == GGML_OP_VIEW || op->op == GGML_OP_PERMUTE || op->op == GGML_OP_TRANSPOSE || op->op == GGML_OP_KVARN_VIEW) {
         return true;
     }
 
@@ -646,6 +646,46 @@ static ggml_backend_feature * ggml_backend_cpu_get_features(ggml_backend_reg_t r
 }
 
 static void * ggml_backend_cpu_get_proc_address(ggml_backend_reg_t reg, const char * name) {
+    if (strcmp(name, "ggml_backend_kvarn_ops") == 0) {
+        return (void *) +[](ggml_backend_dev_t) { return true; };
+    }
+    if (strcmp(name, "ggml_backend_kvarn_native_ops") == 0) {
+        return (void *) +[](ggml_backend_dev_t) { return true; };
+    }
+    if (strcmp(name, "ggml_backend_kvarn_native_rotated_max_query_tokens") == 0) {
+        return (void *) +[](ggml_backend_dev_t) { return UINT32_MAX; };
+    }
+    if (strcmp(name, "ggml_backend_kvarn_tail_attention_supported") == 0) {
+        return (void *) +[](ggml_backend_dev_t,
+                            ggml_type body_k, ggml_type body_v,
+                            ggml_type tail_k, ggml_type tail_v,
+                            int64_t d_k, int64_t d_v) {
+            const bool body_ok = body_k == GGML_TYPE_F16 && body_v == GGML_TYPE_F16;
+            const bool tail_ok =
+                (tail_k == GGML_TYPE_F16 || tail_k == GGML_TYPE_BF16) &&
+                (tail_v == GGML_TYPE_F16 || tail_v == GGML_TYPE_BF16);
+            const bool dims_ok = d_k == d_v &&
+                (d_k == 128 || d_k == 256 || d_k == 512);
+            return body_ok && tail_ok && dims_ok;
+        };
+    }
+    if (strcmp(name, "ggml_backend_kv_tail_attention_supported") == 0 ||
+            strcmp(name, "ggml_backend_kv_tail_segmented_attention_supported") == 0) {
+        return (void *) +[](ggml_type body_k, ggml_type body_v,
+                            ggml_type tail_k, ggml_type tail_v,
+                            int64_t d_k, int64_t d_v) {
+            const auto row_convertible = [](ggml_type type) {
+                return type == GGML_TYPE_F32 || ggml_get_type_traits(type)->to_float != nullptr;
+            };
+            const bool body_ok = row_convertible(body_k) && row_convertible(body_v);
+            const bool tail_ok =
+                (tail_k == GGML_TYPE_F16 || tail_k == GGML_TYPE_BF16) &&
+                (tail_v == GGML_TYPE_F16 || tail_v == GGML_TYPE_BF16);
+            const bool dims_ok = d_k == d_v &&
+                (d_k == 128 || d_k == 256 || d_k == 512);
+            return body_ok && tail_ok && dims_ok;
+        };
+    }
     if (strcmp(name, "ggml_backend_set_n_threads") == 0) {
         ggml_backend_set_n_threads_t fct = ggml_backend_cpu_set_n_threads;
         return (void *)fct;

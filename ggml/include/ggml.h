@@ -439,6 +439,22 @@ extern "C" {
         GGML_PREC_F32     = 10,
     };
 
+    // FLASH_ATTN_EXT op_params shared by the generic precision hint and KVarN's
+    // descriptor-native domain contract.
+    enum ggml_flash_attn_ext_op_param {
+        GGML_FLASH_ATTN_EXT_OP_PARAM_PREC          = 3,
+        GGML_FLASH_ATTN_EXT_OP_PARAM_KVARN_DOMAIN  = 4,
+        GGML_FLASH_ATTN_EXT_OP_PARAM_TAIL_BODYLESS = 5,
+        GGML_FLASH_ATTN_EXT_OP_PARAM_TAIL_HISTORY_SLOTS = 6,
+    };
+
+    enum ggml_flash_attn_ext_kvarn_domain {
+        GGML_FLASH_ATTN_EXT_KVARN_DOMAIN_AUTO                 = 0,
+        GGML_FLASH_ATTN_EXT_KVARN_DOMAIN_ROTATED              = 1,
+        GGML_FLASH_ATTN_EXT_KVARN_DOMAIN_ORIGINAL             = 2,
+        GGML_FLASH_ATTN_EXT_KVARN_DOMAIN_ROTATED_K_ORIGINAL_V = 3,
+    };
+
     // op hint
     enum ggml_op_hint {
         GGML_HINT_NONE             = 0,
@@ -574,6 +590,13 @@ extern "C" {
         GGML_OP_DSV4_HC_COMB,
         GGML_OP_DSV4_HC_PRE,
         GGML_OP_DSV4_HC_POST,
+
+        // KVarN record-oriented KV-cache operators.  They are not GGUF
+        // tensor types and are never serialized in model weights.
+        GGML_OP_KVARN_WHT,
+        GGML_OP_KVARN_STORE,
+        GGML_OP_KVARN_VIEW,
+        GGML_OP_KVARN_MATERIALIZE,
 
         GGML_OP_UNARY,
 
@@ -1696,6 +1719,16 @@ extern "C" {
             struct ggml_tensor  * b,  // source
             struct ggml_tensor  * c); // row indices
 
+    // As ggml_set_rows(), with an explicit graph dependency. Negative row
+    // indices are ignored, allowing ragged updates without persistent sink
+    // rows. The dependency affects ordering only and is not read by backends.
+    GGML_API struct ggml_tensor * ggml_set_rows_ordered(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * a,
+            struct ggml_tensor  * b,
+            struct ggml_tensor  * c,
+            struct ggml_tensor  * dependency);
+
     GGML_API struct ggml_tensor * ggml_diag(
         struct ggml_context     * ctx,
         struct ggml_tensor      * a);
@@ -2639,6 +2672,52 @@ extern "C" {
             struct ggml_tensor  * residual,
             struct ggml_tensor  * post,
             struct ggml_tensor  * comb);
+
+    // KVarN normalized Sylvester Walsh-Hadamard transform for 128/256/512
+    // head widths.  The transform is self-inverse.
+    GGML_API struct ggml_tensor * ggml_kvarn_wht(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * a,
+            int                   head_width);
+
+    // KVarN structured KV-cache operations.  Records span full 128-token
+    // tiles, so this deliberately remains separate from ggml_type.
+    GGML_API struct ggml_tensor * ggml_kvarn_store(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * current,
+            struct ggml_tensor  * indices,
+            struct ggml_tensor  * stage,
+            struct ggml_tensor  * records,
+            int                   bits,
+            int                   sinkhorn_iters,
+            bool                  value,
+            int                   stage_groups);
+
+    GGML_API struct ggml_tensor * ggml_kvarn_view(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * records,
+            struct ggml_tensor  * stage_after_store,
+            struct ggml_tensor  * indices,
+            int                   n_kv,
+            int                   stream_start,
+            int                   n_stream,
+            int                   bits,
+            bool                  value,
+            int                   stage_groups);
+
+    // Reconstructs a standard F16 tensor from KVarN records and staging. The
+    // result can be consumed by any ordinary attention implementation.
+    GGML_API struct ggml_tensor * ggml_kvarn_materialize(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * records,
+            struct ggml_tensor  * stage_after_store,
+            struct ggml_tensor  * indices,
+            int                   n_kv,
+            int                   stream_start,
+            int                   n_stream,
+            int                   bits,
+            bool                  value,
+            int                   stage_groups);
 
     // custom operators
 
