@@ -474,6 +474,9 @@ struct common_params {
     enum llama_split_mode split_mode = LLAMA_SPLIT_MODE_LAYER; // how to split the model across GPUs
     enum llama_load_mode  load_mode  = LLAMA_LOAD_MODE_MMAP; // how to load the model
 
+    bool den_stage       = false; // Den: L3-resident CPU expert staging tier (host-half of --cpu-moe)
+    bool den_stage_probe = false; // Den: run the L3-residency probe at init and print GB/s
+
     common_cpu_params cpuparams;
     common_cpu_params cpuparams_batch;
 

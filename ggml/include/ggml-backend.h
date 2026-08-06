@@ -317,6 +317,12 @@ extern "C" {
     GGML_API ggml_backend_sched_t ggml_backend_sched_new(ggml_backend_t * backends, ggml_backend_buffer_type_t * bufts, int n_backends, size_t graph_size, bool parallel, bool op_offload);
     GGML_API void                 ggml_backend_sched_free(ggml_backend_sched_t sched);
 
+    // Den expert staging: enable/disable the L3-resident CPU expert staging tier
+    // (host-half of --cpu-moe).  No-op if the CUDA backend has not registered it.
+    GGML_API void   ggml_backend_den_stage_set_enabled(bool enabled);
+    GGML_API double ggml_backend_den_stage_probe(void);
+
+
     // Initialize backend buffers from a measure graph
     GGML_API void                 ggml_backend_sched_reserve_size(ggml_backend_sched_t sched, struct ggml_cgraph * measure_graph, size_t * sizes);
     GGML_API bool                 ggml_backend_sched_reserve(ggml_backend_sched_t sched, struct ggml_cgraph * measure_graph); // returns success

@@ -268,6 +268,8 @@ llama_context::llama_context(
 
     cparams.op_offload = params.op_offload;
     cparams.kv_unified = params.kv_unified;
+    cparams.expert_stage       = params.expert_stage;
+    cparams.expert_stage_probe = params.expert_stage_probe;
 
     // initialized later
     cparams.pipeline_parallel = false;
@@ -478,6 +480,9 @@ llama_context::~llama_context() {
     // wait for any pending asynchronous copies into the output buffers before they are freed
     synchronize();
 
+    // Den expert staging: stop the staging thread and free the pinned buffers
+    ggml_backend_den_stage_set_enabled(false);
+
     if (!model.hparams.no_alloc) {
         for (size_t i = 0; i < backend_ptrs.size(); ++i) {
             ggml_backend_t             backend = backend_ptrs[i];
@@ -598,6 +603,17 @@ void llama_context::sched_reserve() {
     gf_res_reserve.reset(new llm_graph_result(max_nodes));
 
     sched.reset(ggml_backend_sched_new(backend_ptrs.data(), backend_buft.data(), backend_ptrs.size(), max_nodes, cparams.pipeline_parallel, cparams.op_offload));
+
+    // Den expert staging: enable the L3-resident CPU staging tier (host-half of
+    // --cpu-moe).  It is a no-op when the CUDA backend has not registered it or
+    // when no experts are host-resident.
+    if (cparams.expert_stage) {
+        ggml_backend_den_stage_set_enabled(true);
+        if (cparams.expert_stage_probe) {
+            const double gbps = ggml_backend_den_stage_probe();
+            LLAMA_LOG_INFO("%s: Den expert-stage L3 probe: %.1f GB/s\n", __func__, gbps);
+        }
+    }
 
     llama_memory_context_ptr mctx;
     if (memory) {
@@ -3515,6 +3531,8 @@ llama_context_params llama_context_default_params() {
         /*.op_offload                  =*/ true,
         /*.swa_full                    =*/ true,
         /*.kv_unified                  =*/ false,
+        /*.expert_stage                =*/ false,
+        /*.expert_stage_probe          =*/ false,
         /*.sampler                     =*/ nullptr,
         /*.n_sampler                   =*/ 0,
         /*.ctx_other                   =*/ nullptr,

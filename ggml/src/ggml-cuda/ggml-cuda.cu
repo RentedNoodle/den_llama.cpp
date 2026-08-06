@@ -2,6 +2,8 @@
 #include "ggml-impl.h"
 #include "ggml-backend-impl.h"
 
+#include "den_expert_stage.h"
+
 #include "ggml-cuda/allreduce.cuh"
 #include "ggml-cuda/common.cuh"
 #include "ggml-cuda/acc.cuh"
@@ -1272,6 +1274,17 @@ static void ggml_backend_cuda_host_buffer_free_buffer(ggml_backend_buffer_t buff
 
 static void * ggml_cuda_host_malloc(size_t size) {
     if (getenv("GGML_CUDA_NO_PINNED") != nullptr) {
+        return nullptr;
+    }
+
+    // Den: fast-fail the doomed huge pinned allocations (> 8 GiB).  The 35B MoE
+    // host expert buffer (~18.75 GB) cannot be cudaMallocHost'd on a 16 GB box;
+    // the attempt wastes seconds before failing.  Skip straight to the unpinned
+    // fallback.  The Den expert staging tier pins only its small (<= 96 MiB)
+    // staging buffers instead.
+    if (size > 8ull * 1024 * 1024 * 1024) {
+        GGML_LOG_DEBUG("%s: skipping pinned allocation of %.2f GiB (Den fast-fail > 8 GiB)\n",
+                           __func__, size / 1024.0 / 1024.0 / 1024.0);
         return nullptr;
     }
 
@@ -5408,6 +5421,10 @@ ggml_backend_reg_t ggml_backend_cuda_reg() {
                 /* .iface       = */ ggml_backend_cuda_reg_interface,
                 /* .context     = */ ctx
             };
+
+            // Den expert staging: install this backend's host-half staging tier
+            // (pinned L3-resident expert staging) into ggml-base.
+            den_expert_stage_register_ggml();
         }
 
         initialized = true;

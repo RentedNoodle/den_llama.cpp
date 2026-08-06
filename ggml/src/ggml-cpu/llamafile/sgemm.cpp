@@ -370,11 +370,32 @@ template <> inline __m512 load(const ggml_bf16_t *p) {
 #endif // __AVX512F__
 
 #if defined(__AVX512BF16__)
+// Den: bitcast __m512/__m256 -> __m512bh/__m256bh.  GCC/Clang accept the
+// C-style cast; MSVC (through VS 2022 17.14) has no _mm512_castps_ph-style
+// intrinsic and rejects it with C2440.  memcpy of the exact vector width is
+// folded to a register move by every compiler, so the hot path pays nothing.
+// AVX512_BF16 must stay enabled on Windows (the BF16 sgemm path) — we make a
+// way instead of turning the feature off.
+#if defined(_MSC_VER)
+static inline __m512bh den_cast_ps_ph(__m512 v) {
+    __m512bh r;
+    memcpy(&r, &v, sizeof(r));
+    return r;
+}
+static inline __m256bh den_cast_ps_ph(__m256 v) {
+    __m256bh r;
+    memcpy(&r, &v, sizeof(r));
+    return r;
+}
+#else
+static inline __m512bh den_cast_ps_ph(__m512 v) { return (__m512bh) v; }
+static inline __m256bh den_cast_ps_ph(__m256 v) { return (__m256bh) v; }
+#endif
 template <> inline __m512bh load(const ggml_bf16_t *p) {
-    return (__m512bh)_mm512_loadu_ps((const float *)p);
+    return den_cast_ps_ph(_mm512_loadu_ps((const float *)p));
 }
 template <> inline __m256bh load(const ggml_bf16_t *p) {
-    return (__m256bh)_mm256_loadu_ps((const float *)p);
+    return den_cast_ps_ph(_mm256_loadu_ps((const float *)p));
 }
 template <> inline __m512bh load(const float *p) {
     return _mm512_cvtne2ps_pbh(_mm512_loadu_ps(p + 16), _mm512_loadu_ps(p));

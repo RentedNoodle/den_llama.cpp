@@ -52,6 +52,8 @@ struct llama_cparams {
     bool op_offload;
     bool kv_unified;
     bool pipeline_parallel;
+    bool expert_stage;        // Den: L3-resident CPU expert staging tier (host-half of --cpu-moe)
+    bool expert_stage_probe;  // Den: run the L3-residency probe at init and print GB/s
 
     std::vector<bool> embeddings_layer_inp; // [n_layer()] extract input embeddings for layer
 

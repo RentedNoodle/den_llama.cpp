@@ -13,6 +13,8 @@
 #include "ggml-alloc.h"
 #include "ggml-impl.h"
 
+#include "ggml-cuda/den_expert_stage.h"
+
 #include <assert.h>
 #include <limits.h>
 #include <stdarg.h>
@@ -26,6 +28,36 @@
 #include <sys/types.h>
 #include <sys/sysctl.h>
 #endif
+
+
+// Den expert staging: interface registered by the CUDA backend (den_expert_stage.cu)
+// via ggml_backend_den_stage_register().  ggml-base calls these through the
+// registered pointers, so there is no link dependency on the CUDA backend and the
+// staging tier is a no-op unless the CUDA backend installs it.
+static ggml_den_stage_iface s_den_stage_iface = {};
+
+void ggml_backend_den_stage_register(const ggml_den_stage_iface * iface) {
+    if (iface) {
+        s_den_stage_iface = *iface;
+    }
+}
+
+bool ggml_backend_den_stage_enabled(void) {
+    return s_den_stage_iface.set_enabled != NULL;
+}
+
+void ggml_backend_den_stage_set_enabled(bool enabled) {
+    if (s_den_stage_iface.set_enabled) {
+        s_den_stage_iface.set_enabled(enabled);
+    }
+}
+
+double ggml_backend_den_stage_probe(void) {
+    if (s_den_stage_iface.probe) {
+        return s_den_stage_iface.probe();
+    }
+    return 0.0;
+}
 
 
 // backend buffer type
@@ -1673,6 +1705,23 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                         prev_ids_tensor = ids_tensor;
                     }
 
+                    // Den expert staging: submit the next-split prediction right after
+                    // the ids read-back, so the staging thread fills the pinned
+                    // L3-resident buffer while the GPU computes this split.
+                    if (s_den_stage_iface.submit != NULL) {
+                        std::vector<int32_t> unique_ids;
+                        unique_ids.reserve(ids.size());
+                        for (int64_t id = 0; id < n_expert; id++) {
+                            if (ggml_bitset_get(used_ids.data(), id)) {
+                                unique_ids.push_back((int32_t) id);
+                            }
+                        }
+                        if (!unique_ids.empty()) {
+                            s_den_stage_iface.submit(input->name, -1, unique_ids.data(),
+                                                        (int) unique_ids.size(), input->data, expert_size);
+                        }
+                    }
+
                     // group consecutive experts and copy them together
                     auto copy_experts = [&](int32_t first_id, int32_t last_id) {
                         const size_t expert_offset = first_id * expert_size;
@@ -1680,9 +1729,20 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
                         const size_t padding = std::min<size_t>(expert_size, 512);
                         const size_t padding_end = last_id < n_expert - 1 ? padding : 0;
 
+                        const uint8_t * src = (const uint8_t *) input->data + expert_offset;
+
+                        // Den expert staging: serve the H2D from the pinned L3-resident
+                        // staging buffer when the whole group is resident there.
+                        if (s_den_stage_iface.find_span != NULL) {
+                            const void * staged = s_den_stage_iface.find_span(input->name, first_id, last_id);
+                            if (staged != NULL) {
+                                src = (const uint8_t *) staged;
+                            }
+                        }
+
                         ggml_backend_tensor_set_async(split_backend,
                             input_cpy,
-                            (const uint8_t *)input->data + expert_offset, expert_offset,
+                            src, expert_offset,
                             // copy a bit extra at the to ensure there are no NaNs in the padding of the last expert
                             // this is necessary for MMQ in the CUDA backend
                             expert_size_copy + padding_end);
