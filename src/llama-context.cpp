@@ -1,5 +1,9 @@
 #include "llama-context.h"
 
+#ifdef GGML_USE_CUDA
+#include "ggml-cuda.h"
+#endif
+
 #include "ggml.h"
 #include "llama-arch.h"
 #include "llama-graph.h"
@@ -252,6 +256,8 @@ llama_context::llama_context(
     cparams.auto_fgdn    = true;
 
     cparams.kvarn = params.kvarn;
+    cparams.nvfp4_kv_enabled = params.nvfp4_kv_enabled;
+    cparams.sparse_kv_enabled = params.sparse_kv_enabled;
 
     cparams.fused_lid    = true;
     cparams.auto_flid    = true;
@@ -3537,6 +3543,8 @@ llama_context_params llama_context_default_params() {
         /*.kv_unified                  =*/ false,
         /*.expert_stage                =*/ false,
         /*.expert_stage_probe          =*/ false,
+        /*.nvfp4_kv_enabled            =*/ false,
+        /*.sparse_kv_enabled           =*/ false,
         /*.sampler                     =*/ nullptr,
         /*.n_sampler                   =*/ 0,
         /*.ctx_other                   =*/ nullptr,
@@ -3632,6 +3640,22 @@ llama_context * llama_init_from_model(
 
     try {
         auto * ctx = new llama_context(*model, params);
+
+#ifdef GGML_USE_CUDA
+        if (params.nvfp4_kv_enabled && getenv("DEN_NVFP4_KV_CACHE")) {
+            // declared in ggml-cuda.h with GGML_BACKEND_API (dllimport)
+            uint32_t il0 = 0;
+            while (il0 < model->hparams.n_layer_all && !model->hparams.has_kv(il0)) il0++;
+            if (il0 < model->hparams.n_layer_all) {
+                ggml_backend_cuda_nvfp4_kv_init(
+                    (int)model->hparams.n_layer_kv(),
+                    (int)model->hparams.n_head_kv(il0),
+                    (int)model->hparams.n_embd_head_k(il0),
+                    (int)llama_n_ctx_seq(ctx));
+            }
+        }
+#endif
+
         return ctx;
     } catch (const std::exception & err) {
         LLAMA_LOG_ERROR("%s: failed to initialize the context: %s\n", __func__, err.what());

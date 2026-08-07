@@ -314,6 +314,7 @@ const std::vector<ggml_type> kv_cache_types = {
 };
 
 static ggml_type kv_cache_type_from_str(const std::string & s) {
+    if (s == "nvfp4_kv") { return GGML_TYPE_F32; }
     for (const auto & type : kv_cache_types) {
         if (ggml_type_name(type) == s) {
             return type;
@@ -330,6 +331,7 @@ static std::string get_all_kv_cache_types(bool include_kvarn_pseudo_types = fals
     if (include_kvarn_pseudo_types) {
         msg << ", kvarn2, kvarn3, kvarn4, kvarn5, kvarn6, kvarn8";
     }
+    msg << ", nvfp4_kv";
     return msg.str();
 }
 
@@ -397,6 +399,10 @@ static void parse_target_cache_type(common_params & params, bool key, const std:
             params.cache_type_v = kvarn_fallback_cache_type(kvarn_bits);
         }
         return;
+    }
+
+    if (cache_type == "nvfp4_kv") {
+        params.nvfp4_kv_enabled = true;
     }
 
     if (key) {
@@ -2874,6 +2880,13 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         [](common_params & params) {
             params.den_stage = true;
             params.den_stage_probe = true;
+        }
+    ));
+    add_opt(common_arg(
+        {"--sparse-kv"},
+        "Den: enable CUDA sparse virtual memory for KV cache",
+        [](common_params & params) {
+            params.sparse_kv_enabled = true;
         }
     ));
     GGML_ASSERT(params.n_gpu_layers < 0); // string_format would need to be extended for a default >= 0

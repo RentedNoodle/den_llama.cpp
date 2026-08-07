@@ -4,7 +4,10 @@
 #include "fattn-tile.cuh"
 #include "fattn-vec.cuh"
 #include "fattn-kvarn-dispatch.cuh"
+#include "fattn-nvfp4-kv.cuh"
 #include "fattn.cuh"
+
+static void ggml_cuda_flash_attn_ext_nvfp4_kv(ggml_backend_cuda_context & ctx, ggml_tensor * dst, int il);
 
 template <int DKQ, int DV, int ncols2>
 static void ggml_cuda_flash_attn_ext_mma_f16_switch_ncols1(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
@@ -334,6 +337,7 @@ enum best_fattn_kernel {
     BEST_FATTN_KERNEL_TILE    = 200,
     BEST_FATTN_KERNEL_VEC     = 100,
     BEST_FATTN_KERNEL_MMA_F16 = 400,
+    BEST_FATTN_KERNEL_NVFP4_KV = 50,
 };
 
 static bool ggml_cuda_fattn_kv_type_supported(ggml_type type) {
@@ -361,6 +365,10 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
     GGML_UNUSED(device); GGML_UNUSED(dst);
     return BEST_FATTN_KERNEL_NONE;
 #endif// FLASH_ATTN_AVAILABLE
+
+    if (false && den_nvfp4_kv_is_active()) {
+        return BEST_FATTN_KERNEL_NVFP4_KV;
+    }
 
     const ggml_tensor * KQV   = dst;
     const ggml_tensor * Q     = dst->src[0];
@@ -569,12 +577,25 @@ size_t ggml_cuda_flash_attn_ext_get_alloc_size(int device, const ggml_tensor * d
             break;
         case BEST_FATTN_KERNEL_NONE:
             break;
+        case BEST_FATTN_KERNEL_NVFP4_KV:
+            // NVFP4 KV uses its own fused attention, no F16 conversion needed
+            need_f16_K = false;
+            need_f16_V = false;
+            break;
     }
 
     const ggml_cuda_flash_attn_ext_f16_extra_data f16_extra =
         ggml_cuda_flash_attn_ext_get_f16_extra_data(dst, need_f16_K, need_f16_V);
 
     return f16_extra.end - (uintptr_t) dst->data;
+}
+
+static void ggml_cuda_flash_attn_ext_nvfp4_kv(ggml_backend_cuda_context & ctx, ggml_tensor * dst, int il) {
+    // Fused kernel produces garbled output on real model dims (n_heads=32).
+    // Standalone test passes at 4 heads, but 32-head 8-KV-head path is buggy.
+    // Fall back to vec always for correctness. Store path verified coherent.
+    ggml_cuda_flash_attn_ext_vec(ctx, dst);
+    (void)il;
 }
 
 void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
@@ -599,6 +620,14 @@ void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst
         case BEST_FATTN_KERNEL_MMA_F16:
             ggml_cuda_flash_attn_ext_mma_f16(ctx, dst);
             break;
+        case BEST_FATTN_KERNEL_NVFP4_KV: {
+            // Parse layer index from K tensor name: "cache_k_l<N>"
+            int il = 0;
+            const char * kname = ggml_get_name(dst->src[1]);
+            if (kname && strncmp(kname, "cache_k_l", 9) == 0) il = atoi(kname + 9);
+            ggml_cuda_flash_attn_ext_nvfp4_kv(ctx, dst, il);
+            break;
+        }
     }
 }
 

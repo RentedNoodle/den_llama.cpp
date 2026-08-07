@@ -582,6 +582,8 @@ struct common_params {
     // KVarN is selected by its pseudo cache-type names in the argument parser.
     // The backing ggml types remain the matching standard q formats for layers
     // that are not eligible for structured KVarN storage.
+    bool nvfp4_kv_enabled = false;
+    bool sparse_kv_enabled = false; // Den: enable CUDA sparse virtual memory for KV cache
     int32_t cache_kvarn_bits_k = 0;
     int32_t cache_kvarn_bits_v = 0;
     int32_t cache_kvarn_swa_bits_k = 0;
