@@ -1,5 +1,9 @@
 #include "llama-context.h"
 
+#ifdef GGML_USE_CUDA
+#include "ggml-cuda.h"
+#endif
+
 #include "ggml.h"
 #include "llama-arch.h"
 #include "llama-graph.h"
@@ -3637,7 +3641,7 @@ llama_context * llama_init_from_model(
 
 #ifdef GGML_USE_CUDA
         if (params.nvfp4_kv_enabled) {
-            extern void ggml_backend_cuda_nvfp4_kv_init(int, int, int, int);
+            // declared in ggml-cuda.h with GGML_BACKEND_API (dllimport)
             uint32_t il0 = 0;
             while (il0 < model->hparams.n_layer_all && !model->hparams.has_kv(il0)) il0++;
             if (il0 < model->hparams.n_layer_all) {
