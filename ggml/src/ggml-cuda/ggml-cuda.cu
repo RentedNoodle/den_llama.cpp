@@ -2063,7 +2063,7 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
             break;
         case GGML_OP_SET_ROWS:
             ggml_cuda_op_set_rows(ctx, dst);
-            // NVFP4 KV cache hook: quantize K/V after each SET_ROWS op
+            // NVFP4 KV cache hook: quantize K/V after SET_ROWS (only if active)
             if (den_nvfp4_kv_is_active() && dst->data) {
                 const char * name = ggml_get_name(dst);
                 if (name) {
@@ -2083,10 +2083,12 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
                                 seq_pos = ((const int32_t *)src1->data)[0];
                             }
                             const float * d_data = (const float *)src0->data;
-                            if (is_k) {
-                                den_nvfp4_kv_store(&g_nvfp4_kv, layer, seq_pos, d_data, nullptr);
-                            } else {
-                                den_nvfp4_kv_store(&g_nvfp4_kv, layer, seq_pos, nullptr, d_data);
+                            if (d_data && seq_pos >= 0 && seq_pos < 65536) {
+                                if (is_k) {
+                                    den_nvfp4_kv_store(&g_nvfp4_kv, layer, seq_pos, d_data, nullptr);
+                                } else {
+                                    den_nvfp4_kv_store(&g_nvfp4_kv, layer, seq_pos, nullptr, d_data);
+                                }
                             }
                         }
                     }

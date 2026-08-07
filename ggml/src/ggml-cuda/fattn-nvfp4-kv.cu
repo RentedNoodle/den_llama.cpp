@@ -400,10 +400,19 @@ void den_nvfp4_kv_set_active_cache(den_nvfp4_kv_cache * cache) {
     (void)cache; // unused — the global is the active one
 }
 
-// Called from llama-context.cpp after context creation
-void den_nvfp4_kv_init_ctx(int n_attn_layers, int n_kv_heads, int head_dim, int max_seq) {
+// Lazy init: called from ggml-cuda.cu SET_ROWS hook on first cache access.
+// Uses a fixed max layer count (64) — each layer's GPU buffers are allocated
+// on first store. Dimensions extracted from the KV cache tensor shape.
+void den_nvfp4_kv_lazy_init(int n_kv_heads, int head_dim, int max_seq) {
     if (g_nvfp4_kv.initialized) return;
-    den_nvfp4_kv_init(&g_nvfp4_kv, n_attn_layers, n_kv_heads, head_dim, max_seq);
+    if (head_dim != 128) {
+        // NVFP4 tile format requires head_dim=128
+        return;
+    }
+    // Clamp max_seq to supported range
+    if (max_seq > DEN_NVFP4_KV_MAX_SEQ) max_seq = DEN_NVFP4_KV_MAX_SEQ;
+    if (max_seq < 1) max_seq = 1;
+    den_nvfp4_kv_init(&g_nvfp4_kv, DEN_NVFP4_KV_MAX_LAYERS, n_kv_heads, head_dim, max_seq);
 }
 
 // ═══════════════════════════════════════════════════════════
