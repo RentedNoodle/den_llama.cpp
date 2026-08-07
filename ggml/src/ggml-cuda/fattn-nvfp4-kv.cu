@@ -465,6 +465,75 @@ void ggml_backend_cuda_nvfp4_kv_init(
         cudaFree(d_in); cudaFree(d_out); cudaFree(d_err);
         free(h_in); free(h_out); free(h_err);
     }
+
+    // Run fused attention correctness test
+    {
+        int n_heads = 4, n_kv_heads = 2, seq_len = 3;
+        // Q [n_heads, hdim], K/V: anchor [n_kv_heads, hdim] + tiles [seq_len-1][n_kv_heads][160]
+        float *h_Q = (float*)calloc(n_heads * head_dim, sizeof(float));
+        float *h_K = (float*)calloc(n_kv_heads * head_dim, sizeof(float));
+        float *h_V = (float*)calloc(n_kv_heads * head_dim, sizeof(float));
+        for (int i = 0; i < n_kv_heads * head_dim; i++) { h_K[i] = (float)rand()/RAND_MAX; h_V[i] = (float)rand()/RAND_MAX; }
+        for (int i = 0; i < n_heads * head_dim; i++) h_Q[i] = (float)rand()/RAND_MAX;
+
+        // CPU reference: Q @ K^T, softmax, weighted V sum
+        float *cpu_out = (float*)calloc(n_heads * head_dim, sizeof(float));
+        for (int h = 0; h < n_heads; h++) {
+            int kv_h = (n_kv_heads == n_heads) ? h : (h * n_kv_heads / n_heads);
+            float scores[8] = {0};
+            for (int t = 0; t < seq_len; t++) {
+                float dot = 0;
+                for (int d = 0; d < head_dim; d++)
+                    dot += h_Q[h*head_dim+d] * h_K[kv_h*head_dim+d];
+                scores[t] = dot / sqrtf(head_dim);
+            }
+            float mx = scores[0]; for (int t=1;t<seq_len;t++) if(scores[t]>mx)mx=scores[t];
+            float sum_exp=0; for (int t=0;t<seq_len;t++) { scores[t]=expf(scores[t]-mx); sum_exp+=scores[t]; }
+            for (int t=0;t<seq_len;t++) scores[t]/=sum_exp;
+            for (int d=0;d<head_dim;d++) {
+                float vsum=0;
+                for (int t=0;t<seq_len;t++) vsum+=scores[t]*h_V[kv_h*head_dim+d];
+                cpu_out[h*head_dim+d]=vsum;
+            }
+        }
+
+        // GPU setup: anchor (token 0) + tiles (tokens 1-2)
+        float *d_Q, *d_out, *d_k_anchor, *d_v_anchor, *d_k_tiles, *d_v_tiles;
+        cudaMalloc(&d_Q, n_heads*head_dim*sizeof(float));
+        cudaMalloc(&d_out, n_heads*head_dim*sizeof(float));
+        cudaMalloc(&d_k_anchor, n_kv_heads*head_dim*sizeof(float));
+        cudaMalloc(&d_v_anchor, n_kv_heads*head_dim*sizeof(float));
+        size_t tiles_sz = (size_t)(seq_len-1)*n_kv_heads*DEN_NVFP4_KV_TILE_BYTES;
+        cudaMalloc(&d_k_tiles, tiles_sz);
+        cudaMalloc(&d_v_tiles, tiles_sz);
+        cudaMemcpy(d_Q, h_Q, n_heads*head_dim*sizeof(float), cudaMemcpyHostToDevice);
+        cudaMemcpy(d_k_anchor, h_K, n_kv_heads*head_dim*sizeof(float), cudaMemcpyHostToDevice);
+        cudaMemcpy(d_v_anchor, h_V, n_kv_heads*head_dim*sizeof(float), cudaMemcpyHostToDevice);
+        cudaMemset(d_k_tiles, 0, tiles_sz); cudaMemset(d_v_tiles, 0, tiles_sz);
+
+        // Launch attention kernel (all tokens from anchor since tiles empty)
+        size_t smem = seq_len * sizeof(float);
+        kv_nvfp4_attention_kernel<<<n_heads, head_dim, smem>>>(
+            d_Q, d_k_anchor, d_v_anchor, d_k_tiles, d_v_tiles, d_out,
+            n_heads, n_kv_heads, head_dim, seq_len, seq_len+1, 1);
+        cudaDeviceSynchronize();
+
+        float *h_gpu = (float*)malloc(n_heads*head_dim*sizeof(float));
+        cudaMemcpy(h_gpu, d_out, n_heads*head_dim*sizeof(float), cudaMemcpyDeviceToHost);
+
+        float att_max_err=0, att_s_in=0, att_s_out=0, att_dot=0;
+        for (int i=0;i<n_heads*head_dim;i++) {
+            float e=fabsf(cpu_out[i]-h_gpu[i]); if(e>att_max_err)att_max_err=e;
+            att_s_in+=cpu_out[i]*cpu_out[i]; att_s_out+=h_gpu[i]*h_gpu[i]; att_dot+=cpu_out[i]*h_gpu[i];
+        }
+        float att_cos = att_dot/(sqrtf(att_s_in)*sqrtf(att_s_out));
+        fprintf(stderr, "NVFP4 attention test: max_err=%.4f cos=%.4f %s\n",
+                att_max_err, att_cos, att_cos>0.99f?"PASS":"FAIL");
+
+        cudaFree(d_Q); cudaFree(d_out); cudaFree(d_k_anchor); cudaFree(d_v_anchor);
+        cudaFree(d_k_tiles); cudaFree(d_v_tiles);
+        free(h_Q); free(h_K); free(h_V); free(cpu_out); free(h_gpu);
+    }
 }
 
 // Lazy init: called from ggml-cuda.cu SET_ROWS hook on first cache access.
