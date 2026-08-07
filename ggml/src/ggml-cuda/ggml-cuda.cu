@@ -2092,7 +2092,31 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
                                     den_nvfp4_kv_store(&g_nvfp4_kv, layer, seq_pos, nullptr, tok_data);
                                 }
                             }
-                            if (!is_k) {
+                            if (!is_k && layer == 0 && base_seq == 0) {
+                                // Verify store: dequant tile 0, compare to original float data
+                                static int verified = 0;
+                                if (!verified) { verified = 1;
+                                    // Wait for store kernel to complete
+                                    cudaDeviceSynchronize();
+                                    float *h_deq = (float*)malloc(1024 * sizeof(float));
+                                    float *h_orig = (float*)malloc(1024 * sizeof(float));
+                                    // Dequant tile 0 (for head 0, token 0 = anchor)
+                                    cudaMemcpy(h_deq, g_nvfp4_kv.layers[0].d_v_anchor, 128*sizeof(float), cudaMemcpyDeviceToHost);
+                                    // Original data: first token's V data (head 0 only = 128 floats)
+                                    if (base_data) {
+                                        cudaMemcpy(h_orig, base_data, 128*sizeof(float), cudaMemcpyDeviceToHost);
+                                        float mx=0, dot=0, s1=0, s2=0;
+                                        for (int j=0;j<128;j++) {
+                                            float e=fabsf(h_orig[j]-h_deq[j]); if(e>mx)mx=e;
+                                            dot+=h_orig[j]*h_deq[j]; s1+=h_orig[j]*h_orig[j]; s2+=h_deq[j]*h_deq[j];
+                                        }
+                                        fprintf(stderr, "NVFP4 ANCHOR VERIFY: max_err=%.6f cos=%.6f (first 4: orig=[%.4f,%.4f,%.4f,%.4f] deq=[%.4f,%.4f,%.4f,%.4f])\n",
+                                            mx, dot/(sqrtf(s1)*sqrtf(s2)),
+                                            h_orig[0],h_orig[1],h_orig[2],h_orig[3],
+                                            h_deq[0],h_deq[1],h_deq[2],h_deq[3]);
+                                    }
+                                    free(h_deq); free(h_orig);
+                                }
                                 den_nvfp4_kv_set_seq_len(&g_nvfp4_kv, layer, base_seq + n_tokens);
                             }
                         }
