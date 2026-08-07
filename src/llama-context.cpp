@@ -3642,7 +3642,7 @@ llama_context * llama_init_from_model(
         auto * ctx = new llama_context(*model, params);
 
 #ifdef GGML_USE_CUDA
-        if (params.nvfp4_kv_enabled) {
+        if (params.nvfp4_kv_enabled && getenv("DEN_NVFP4_KV_CACHE")) {
             // declared in ggml-cuda.h with GGML_BACKEND_API (dllimport)
             uint32_t il0 = 0;
             while (il0 < model->hparams.n_layer_all && !model->hparams.has_kv(il0)) il0++;
