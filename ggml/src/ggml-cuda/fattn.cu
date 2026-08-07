@@ -596,6 +596,8 @@ static void ggml_cuda_flash_attn_ext_nvfp4_kv(ggml_backend_cuda_context & ctx, g
         ggml_cuda_flash_attn_ext_vec(ctx, dst);
         return;
     }
+    // Sync: ensure store kernels (NVFP4 stream) completed before attention reads tiles
+    cudaDeviceSynchronize();
     const float * d_Q = (const float *)dst->src[0]->data;
     float * d_output = (float *)dst->data;
     int n_heads = (int)dst->src[0]->ne[1];
