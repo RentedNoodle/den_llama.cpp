@@ -401,6 +401,10 @@ static void parse_target_cache_type(common_params & params, bool key, const std:
         return;
     }
 
+    if (cache_type == "nvfp4_kv") {
+        params.nvfp4_kv_enabled = true;
+    }
+
     if (key) {
         params.cache_kvarn_bits_k = 0;
         params.cache_type_k = kv_cache_type_from_str(cache_type);
