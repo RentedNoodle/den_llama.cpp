@@ -539,8 +539,7 @@ int den_nvfp4_kv_store(den_nvfp4_kv_cache * cache, int layer,
         return -1;
     }
 
-    kv_atomic_max_i32(&kv_layer->seq_len, seq_pos + 1);
-
+    // seq_len is advanced externally by the hook (after K+V pair is stored)
     cudaStream_t stream = (cudaStream_t)cache->cuda_stream;
     int block_size = 128;
     int grid_size  = (cache->n_kv_heads + block_size - 1) / block_size;

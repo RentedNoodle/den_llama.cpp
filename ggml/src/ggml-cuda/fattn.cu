@@ -366,8 +366,7 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
     return BEST_FATTN_KERNEL_NONE;
 #endif// FLASH_ATTN_AVAILABLE
 
-    // DISABLED: fused attention produces garbled output (tile data needs debug)
-    if (false && den_nvfp4_kv_is_active()) {
+    if (den_nvfp4_kv_is_active()) {
         return BEST_FATTN_KERNEL_NVFP4_KV;
     }
 

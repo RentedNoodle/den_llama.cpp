@@ -2064,9 +2064,9 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
         case GGML_OP_SET_ROWS:
             ggml_cuda_op_set_rows(ctx, dst);
             // NVFP4 KV cache hook: quantize K/V after SET_ROWS
-            // NOTE: src1->data is a GPU pointer — cannot deref on CPU.
-            // Use seq_len tracking instead: each store increments seq_len,
-            // so the next store position = current seq_len.
+            // K and V fire in order (cpy_k then cpy_v per graph). Pair them:
+            // K stores at seq_len, V stores at seq_len (same token).
+            // seq_len advances only in V handler (after both K+V done).
             if (den_nvfp4_kv_is_active() && dst->data) {
                 const char * name = ggml_get_name(dst);
                 if (name) {
@@ -2074,14 +2074,15 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
                     int is_v = (!is_k && strncmp(name, "cache_v_l", 9) == 0) ? 1 : 0;
                     if (is_k || is_v) {
                         int layer = atoi(name + 9);
-                        // Use seq_len as the write position (incremented by store itself)
                         int seq_pos = den_nvfp4_kv_seq_len(&g_nvfp4_kv, layer);
                         const float * d_data = (const float *)dst->src[0]->data;
                         if (d_data && seq_pos >= 0 && seq_pos < 65536) {
                             if (is_k) {
                                 den_nvfp4_kv_store(&g_nvfp4_kv, layer, seq_pos, d_data, nullptr);
                             } else {
+                                // V: same seq_pos as K, then advance for next token
                                 den_nvfp4_kv_store(&g_nvfp4_kv, layer, seq_pos, nullptr, d_data);
+                                den_nvfp4_kv_set_seq_len(&g_nvfp4_kv, layer, seq_pos + 1);
                             }
                         }
                     }
