@@ -541,8 +541,6 @@ int den_nvfp4_kv_store(den_nvfp4_kv_cache * cache, int layer,
 
     kv_atomic_max_i32(&kv_layer->seq_len, seq_pos + 1);
 
-    fprintf(stderr, "KV NVFP4 store: layer=%d seq=%d k=%d v=%d\n", layer, seq_pos, store_k, store_v);
-
     cudaStream_t stream = (cudaStream_t)cache->cuda_stream;
     int block_size = 128;
     int grid_size  = (cache->n_kv_heads + block_size - 1) / block_size;
@@ -561,12 +559,7 @@ int den_nvfp4_kv_store(den_nvfp4_kv_cache * cache, int layer,
         cache->n_kv_heads, cache->head_dim,
         seq_pos, kv_layer->max_seq, store_k, store_v);
 
-    cudaError_t err = cudaGetLastError();
-    if (err != cudaSuccess) {
-        fprintf(stderr, "KV NVFP4: store kernel failed: %s (layer=%d, seq=%d, heads=%d, grid=%d, blk=%d)\n",
-                cudaGetErrorString(err), layer, seq_pos, cache->n_kv_heads, grid_size, block_size);
-        return -1;
-    }
+    CUDA_CHECK(cudaGetLastError());
     return 0;
 }
 
