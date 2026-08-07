@@ -514,7 +514,7 @@ void ggml_backend_cuda_nvfp4_kv_init(
         // Launch attention kernel (all tokens from anchor since tiles empty)
         size_t smem = seq_len * sizeof(float);
         kv_nvfp4_attention_kernel<<<n_heads, head_dim, smem>>>(
-            d_Q, d_k_anchor, d_v_anchor, d_k_tiles, d_v_tiles, d_out,
+            d_Q, d_k_anchor, d_v_anchor, (const uint8_t*)d_k_tiles, (const uint8_t*)d_v_tiles, d_out,
             n_heads, n_kv_heads, head_dim, seq_len, seq_len+1, 1);
         cudaDeviceSynchronize();
 
