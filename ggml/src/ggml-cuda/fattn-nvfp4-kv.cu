@@ -242,8 +242,8 @@ __global__ void kv_dequantize_kernel(
 // ═══════════════════════════════════════════════════════════
 // Kernel: fused NVFP4 attention (3-phase: QK^T, softmax, V sum)
 //
-// Each block = one head, blockDim = head_dim (128 threads).
-// Shared memory: smem_scores[seq_len] float.
+// Each block = one head, blockDim = head_dim (128 or 256 threads).
+// Shared memory: smem[seq_len scores + n_warps warp sums] float.
 // Q@K^T uses on-the-fly tile dequant via kv_dequantize_element.
 // ═══════════════════════════════════════════════════════════
 
@@ -262,12 +262,12 @@ __global__ void kv_nvfp4_attention_kernel(
 
     int kv_head = (n_kv_heads == n_heads) ? head : (head * n_kv_heads / n_heads);
 
-    extern __shared__ float smem_scores[];
+    extern __shared__ float smem[];
     float inv_sqrt_hd = 1.0f / sqrtf((float)head_dim);
     int tid = threadIdx.x;
     float q_val = d_Q[(size_t)head * head_dim + tid];
-
-    __shared__ float warp_sums[4];
+    float * smem_scores = smem;
+    float * warp_sums   = smem + seq_len;
 
     // Phase 1: Q @ K^T for all cached tokens
     for (int t = 0; t < seq_len; t++) {
@@ -418,7 +418,7 @@ void ggml_backend_cuda_nvfp4_kv_init(
     int n_attn_layers, int n_kv_heads, int head_dim, int max_seq)
 {
     if (g_nvfp4_kv.initialized) return;
-    if (head_dim != 128) return;
+    if (head_dim != 128 && head_dim != 256) return;
     if (max_seq > DEN_NVFP4_KV_MAX_SEQ) max_seq = DEN_NVFP4_KV_MAX_SEQ;
     if (max_seq < 1) max_seq = 1;
     den_nvfp4_kv_init(&g_nvfp4_kv, n_attn_layers, n_kv_heads, head_dim, max_seq);
@@ -427,8 +427,8 @@ void ggml_backend_cuda_nvfp4_kv_init(
 // Lazy init: called from ggml-cuda.cu SET_ROWS hook on first cache access.
 void den_nvfp4_kv_lazy_init(int n_kv_heads, int head_dim, int max_seq) {
     if (g_nvfp4_kv.initialized) return;
-    if (head_dim != 128) {
-        // NVFP4 tile format requires head_dim=128
+    if (head_dim != 128 && head_dim != 256) {
+        // NVFP4 tile format supports head_dim=128 or 256 (16 groups x 16 elems)
         return;
     }
     // Clamp max_seq to supported range
@@ -448,9 +448,9 @@ int den_nvfp4_kv_init(den_nvfp4_kv_cache * cache,
     if (!cache) return -1;
     memset(cache, 0, sizeof(*cache));
 
-    cache->enabled = (head_dim == 128); // must be 128 for tile format
+    cache->enabled = (head_dim == 128 || head_dim == 256); // tile format: 16 groups x 16 elems
     if (!cache->enabled) {
-        fprintf(stderr, "KV NVFP4: disabled (head_dim=%d, need 128)\n", head_dim);
+        fprintf(stderr, "KV NVFP4: disabled (head_dim=%d, need 128 or 256)\n", head_dim);
         return 0;
     }
 
@@ -608,7 +608,8 @@ int den_nvfp4_kv_attention(den_nvfp4_kv_cache * cache, int layer,
     int seq_len = kv_layer->seq_len;
     if (seq_len < 1) return -1;
 
-    size_t smem_bytes = (size_t)seq_len * sizeof(float);
+    int n_warps_smem = (cache->head_dim + 31) / 32;
+    size_t smem_bytes = ((size_t)seq_len + (size_t)n_warps_smem) * sizeof(float);
     if (smem_bytes > DEN_SMEM_MAX_BYTES) smem_bytes = DEN_SMEM_MAX_BYTES;
 
     cudaStream_t stream = (cudaStream_t)cache->cuda_stream;
@@ -616,6 +617,7 @@ int den_nvfp4_kv_attention(den_nvfp4_kv_cache * cache, int layer,
     // Clear stale errors before launch
     cudaGetLastError();
 
+    // blockDim = head_dim (128 or 256); smem holds seq_len scores + n_warps warp sums
     kv_nvfp4_attention_kernel<<<n_heads, cache->head_dim, smem_bytes, stream>>>(
         d_Q,
         kv_layer->d_k_anchor, kv_layer->d_v_anchor,
