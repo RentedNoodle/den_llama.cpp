@@ -539,13 +539,14 @@ int den_nvfp4_kv_store(den_nvfp4_kv_cache * cache, int layer,
         return -1;
     }
 
-    // Sync: ensure compute stream finished writing K/V before we read them.
-    // The store hook fires on the ggml-cuda compute stream; we queue to
-    // a separate NVFP4 stream. Without sync, we may read stale/incomplete data.
-    cudaDeviceSynchronize();
+    // Skip during CUDA graph capture — device sync is illegal.
+    // Store only during actual decode (graph capture is warmup/prefill).
+    cudaStream_t stream = (cudaStream_t)cache->cuda_stream;
+    if (cudaStreamIsCapturing(stream, nullptr) == cudaSuccess) {
+        return 0; // skip during capture
+    }
 
     // seq_len is advanced externally by the hook (after K+V pair is stored)
-    cudaStream_t stream = (cudaStream_t)cache->cuda_stream;
     int block_size = 128;
     int grid_size  = (cache->n_kv_heads + block_size - 1) / block_size;
 
