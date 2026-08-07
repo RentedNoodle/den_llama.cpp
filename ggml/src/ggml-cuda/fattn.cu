@@ -627,9 +627,14 @@ void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst
         case BEST_FATTN_KERNEL_MMA_F16:
             ggml_cuda_flash_attn_ext_mma_f16(ctx, dst);
             break;
-        case BEST_FATTN_KERNEL_NVFP4_KV:
-            ggml_cuda_flash_attn_ext_nvfp4_kv(ctx, dst, 0);
+        case BEST_FATTN_KERNEL_NVFP4_KV: {
+            // Parse layer index from K tensor name: "cache_k_l<N>"
+            int il = 0;
+            const char * kname = ggml_get_name(dst->src[1]);
+            if (kname && strncmp(kname, "cache_k_l", 9) == 0) il = atoi(kname + 9);
+            ggml_cuda_flash_attn_ext_nvfp4_kv(ctx, dst, il);
             break;
+        }
     }
 }
 
