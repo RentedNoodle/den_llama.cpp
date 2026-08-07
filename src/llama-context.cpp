@@ -239,6 +239,7 @@ llama_context::llama_context(
     cparams.auto_fgdn    = true;
 
     cparams.nvfp4_kv_enabled = params.nvfp4_kv_enabled;
+    cparams.kvarn = llama_kvarn_default_params();
 
     cparams.fused_lid    = true;
     cparams.auto_flid    = true;
@@ -398,6 +399,7 @@ llama_context::llama_context(
             /*.swa_full  =*/ params.swa_full,
             /*.ctx_type  =*/ cparams.ctx_type,
             /*.mem_other =*/ llama_get_memory(cparams.ctx_other),
+            /*.kvarn     =*/ cparams.kvarn,
         };
 
         memory.reset(model.create_memory(params_mem, cparams));
@@ -3544,6 +3546,7 @@ llama_context_params llama_context_default_params() {
         /*.cb_eval_user_data           =*/ nullptr,
         /*.type_k                      =*/ GGML_TYPE_F16,
         /*.type_v                      =*/ GGML_TYPE_F16,
+        /*.kvarn                       =*/ llama_kvarn_default_params(),
         /*.abort_callback              =*/ nullptr,
         /*.abort_callback_data         =*/ nullptr,
         /*.embeddings                  =*/ false,
