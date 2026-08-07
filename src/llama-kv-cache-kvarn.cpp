@@ -1135,6 +1135,7 @@ llama_kv_cache_kvarn::llama_kv_cache_kvarn(
         [](int32_t) { return false; },
         nullptr,
         nullptr,
+        false, // sparse_kv_enabled
         n_ubatch,
         tail_tokens,
         tail_type_requested,
