@@ -2076,9 +2076,8 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
                         // n_tokens from indices tensor shape (reliable for both 2D/3D)
                         int n_tokens = src1 ? (int)src1->ne[0] : 1;
                         int base_seq = den_nvfp4_kv_seq_len(&g_nvfp4_kv, layer);
-                        // SET_ROWS: 2D[a] or 3D — per token = ne[0] * ne[1] for 3D
-                        size_t per_token = (size_t)src0->ne[0] *
-                            (src0->n_dims >= 3 ? src0->ne[1] : 1);
+                        // Per-token elements = total / n_tokens (handles 2D and 3D)
+                        size_t per_token = ggml_nelements(src0) / n_tokens;
                         const float * base_data = (const float *)src0->data;
                         if (base_data && base_seq >= 0 && n_tokens > 0 && n_tokens < 65536) {
                             for (int t = 0; t < n_tokens; t++) {
