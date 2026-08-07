@@ -55,8 +55,7 @@ struct llama_cparams {
     bool expert_stage;        // Den: L3-resident CPU expert staging tier (host-half of --cpu-moe)
     bool expert_stage_probe;  // Den: run the L3-residency probe at init and print GB/s
     bool nvfp4_kv_enabled = false; // Den: enable NVFP4 KV cache quantization
-    bool sparse_kv_enabled = false; // Den: enable sparse VMM for KV cache (reserve 4x, commit on demand)
-    bool sparse_kv_enabled = false; // Den: enable CUDA sparse virtual memory for KV cache
+    bool sparse_kv_enabled = false; // Den: enable CUDA sparse virtual memory for KV cache (reserve 4x, commit on demand)
 
     std::vector<bool> embeddings_layer_inp; // [n_layer()] extract input embeddings for layer
 

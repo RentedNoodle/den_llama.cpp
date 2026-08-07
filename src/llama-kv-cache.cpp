@@ -92,14 +92,14 @@ llama_kv_cache::llama_kv_cache(
     const layer_filter_cb & filter,
     const  layer_reuse_cb & reuse,
     const  layer_share_cb & share,
+                     bool   sparse_kv_enabled,
                  uint32_t   n_ubatch,
                  uint32_t   tail_tokens,
                 ggml_type   tail_type,
                  uint32_t   tail_tokens_requested,
                      bool   tail_metadata_only,
                  uint32_t   tail_rollback_tokens,
-                 uint32_t   tail_visibility_window,
-                     bool   sparse_kv_enabled) :
+                 uint32_t   tail_visibility_window) :
     model(model), hparams(hparams), v_trans(v_trans),
     n_seq_max(n_seq_max), n_stream(unified ? 1 : n_seq_max), n_pad(n_pad), n_swa(n_swa), swa_type(swa_type),
     other(static_cast<llama_kv_cache *>(mem_other)),
@@ -819,21 +819,6 @@ llama_memory_context_ptr llama_kv_cache::init_batch(
 llama_memory_context_ptr llama_kv_cache::init_full() {
     return std::make_unique<llama_kv_cache_context>(this);
 }
-
-#ifdef GGML_USE_CUDA
-void llama_kv_cache::grow_sparse_kv_if_needed(size_t total_kv_bytes) const {
-    if (!sparse_pool || !sparse_kv) return;
-
-    // Import sparse VMM types (opaque from ggml-cuda)
-    typedef struct den_sparse_vmm_pool * den_sparse_vmm_t;
-    extern int den_sparse_vmm_ensure(den_sparse_vmm_t, size_t);
-
-    den_sparse_vmm_t pool = (den_sparse_vmm_t)sparse_pool;
-    den_sparse_vmm_ensure(pool, total_kv_bytes);
-}
-#else
-void llama_kv_cache::grow_sparse_kv_if_needed(size_t) const {}
-#endif
 
 llama_memory_context_ptr llama_kv_cache::init_update(llama_context * lctx, bool optimize) {
     GGML_UNUSED(optimize);

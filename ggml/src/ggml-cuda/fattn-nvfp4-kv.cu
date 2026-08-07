@@ -545,6 +545,9 @@ int den_nvfp4_kv_store(den_nvfp4_kv_cache * cache, int layer,
     int block_size = 128;
     int grid_size  = (cache->n_kv_heads + block_size - 1) / block_size;
 
+    // Clear any stale CUDA errors before launching
+    cudaGetLastError();
+
     // Pass non-null device pointer for the "unused" side (kernel won't touch it)
     const float * k_ptr = store_k ? d_k : d_v;
     const float * v_ptr = store_v ? d_v : d_k;
@@ -611,6 +614,9 @@ int den_nvfp4_kv_attention(den_nvfp4_kv_cache * cache, int layer,
     if (smem_bytes > DEN_SMEM_MAX_BYTES) smem_bytes = DEN_SMEM_MAX_BYTES;
 
     cudaStream_t stream = (cudaStream_t)cache->cuda_stream;
+
+    // Clear stale errors before launch
+    cudaGetLastError();
 
     kv_nvfp4_attention_kernel<<<n_heads, cache->head_dim, smem_bytes, stream>>>(
         d_Q,

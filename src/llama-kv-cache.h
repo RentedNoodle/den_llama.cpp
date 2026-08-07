@@ -123,14 +123,14 @@ public:
         const layer_filter_cb & filter,
         const  layer_reuse_cb & reuse,
         const  layer_share_cb & share,
+                     bool   sparse_kv_enabled = false,
                  uint32_t   n_ubatch = 0,
                  uint32_t   tail_tokens = 0,
                 ggml_type   tail_type = GGML_TYPE_F16,
                  uint32_t   tail_tokens_requested = UINT32_MAX,
                      bool   tail_metadata_only = false,
                  uint32_t   tail_rollback_tokens = 0,
-                 uint32_t   tail_visibility_window = 0,
-                     bool   sparse_kv_enabled = false);
+                 uint32_t   tail_visibility_window = 0);
 
     ~llama_kv_cache() = default;
 
@@ -434,9 +434,6 @@ private:
     // sparse VMM pool for on-demand KV cache physical page commitment (CUDA-only)
     mutable struct den_sparse_vmm_pool * sparse_pool = nullptr;
     mutable bool sparse_kv = false;
-
-    // Grow sparse VMM physical capacity if KV usage approaches limit
-    void grow_sparse_kv_if_needed(size_t total_kv_bytes) const;
 
     std::shared_ptr<llama_kv_cells_vec> v_cells_impl;
 

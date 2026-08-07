@@ -2133,7 +2133,8 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                             nullptr,
                             filter,
                             nullptr,
-                            nullptr);
+                            nullptr,
+                            cparams.sparse_kv_enabled);
                 } else {
                     // Main context: DSA cache for the trunk layers only - the nextn
                     // layer(s) are never attended by the trunk graph.
@@ -2431,7 +2432,8 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                                     nullptr,
                                     filter,
                                     nullptr,
-                                    nullptr);
+                                    nullptr,
+                                    cparams.sparse_kv_enabled);
                         }
                     }
                 }
