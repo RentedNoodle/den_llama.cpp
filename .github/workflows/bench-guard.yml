@@ -1,0 +1,130 @@
+# den_llama.cpp — Golden Rule Benchmark Guard
+# Triggers on push to master. Fails if 35B tg64 drops below threshold.
+# Requires self-hosted runner with label "den-rtx5070ti" (RTX 5070 Ti, 16 GB VRAM).
+
+name: Golden Rule Guard
+
+on:
+  push:
+    branches:
+      - master
+    paths:
+      - 'ggml/src/ggml-cuda/**'
+      - 'ggml/src/ggml-cpu/**'
+      - 'src/**'
+      - 'ggml/src/**'
+      - 'ggml/include/**'
+      - 'include/**'
+      - 'common/**'
+      - 'tools/llama-bench/**'
+      - 'CMakeLists.txt'
+      - 'cmake/**'
+      - 'ggml/CMakeLists.txt'
+  workflow_dispatch:
+    inputs:
+      threshold:
+        description: 'Minimum tg64 threshold'
+        required: false
+        type: number
+        default: 184
+      model:
+        description: 'Path to 35B model'
+        required: false
+        type: string
+        default: 'I:\models\ornith-1.0-35b-APEX-I-Mini-MTP.gguf'
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  golden-guard:
+    name: "Golden Rule: 35B tg64 ≥ ${{ inputs.threshold || 184 }}"
+    runs-on: [self-hosted, den-rtx5070ti]
+
+    env:
+      THRESHOLD: ${{ inputs.threshold || 184 }}
+      MODEL_PATH: ${{ inputs.model || 'I:\models\ornith-1.0-35b-APEX-I-Mini-MTP.gguf' }}
+      DEN_NVFP4_KV_CACHE: 0
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          fetch-depth: 1
+
+      - name: Build
+        shell: pwsh
+        run: |
+          .\build_den.ps1 -phase all
+          if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
+
+      - name: Baseline benchmark (35B, q8_0 KV, tg64)
+        shell: pwsh
+        run: |
+          $output = & .\build_ninja\bin\llama-bench.exe `
+            -m $env:MODEL_PATH `
+            -p 64 -n 64 `
+            -ngl 99 -t 8 `
+            -ctk q8_0 -ctv q8_0 `
+            2>&1
+          $output | ForEach-Object { Write-Output $_ }
+
+          # Parse tg64 from output: "tg64" row, extract t/s column
+          $tg64_line = $output | Select-String "tg64" | Select-Object -First 1
+          if (-not $tg64_line) {
+            Write-Error "GOLDEN GUARD FAILED: Could not find tg64 in benchmark output"
+            exit 1
+          }
+
+          $tg64_str = $tg64_line.ToString() -split '\|' | Select-Object -Index 10
+          $tg64 = [double]($tg64_str.Trim() -split ' ' | Select-Object -First 1)
+          Write-Output "tg64 = $tg64 tok/s"
+
+          if ($tg64 -lt $env:THRESHOLD) {
+            Write-Error "GOLDEN GUARD FAILED: tg64=$tg64 < threshold=$($env:THRESHOLD)"
+            exit 1
+          }
+
+          Write-Output "GOLDEN GUARD PASSED: tg64=$tg64 >= threshold=$($env:THRESHOLD)"
+
+      - name: NVFP4 KV benchmark (35B, tg64)
+        shell: pwsh
+        env:
+          DEN_NVFP4_KV_CACHE: 1
+        run: |
+          $output = & .\build_ninja\bin\llama-bench.exe `
+            -m $env:MODEL_PATH `
+            -p 64 -n 64 `
+            -ngl 99 -t 8 `
+            -ctk nvfp4_kv -ctv nvfp4_kv `
+            2>&1
+          $output | ForEach-Object { Write-Output $_ }
+
+          $tg64_line = $output | Select-String "tg64" | Select-Object -First 1
+          if (-not $tg64_line) {
+            Write-Error "NVFP4 GUARD FAILED: Could not find tg64 in benchmark output"
+            exit 1
+          }
+
+          $tg64_str = $tg64_line.ToString() -split '\|' | Select-Object -Index 10
+          $tg64 = [double]($tg64_str.Trim() -split ' ' | Select-Object -First 1)
+          Write-Output "NVFP4 tg64 = $tg64 tok/s"
+
+          # NVFP4 may be slightly slower but should not regress below F32 baseline
+          # NVFP4 threshold: same as F32 baseline (parity expected)
+          if ($tg64 -lt $env:THRESHOLD) {
+            Write-Error "NVFP4 GUARD FAILED: tg64=$tg64 < threshold=$($env:THRESHOLD)"
+            exit 1
+          }
+
+          Write-Output "NVFP4 GUARD PASSED: tg64=$tg64 >= threshold=$($env:THRESHOLD)"
+
+      - name: Summary
+        shell: pwsh
+        if: always()
+        run: |
+          Write-Output "Golden Rule Guard complete."
+          Write-Output "Threshold: $env:THRESHOLD tok/s (35B tg64)"
+          Write-Output "Commit: ${{ github.sha }}"
+          Write-Output "Branch: ${{ github.ref_name }}"

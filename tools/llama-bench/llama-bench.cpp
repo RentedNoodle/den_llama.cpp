@@ -359,6 +359,7 @@ struct cmd_params {
     bool                             verbose;
     bool                             progress;
     bool                             no_warmup;
+    bool                             nvfp4_kv_enabled;
     output_formats                   output_format;
     output_formats                   output_format_stderr;
 };
@@ -403,6 +404,7 @@ static const cmd_params cmd_params_defaults = {
     /* verbose              */ false,
     /* progress             */ false,
     /* no_warmup            */ false,
+    /* nvfp4_kv_enabled     */ false,
     /* output_format        */ MARKDOWN,
     /* output_format_stderr */ NONE,
 };
@@ -620,6 +622,11 @@ static cmd_params parse_cmd_params(int argc, char ** argv) {
 
                 std::vector<ggml_type> types;
                 for (const auto & t : p) {
+                    if (t == "nvfp4_kv") {
+                        params.nvfp4_kv_enabled = true;
+                        types.push_back(GGML_TYPE_F32);
+                        continue;
+                    }
                     ggml_type gt = ggml_type_from_name(t);
                     if (gt == GGML_TYPE_COUNT) {
                         invalid_param = true;
@@ -640,6 +647,11 @@ static cmd_params parse_cmd_params(int argc, char ** argv) {
 
                 std::vector<ggml_type> types;
                 for (const auto & t : p) {
+                    if (t == "nvfp4_kv") {
+                        params.nvfp4_kv_enabled = true;
+                        types.push_back(GGML_TYPE_F32);
+                        continue;
+                    }
                     ggml_type gt = ggml_type_from_name(t);
                     if (gt == GGML_TYPE_COUNT) {
                         invalid_param = true;
@@ -1210,6 +1222,7 @@ struct cmd_params_instance {
     bool               embeddings;
     bool               no_op_offload;
     bool               no_host;
+    bool               nvfp4_kv_enabled;
     size_t             fit_target;
     uint32_t           fit_min_ctx;
 
@@ -1286,6 +1299,7 @@ struct cmd_params_instance {
         cparams.embeddings      = embeddings;
         cparams.op_offload      = !no_op_offload;
         cparams.swa_full        = false;
+        cparams.nvfp4_kv_enabled = nvfp4_kv_enabled;
 
         return cparams;
     }
@@ -1351,6 +1365,7 @@ static std::vector<cmd_params_instance> get_cmd_params_instances(const cmd_param
                 /* .embeddings            = */ embd,
                 /* .no_op_offload         = */ nopo,
                 /* .no_host               = */ noh,
+                /* .nvfp4_kv_enabled      = */ params.nvfp4_kv_enabled,
                 /* .fit_target            = */ fpt,
                 /* .fit_min_ctx           = */ fpc,
             };
@@ -1387,6 +1402,7 @@ static std::vector<cmd_params_instance> get_cmd_params_instances(const cmd_param
                 /* .embeddings            = */ embd,
                 /* .no_op_offload         = */ nopo,
                 /* .no_host               = */ noh,
+                /* .nvfp4_kv_enabled      = */ params.nvfp4_kv_enabled,
                 /* .fit_target            = */ fpt,
                 /* .fit_min_ctx           = */ fpc,
             };
@@ -1423,6 +1439,7 @@ static std::vector<cmd_params_instance> get_cmd_params_instances(const cmd_param
                 /* .embeddings            = */ embd,
                 /* .no_op_offload         = */ nopo,
                 /* .no_host               = */ noh,
+                /* .nvfp4_kv_enabled      = */ params.nvfp4_kv_enabled,
                 /* .fit_target            = */ fpt,
                 /* .fit_min_ctx           = */ fpc,
             };
@@ -1464,6 +1481,7 @@ struct test {
     bool                     embeddings;
     bool                     no_op_offload;
     bool                     no_host;
+    bool                     nvfp4_kv_enabled;
     size_t                   fit_target;
     uint32_t                 fit_min_ctx;
     int                      n_prompt;
@@ -1502,8 +1520,9 @@ struct test {
         tensor_buft_overrides = inst.tensor_buft_overrides;
         embeddings     = inst.embeddings;
         no_op_offload  = inst.no_op_offload;
-        no_host        = inst.no_host;
-        fit_target     = inst.fit_target;
+        no_host            = inst.no_host;
+        nvfp4_kv_enabled   = inst.nvfp4_kv_enabled;
+        fit_target         = inst.fit_target;
         fit_min_ctx    = inst.fit_min_ctx;
         n_prompt       = inst.n_prompt;
         n_gen          = inst.n_gen;
@@ -1562,7 +1581,7 @@ struct test {
             "type_k",         "type_v",         "n_gpu_layers",  "n_cpu_moe",      "split_mode",
             "main_gpu",       "no_kv_offload",  "flash_attn",    "devices",        "tensor_split",
             "tensor_buft_overrides",            "load_mode",     "embeddings",
-            "no_op_offload",  "no_host",        "fit_target",    "fit_min_ctx",
+            "no_op_offload",  "no_host",        "nvfp4_kv_enabled", "fit_target",    "fit_min_ctx",
             "n_prompt",       "n_gen",          "n_depth",
             "test_time",      "avg_ns",         "stddev_ns",     "avg_ts",         "stddev_ts"
         };
@@ -1580,7 +1599,7 @@ struct test {
             return INT;
         }
         if (field == "f16_kv" || field == "no_kv_offload" || field == "cpu_strict" ||
-            field == "embeddings" || field == "no_host") {
+            field == "embeddings" || field == "no_host" || field == "nvfp4_kv_enabled") {
             return BOOL;
         }
         if (field == "avg_ts" || field == "stddev_ts") {
@@ -1659,6 +1678,7 @@ struct test {
                                             std::to_string(embeddings),
                                             std::to_string(no_op_offload),
                                             std::to_string(no_host),
+                                            std::to_string(nvfp4_kv_enabled),
                                             std::to_string(fit_target),
                                             std::to_string(fit_min_ctx),
                                             std::to_string(n_prompt),
