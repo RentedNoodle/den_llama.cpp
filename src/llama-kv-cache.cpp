@@ -13,6 +13,20 @@
 #include <map>
 #include <stdexcept>
 
+#ifdef GGML_USE_CUDA
+#include "ggml-cuda.h"
+
+// Extern declarations for sparse VMM functions (implemented in ggml-cuda.dll)
+extern "C" {
+    typedef struct den_sparse_vmm_pool * den_sparse_vmm_t;
+    den_sparse_vmm_t den_sparse_vmm_create(size_t reserve_bytes, size_t initial_bytes);
+    int  den_sparse_vmm_ensure(den_sparse_vmm_t pool, size_t required_bytes);
+    void den_sparse_vmm_destroy(den_sparse_vmm_t pool);
+    bool ggml_backend_cuda_sparse_vmm_supported(void);
+    ggml_backend_buffer_type_t ggml_backend_cuda_sparse_vmm_buffer_type(den_sparse_vmm_t pool);
+}
+#endif
+
 static bool ggml_is_power_of_2(int n) {
     return (n & (n - 1)) == 0;
 }
@@ -84,10 +98,12 @@ llama_kv_cache::llama_kv_cache(
                  uint32_t   tail_tokens_requested,
                      bool   tail_metadata_only,
                  uint32_t   tail_rollback_tokens,
-                 uint32_t   tail_visibility_window) :
+                 uint32_t   tail_visibility_window,
+                     bool   sparse_kv_enabled) :
     model(model), hparams(hparams), v_trans(v_trans),
     n_seq_max(n_seq_max), n_stream(unified ? 1 : n_seq_max), n_pad(n_pad), n_swa(n_swa), swa_type(swa_type),
     other(static_cast<llama_kv_cache *>(mem_other)),
+    sparse_kv(sparse_kv_enabled),
     v_cells_impl(other ? other->v_cells_impl : std::make_shared<llama_kv_cells_vec>()),
     v_cells(*v_cells_impl),
     tail_tokens(tail_tokens), tail_type(tail_type), tail_rollback_tokens(tail_rollback_tokens),

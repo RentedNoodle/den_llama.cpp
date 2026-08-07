@@ -2882,6 +2882,13 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             params.den_stage_probe = true;
         }
     ));
+    add_opt(common_arg(
+        {"--sparse-kv"},
+        "Den: enable CUDA sparse virtual memory for KV cache",
+        [](common_params & params) {
+            params.sparse_kv_enabled = true;
+        }
+    ));
     GGML_ASSERT(params.n_gpu_layers < 0); // string_format would need to be extended for a default >= 0
     add_opt(common_arg(
         {"-ngl", "--gpu-layers", "--n-gpu-layers"}, "N",

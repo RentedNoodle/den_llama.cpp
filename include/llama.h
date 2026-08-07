@@ -442,6 +442,7 @@ extern "C" {
         bool expert_stage_probe; // Den: run the L3-residency probe at init and print GB/s
 
         bool nvfp4_kv_enabled; // Den: enable NVFP4 KV cache quantization
+        bool sparse_kv_enabled; // Den: enable CUDA sparse virtual memory for KV cache
 
         // [EXPERIMENTAL]
         // backend sampler chain configuration (make sure the caller keeps the sampler chains alive)
