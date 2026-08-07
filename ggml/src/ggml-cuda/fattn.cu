@@ -366,11 +366,7 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
     return BEST_FATTN_KERNEL_NONE;
 #endif// FLASH_ATTN_AVAILABLE
 
-    // Fused attention produces garbled output despite correct quant math
-    // (roundtrip cos=0.995, attention test cos=0.979). Store path verified.
-    // Disabled until root cause found — likely real K/V distribution differs
-    // from test data, or tile indexing mismatch in full pipeline.
-    if (false && den_nvfp4_kv_is_active()) {
+    if (den_nvfp4_kv_is_active()) {
         return BEST_FATTN_KERNEL_NVFP4_KV;
     }
 
