@@ -251,7 +251,7 @@ llama_context::llama_context(
     cparams.fused_gdn_ch = true;
     cparams.auto_fgdn    = true;
 
-    cparams.kvarn = llama_kvarn_default_params();
+    cparams.kvarn = params.kvarn;
 
     cparams.fused_lid    = true;
     cparams.auto_flid    = true;
