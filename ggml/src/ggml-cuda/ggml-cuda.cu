@@ -2092,7 +2092,18 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
                                     den_nvfp4_kv_store(&g_nvfp4_kv, layer, seq_pos, nullptr, tok_data);
                                 }
                             }
-                            if (!is_k) {
+                            if (!is_k && layer == 0) {
+                                // DEBUG: dump first tile after store
+                                static int dumped = 0;
+                                if (!dumped) { dumped = 1;
+                                    uint8_t h_tile[160];
+                                    cudaMemcpy(h_tile, g_nvfp4_kv.layers[0].d_v_tiles, 160, cudaMemcpyDeviceToHost);
+                                    float ue4m3[16] = {0.0f,0.0625f,0.125f,0.1875f,0.25f,0.3125f,0.375f,0.4375f,1.0f,1.125f,1.25f,1.375f,1.5f,1.625f,1.75f,1.875f};
+                                    float scale0 = ue4m3[h_tile[0] & 0x0F];
+                                    fprintf(stderr, "NVFP4 TILE DUMP: tok=%d n_tokens=%d scale0=%.4f nibbles: ", base_seq, n_tokens, scale0);
+                                    for (int i=0;i<8;i++) fprintf(stderr, "%02x ", h_tile[16+i]);
+                                    fprintf(stderr, " tile_norm=%.4f\n", *(float*)(h_tile+144));
+                                }
                                 den_nvfp4_kv_set_seq_len(&g_nvfp4_kv, layer, base_seq + n_tokens);
                             }
                         }
