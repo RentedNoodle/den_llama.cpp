@@ -2092,30 +2092,36 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
                                     den_nvfp4_kv_store(&g_nvfp4_kv, layer, seq_pos, nullptr, tok_data);
                                 }
                             }
-                            if (!is_k && layer == 0 && base_seq == 0) {
-                                // Verify store: dequant tile 0, compare to original float data
+                            if (!is_k && layer == 0) {
                                 static int verified = 0;
-                                if (!verified) { verified = 1;
-                                    // Wait for store kernel to complete
+                                if (verified < 2 && base_seq + n_tokens > 1) { verified++;
                                     cudaDeviceSynchronize();
-                                    float *h_deq = (float*)malloc(1024 * sizeof(float));
-                                    float *h_orig = (float*)malloc(1024 * sizeof(float));
-                                    // Dequant tile 0 (for head 0, token 0 = anchor)
-                                    cudaMemcpy(h_deq, g_nvfp4_kv.layers[0].d_v_anchor, 128*sizeof(float), cudaMemcpyDeviceToHost);
-                                    // Original data: first token's V data (head 0 only = 128 floats)
-                                    if (base_data) {
+                                    float h_deq[128], h_orig[128];
+                                    if (base_seq == 0) {
+                                        // Anchor verify (token 0)
+                                        cudaMemcpy(h_deq, g_nvfp4_kv.layers[0].d_v_anchor, 128*sizeof(float), cudaMemcpyDeviceToHost);
                                         cudaMemcpy(h_orig, base_data, 128*sizeof(float), cudaMemcpyDeviceToHost);
-                                        float mx=0, dot=0, s1=0, s2=0;
-                                        for (int j=0;j<128;j++) {
-                                            float e=fabsf(h_orig[j]-h_deq[j]); if(e>mx)mx=e;
-                                            dot+=h_orig[j]*h_deq[j]; s1+=h_orig[j]*h_orig[j]; s2+=h_deq[j]*h_deq[j];
+                                    } else {
+                                        // Tile verify: dequant first tile (head 0, token base_seq)
+                                        cudaMemcpy(h_deq, g_nvfp4_kv.layers[0].d_v_tiles, 160, cudaMemcpyDeviceToHost);
+                                        // Dequant on host
+                                        float ue4m3[16]={0,0.0625,0.125,0.1875,0.25,0.3125,0.375,0.4375,1,1.125,1.25,1.375,1.5,1.625,1.75,1.875};
+                                        for (int g=0;g<8;g++) {
+                                            float s=ue4m3[h_deq[g]&0x0F];
+                                            for (int e=0;e<16;e++) {
+                                                int nb=h_deq[16+g*8+e/2];
+                                                if(e&1)nb>>=4;else nb&=0x0F;
+                                                float v=(nb&8?-1:1)*((float[]){0,0.5,1,1.5,2,3,4,6}[nb&7]);
+                                                h_deq[g*16+e]=v*s;
+                                            }
                                         }
-                                        fprintf(stderr, "NVFP4 ANCHOR VERIFY: max_err=%.6f cos=%.6f (first 4: orig=[%.4f,%.4f,%.4f,%.4f] deq=[%.4f,%.4f,%.4f,%.4f])\n",
-                                            mx, dot/(sqrtf(s1)*sqrtf(s2)),
-                                            h_orig[0],h_orig[1],h_orig[2],h_orig[3],
-                                            h_deq[0],h_deq[1],h_deq[2],h_deq[3]);
+                                        cudaMemcpy(h_orig, base_data, 128*sizeof(float), cudaMemcpyDeviceToHost);
                                     }
-                                    free(h_deq); free(h_orig);
+                                    float mx=0,dot=0,s1=0,s2=0;
+                                    for(int j=0;j<128;j++){float e=fabsf(h_orig[j]-h_deq[j]);if(e>mx)mx=e;dot+=h_orig[j]*h_deq[j];s1+=h_orig[j]*h_orig[j];s2+=h_deq[j]*h_deq[j];}
+                                    fprintf(stderr,"NVFP4 VERIFY%d (seq=%d): max_err=%.4f cos=%.4f orig[0..2]=[%.4f,%.4f,%.4f] deq=[%.4f,%.4f,%.4f]\n",
+                                        verified,base_seq,mx,dot/(sqrtf(s1)*sqrtf(s2)),h_orig[0],h_orig[1],h_orig[2],h_deq[0],h_deq[1],h_deq[2]);
+                                    free((void*)0);
                                 }
                                 den_nvfp4_kv_set_seq_len(&g_nvfp4_kv, layer, base_seq + n_tokens);
                             }
