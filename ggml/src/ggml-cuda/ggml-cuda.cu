@@ -2064,8 +2064,9 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
         case GGML_OP_SET_ROWS:
             ggml_cuda_op_set_rows(ctx, dst);
             // NVFP4 KV cache hook: only during non-captured execution
-            if (den_nvfp4_kv_is_active() && dst->data &&
-                cudaStreamIsCapturing(0, nullptr) != cudaSuccess) {
+            // Check capture FIRST to avoid CUDA calls during capture
+            if (dst->data && cudaStreamIsCapturing(0, nullptr) != cudaSuccess &&
+                den_nvfp4_kv_is_active()) {
                 const char * name = ggml_get_name(dst);
                 if (name) {
                     int is_k = (strncmp(name, "cache_k_l", 9) == 0) ? 1 : 0;
