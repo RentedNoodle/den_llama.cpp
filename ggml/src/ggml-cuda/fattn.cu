@@ -366,7 +366,9 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
     return BEST_FATTN_KERNEL_NONE;
 #endif// FLASH_ATTN_AVAILABLE
 
-    if (den_nvfp4_kv_is_active()) {
+    // NVFP4 fused attention is incompatible with CUDA graph capture.
+    // Fall back to vec during capture/warmup, use fused during decode.
+    if (den_nvfp4_kv_is_active() && cudaStreamIsCapturing(0, nullptr) != cudaSuccess) {
         return BEST_FATTN_KERNEL_NVFP4_KV;
     }
 
@@ -595,11 +597,6 @@ static void ggml_cuda_flash_attn_ext_nvfp4_kv(ggml_backend_cuda_context & ctx, g
     if (den_nvfp4_kv_seq_len(&g_nvfp4_kv, il) < 1) {
         ggml_cuda_flash_attn_ext_vec(ctx, dst);
         return;
-    }
-    // Sync: ensure store kernels completed before attention reads tiles.
-    // Skip during CUDA graph capture (warmup) — graph replay handles ordering.
-    if (cudaStreamIsCapturing(0, nullptr) != cudaSuccess) {
-        cudaDeviceSynchronize();
     }
     const float * d_Q = (const float *)dst->src[0]->data;
     float * d_output = (float *)dst->data;
