@@ -3645,7 +3645,7 @@ llama_context * llama_init_from_model(
                     (int)model->hparams.n_layer_kv(),
                     (int)model->hparams.n_head_kv(il0),
                     (int)model->hparams.n_embd_head_k(il0),
-                    (int)ctx->cparams.n_ctx_seq);
+                    (int)llama_n_ctx_seq(ctx));
             }
         }
 #endif
