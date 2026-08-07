@@ -2063,17 +2063,9 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
             break;
         case GGML_OP_SET_ROWS:
             ggml_cuda_op_set_rows(ctx, dst);
-            // NVFP4 KV cache hook: lazy init + quantize after SET_ROWS
-            if (dst->data && den_nvfp4_kv_is_wanted()) {
-                const char * name = ggml_get_name(dst);
-                if (name && (strncmp(name, "cache_k_l", 9) == 0 || strncmp(name, "cache_v_l", 9) == 0)) {
-                    extern void den_nvfp4_kv_lazy_init(int n_kv_heads, int head_dim, int max_seq);
-                    if (!g_nvfp4_kv.initialized) {
-                        den_nvfp4_kv_lazy_init((int)dst->ne[0] / 128, 128, (int)dst->ne[1]);
-                    }
-                }
-            }
-            if (den_nvfp4_kv_is_active() && dst->data) {
+            // NVFP4 KV cache hook: DISABLED for debugging
+            //if (dst->data && den_nvfp4_kv_is_wanted()) { ... }
+            if (false && den_nvfp4_kv_is_active() && dst->data) {
                 const char * name = ggml_get_name(dst);
                 if (name) {
                     int is_k = (strncmp(name, "cache_k_l", 9) == 0) ? 1 : 0;
