@@ -498,7 +498,8 @@ void ggml_backend_cuda_nvfp4_kv_init(
         }
 
         // GPU setup: anchor (token 0) + tiles (tokens 1-2) QUANTIZED
-        float *d_Q, *d_out, *d_k_anchor, *d_v_anchor, *d_k_tiles, *d_v_tiles;
+        float *d_Q, *d_out, *d_k_anchor, *d_v_anchor;
+        uint8_t *d_k_tiles, *d_v_tiles;
         cudaMalloc(&d_Q, n_heads*head_dim*sizeof(float));
         cudaMalloc(&d_out, n_heads*head_dim*sizeof(float));
         cudaMalloc(&d_k_anchor, n_kv_heads*head_dim*sizeof(float));
@@ -522,7 +523,7 @@ void ggml_backend_cuda_nvfp4_kv_init(
             cudaMalloc(&d_V1,n_kv_heads*head_dim*sizeof(float));
             cudaMemcpy(d_K1,h_K1,n_kv_heads*head_dim*sizeof(float),cudaMemcpyHostToDevice);
             cudaMemcpy(d_V1,h_V1,n_kv_heads*head_dim*sizeof(float),cudaMemcpyHostToDevice);
-            kv_store_quantize_kernel<<<blk,128>>>(d_K1,d_V1,d_k_tiles,d_v_tiles,(float*)0,(float*)0,n_kv_heads,head_dim,1,seq_len+1,0,0);
+            kv_store_quantize_kernel<<<blk,128>>>(d_K1,d_V1,d_k_tiles,d_v_tiles,nullptr,nullptr,n_kv_heads,head_dim,1,seq_len+1,0,0);
             // Token 2
             float *h_K2=(float*)calloc(n_kv_heads*head_dim,sizeof(float));
             float *h_V2=(float*)calloc(n_kv_heads*head_dim,sizeof(float));
@@ -532,7 +533,7 @@ void ggml_backend_cuda_nvfp4_kv_init(
             cudaMalloc(&d_V2,n_kv_heads*head_dim*sizeof(float));
             cudaMemcpy(d_K2,h_K2,n_kv_heads*head_dim*sizeof(float),cudaMemcpyHostToDevice);
             cudaMemcpy(d_V2,h_V2,n_kv_heads*head_dim*sizeof(float),cudaMemcpyHostToDevice);
-            kv_store_quantize_kernel<<<blk,128>>>(d_K2,d_V2,d_k_tiles,d_v_tiles,(float*)0,(float*)0,n_kv_heads,head_dim,2,seq_len+1,0,0);
+            kv_store_quantize_kernel<<<blk,128>>>(d_K2,d_V2,d_k_tiles,d_v_tiles,nullptr,nullptr,n_kv_heads,head_dim,2,seq_len+1,0,0);
             cudaDeviceSynchronize();
             // Update CPU ref: K/V now has 3 tokens: anchor (token0), K1/V1 (token1), K2/V2 (token2)
             // Recompute CPU reference with all 3 tokens
