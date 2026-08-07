@@ -2103,13 +2103,13 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
                                         cudaMemcpy(h_orig, base_data, 128*sizeof(float), cudaMemcpyDeviceToHost);
                                     } else {
                                         // Tile verify: dequant first tile (head 0, token base_seq)
-                                        cudaMemcpy(h_deq, g_nvfp4_kv.layers[0].d_v_tiles, 160, cudaMemcpyDeviceToHost);
-                                        // Dequant on host
-                                        float ue4m3[16]={0,0.0625,0.125,0.1875,0.25,0.3125,0.375,0.4375,1,1.125,1.25,1.375,1.5,1.625,1.75,1.875};
+                                        uint8_t h_tile[160];
+                                        cudaMemcpy(h_tile, g_nvfp4_kv.layers[0].d_v_tiles, 160, cudaMemcpyDeviceToHost);
+                                        float ue4m3[16]={0,0.0625f,0.125f,0.1875f,0.25f,0.3125f,0.375f,0.4375f,1,1.125f,1.25f,1.375f,1.5f,1.625f,1.75f,1.875f};
                                         for (int g=0;g<8;g++) {
-                                            float s=ue4m3[h_deq[g]&0x0F];
+                                            float s=ue4m3[h_tile[g]&0x0F];
                                             for (int e=0;e<16;e++) {
-                                                int nb=h_deq[16+g*8+e/2];
+                                                int nb=h_tile[16+g*8+e/2];
                                                 if(e&1)nb>>=4;else nb&=0x0F;
                                                 float e2m1_lut[8]={0,0.5f,1,1.5f,2,3,4,6}; float v=(nb&8?-1:1)*e2m1_lut[nb&7];
                                                 h_deq[g*16+e]=v*s;
