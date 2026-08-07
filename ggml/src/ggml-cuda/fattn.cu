@@ -591,11 +591,17 @@ size_t ggml_cuda_flash_attn_ext_get_alloc_size(int device, const ggml_tensor * d
 }
 
 static void ggml_cuda_flash_attn_ext_nvfp4_kv(ggml_backend_cuda_context & ctx, ggml_tensor * dst, int il) {
-    // Fused kernel produces garbled output on real model dims (n_heads=32).
-    // Standalone test passes at 4 heads, but 32-head 8-KV-head path is buggy.
-    // Fall back to vec always for correctness. Store path verified coherent.
-    ggml_cuda_flash_attn_ext_vec(ctx, dst);
-    (void)il;
+    if (den_nvfp4_kv_seq_len(&g_nvfp4_kv, il) < 1) {
+        ggml_cuda_flash_attn_ext_vec(ctx, dst);
+        return;
+    }
+    const float * d_Q = (const float *)dst->src[0]->data;
+    float * d_output = (float *)dst->data;
+    int n_heads = (int)dst->src[0]->ne[1];
+    int ret = den_nvfp4_kv_attention(&g_nvfp4_kv, il, d_Q, d_output, n_heads);
+    if (ret != 0) {
+        ggml_cuda_flash_attn_ext_vec(ctx, dst);
+    }
 }
 
 void ggml_cuda_flash_attn_ext(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
