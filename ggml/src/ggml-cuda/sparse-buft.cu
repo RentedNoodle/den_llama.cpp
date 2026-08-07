@@ -55,16 +55,17 @@ static void sparse_vmm_buf_get_tensor(ggml_backend_buffer_t buf, const ggml_tens
 }
 
 static const ggml_backend_buffer_i sparse_vmm_buffer_interface = {
-    /* .free_buffer  = */ sparse_vmm_buf_free,
-    /* .get_base     = */ sparse_vmm_buf_get_base,
-    /* .init_tensor  = */ nullptr,
-    /* .memset_tensor= */ sparse_vmm_buf_memset_tensor,
+    /* .free_buffer   = */ sparse_vmm_buf_free,
+    /* .get_base      = */ sparse_vmm_buf_get_base,
+    /* .init_tensor   = */ nullptr,
+    /* .memset_tensor = */ sparse_vmm_buf_memset_tensor,
     /* .set_tensor    = */ sparse_vmm_buf_set_tensor,
     /* .get_tensor    = */ sparse_vmm_buf_get_tensor,
     /* .set_tensor_2d = */ nullptr,
     /* .get_tensor_2d = */ nullptr,
-    /* .supports_op   = */ nullptr,
-    /* .usage         = */ nullptr,
+    /* .cpy_tensor    = */ nullptr,
+    /* .clear         = */ nullptr,
+    /* .reset         = */ nullptr,
 };
 
 // ═══════════════════════════════════════════════════════
@@ -96,7 +97,6 @@ static ggml_backend_buffer_t sparse_vmm_buft_alloc(ggml_backend_buffer_type_t bu
     buf->iface   = sparse_vmm_buffer_interface;
     buf->context = buf_ctx;
     buf->size    = size;
-    buf->usage   = size;
 
     return buf;
 }
