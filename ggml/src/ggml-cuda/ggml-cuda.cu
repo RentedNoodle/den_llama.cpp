@@ -2063,37 +2063,25 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
             break;
         case GGML_OP_SET_ROWS:
             ggml_cuda_op_set_rows(ctx, dst);
-            // NVFP4 KV cache hook: DISABLED (store path crashes)
-            if (false && dst->data && den_nvfp4_kv_is_wanted()) {
-                const char * name = ggml_get_name(dst);
-                if (name && (strncmp(name, "cache_k_l", 9) == 0 || strncmp(name, "cache_v_l", 9) == 0)) {
-                }
-            }
-            if (false && den_nvfp4_kv_is_active() && dst->data) {
+            // NVFP4 KV cache hook: quantize K/V after SET_ROWS
+            // NOTE: src1->data is a GPU pointer — cannot deref on CPU.
+            // Use seq_len tracking instead: each store increments seq_len,
+            // so the next store position = current seq_len.
+            if (den_nvfp4_kv_is_active() && dst->data) {
                 const char * name = ggml_get_name(dst);
                 if (name) {
                     int is_k = (strncmp(name, "cache_k_l", 9) == 0) ? 1 : 0;
                     int is_v = (!is_k && strncmp(name, "cache_v_l", 9) == 0) ? 1 : 0;
                     if (is_k || is_v) {
                         int layer = atoi(name + 9);
-                        const ggml_tensor * src0 = dst->src[0];
-                        const ggml_tensor * src1 = dst->src[1];
-                        int n_tokens = (int)src0->ne[2];
-                        // Single-token decode: src1->data[0] = seq_pos
-                        if (src1 && src1->data && n_tokens == 1) {
-                            int seq_pos;
-                            if (src1->type == GGML_TYPE_I64) {
-                                seq_pos = (int)((const int64_t *)src1->data)[0];
+                        // Use seq_len as the write position (incremented by store itself)
+                        int seq_pos = den_nvfp4_kv_seq_len(&g_nvfp4_kv, layer);
+                        const float * d_data = (const float *)dst->src[0]->data;
+                        if (d_data && seq_pos >= 0 && seq_pos < 65536) {
+                            if (is_k) {
+                                den_nvfp4_kv_store(&g_nvfp4_kv, layer, seq_pos, d_data, nullptr);
                             } else {
-                                seq_pos = ((const int32_t *)src1->data)[0];
-                            }
-                            const float * d_data = (const float *)src0->data;
-                            if (d_data && seq_pos >= 0 && seq_pos < 65536) {
-                                if (is_k) {
-                                    den_nvfp4_kv_store(&g_nvfp4_kv, layer, seq_pos, d_data, nullptr);
-                                } else {
-                                    den_nvfp4_kv_store(&g_nvfp4_kv, layer, seq_pos, nullptr, d_data);
-                                }
+                                den_nvfp4_kv_store(&g_nvfp4_kv, layer, seq_pos, nullptr, d_data);
                             }
                         }
                     }
