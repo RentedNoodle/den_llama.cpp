@@ -418,6 +418,7 @@ extern "C" {
 
         enum ggml_type type_k; // data type for K cache [EXPERIMENTAL]
         enum ggml_type type_v; // data type for V cache [EXPERIMENTAL]
+        struct llama_kvarn_params kvarn; // experimental structured K/V cache
 
         // Abort callback
         // if it returns true, execution of llama_decode() will be aborted

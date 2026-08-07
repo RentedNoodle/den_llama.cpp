@@ -579,6 +579,25 @@ struct common_params {
     ggml_type cache_type_k = GGML_TYPE_F16; // KV cache data type for the K
     ggml_type cache_type_v = GGML_TYPE_F16; // KV cache data type for the V
 
+    // KVarN is selected by its pseudo cache-type names in the argument parser.
+    // The backing ggml types remain the matching standard q formats for layers
+    // that are not eligible for structured KVarN storage.
+    int32_t cache_kvarn_bits_k = 0;
+    int32_t cache_kvarn_bits_v = 0;
+    int32_t cache_kvarn_swa_bits_k = 0;
+    int32_t cache_kvarn_swa_bits_v = 0;
+    llama_kvarn_params kvarn = {
+        /*.type                =*/ LLAMA_KVARN_TYPE_DISABLED,
+        /*.key_bits            =*/ 0,
+        /*.value_bits          =*/ 0,
+        /*.swa_key_bits        =*/ 0,
+        /*.swa_value_bits      =*/ 0,
+        /*.group               =*/ 128,
+        /*.sinkhorn_iters      =*/ 16,
+        /*.sink_tokens         =*/ 128,
+        /*.fail_if_unsupported =*/ true,
+    };
+
     common_conversation_mode conversation_mode = COMMON_CONVERSATION_MODE_AUTO;
 
     // multimodal models (see tools/mtmd)

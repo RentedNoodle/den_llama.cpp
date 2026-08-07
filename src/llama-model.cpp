@@ -9,6 +9,7 @@
 #include "llama-model-loader.h"
 
 #include "llama-kv-cache.h"
+#include "llama-kv-cache-kvarn.h"
 #include "llama-kv-cache-iswa.h"
 #include "llama-kv-cache-dsa.h"
 #include "llama-kv-cache-msa.h"
@@ -2396,23 +2397,42 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                     } else {
                         GGML_ASSERT(!hparams.is_swa_any());
 
-                        res = new llama_kv_cache(
-                                *this,
-                                hparams,
-                                params.type_k,
-                                params.type_v,
-                                !cparams.flash_attn,
-                                cparams.offload_kqv,
-                                cparams.kv_unified,
-                                cparams.n_ctx_seq,
-                                cparams.n_seq_max,
-                                1,
-                                hparams.n_swa,
-                                hparams.swa_type,
-                                nullptr,
-                                filter,
-                                nullptr,
-                                nullptr);
+                        if (params.kvarn.type != LLAMA_KVARN_TYPE_DISABLED) {
+                            res = new llama_kv_cache_kvarn(
+                                /* model       */ *this,
+                                /* hparams     */ hparams,
+                                /* params      */ params.kvarn,
+                                /* offload     */ cparams.offload_kqv,
+                                /* unified     */ cparams.kv_unified,
+                                /* kv_size     */ cparams.n_ctx_seq,
+                                /* n_seq_max   */ cparams.n_seq_max,
+                                /* n_batch     */ cparams.n_batch,
+                                /* n_ubatch    */ cparams.n_ubatch,
+                                /* n_pad       */ 1,
+                                /* n_swa       */ hparams.n_swa,
+                                /* swa_type    */ hparams.swa_type,
+                                /* filter      */ filter,
+                                /* reuse       */ nullptr,
+                                /* tail_tokens */ 0);
+                        } else {
+                            res = new llama_kv_cache(
+                                    *this,
+                                    hparams,
+                                    params.type_k,
+                                    params.type_v,
+                                    !cparams.flash_attn,
+                                    cparams.offload_kqv,
+                                    cparams.kv_unified,
+                                    cparams.n_ctx_seq,
+                                    cparams.n_seq_max,
+                                    1,
+                                    hparams.n_swa,
+                                    hparams.swa_type,
+                                    nullptr,
+                                    filter,
+                                    nullptr,
+                                    nullptr);
+                        }
                     }
                 }
             }
