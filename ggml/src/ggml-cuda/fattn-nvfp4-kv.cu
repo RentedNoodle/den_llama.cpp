@@ -707,10 +707,10 @@ int den_nvfp4_kv_store(den_nvfp4_kv_cache * cache, int layer,
         return -1;
     }
 
-    // Launch on default stream (NULL = synchronous with compute stream).
-    // Using the compute stream avoids cross-stream races and works
-    // during CUDA graph capture (no illegal ops).
-    cudaStream_t stream = 0; // default stream = synchronous with compute
+    // Use dedicated stream — avoids CUDA graph capture (graph replays
+    // would re-execute with stale params). Launch is synchronous via
+    // cudaDeviceSynchronize after attention.
+    cudaStream_t stream = (cudaStream_t)cache->cuda_stream;
     int block_size = 128;
     int grid_size  = (cache->n_kv_heads + block_size - 1) / block_size;
 
@@ -782,7 +782,7 @@ int den_nvfp4_kv_attention(den_nvfp4_kv_cache * cache, int layer,
     size_t smem_bytes = (size_t)seq_len * sizeof(float);
     if (smem_bytes > DEN_SMEM_MAX_BYTES) smem_bytes = DEN_SMEM_MAX_BYTES;
 
-    cudaStream_t stream = 0; // default stream
+    cudaStream_t stream = (cudaStream_t)cache->cuda_stream;
 
     // Clear stale errors before launch
     cudaGetLastError();
