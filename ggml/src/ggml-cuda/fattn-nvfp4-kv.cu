@@ -707,9 +707,10 @@ int den_nvfp4_kv_store(den_nvfp4_kv_cache * cache, int layer,
         return -1;
     }
 
-    // Use dedicated stream — avoids CUDA graph capture (graph replays
-    // would re-execute with stale params). Launch is synchronous via
-    // cudaDeviceSynchronize after attention.
+    // Skip during CUDA graph capture on default stream (warmup tokens
+    // are random placeholders — storing them corrupts tile buffers).
+    if (cudaStreamIsCapturing(0, nullptr) == cudaSuccess) return 0;
+
     cudaStream_t stream = (cudaStream_t)cache->cuda_stream;
     int block_size = 128;
     int grid_size  = (cache->n_kv_heads + block_size - 1) / block_size;
