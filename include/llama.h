@@ -441,6 +441,8 @@ extern "C" {
         bool expert_stage;       // Den: enable the L3-resident CPU expert staging tier (host-half of --cpu-moe)
         bool expert_stage_probe; // Den: run the L3-residency probe at init and print GB/s
 
+        bool nvfp4_kv_enabled; // Den: enable NVFP4 KV cache quantization
+
         // [EXPERIMENTAL]
         // backend sampler chain configuration (make sure the caller keeps the sampler chains alive)
         // note: the samplers must be sampler chains (i.e. use llama_sampler_chain_init)

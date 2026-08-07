@@ -314,6 +314,7 @@ const std::vector<ggml_type> kv_cache_types = {
 };
 
 static ggml_type kv_cache_type_from_str(const std::string & s) {
+    if (s == "nvfp4_kv") { return GGML_TYPE_F32; }
     for (const auto & type : kv_cache_types) {
         if (ggml_type_name(type) == s) {
             return type;
@@ -330,6 +331,7 @@ static std::string get_all_kv_cache_types(bool include_kvarn_pseudo_types = fals
     if (include_kvarn_pseudo_types) {
         msg << ", kvarn2, kvarn3, kvarn4, kvarn5, kvarn6, kvarn8";
     }
+    msg << ", nvfp4_kv";
     return msg.str();
 }
 

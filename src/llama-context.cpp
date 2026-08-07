@@ -252,6 +252,7 @@ llama_context::llama_context(
     cparams.auto_fgdn    = true;
 
     cparams.kvarn = params.kvarn;
+    cparams.nvfp4_kv_enabled = params.nvfp4_kv_enabled;
 
     cparams.fused_lid    = true;
     cparams.auto_flid    = true;
@@ -3537,6 +3538,7 @@ llama_context_params llama_context_default_params() {
         /*.kv_unified                  =*/ false,
         /*.expert_stage                =*/ false,
         /*.expert_stage_probe          =*/ false,
+        /*.nvfp4_kv_enabled            =*/ false,
         /*.sampler                     =*/ nullptr,
         /*.n_sampler                   =*/ 0,
         /*.ctx_other                   =*/ nullptr,
