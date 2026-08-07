@@ -208,6 +208,67 @@ option(GGML_CUDA_FA                         "ggml: compile ggml FlashAttention C
 option(GGML_CUDA_FA_ALL_QUANTS              "ggml: compile all quants for FlashAttention"     OFF)
 option(GGML_CUDA_KVARN                      "ggml: compile CUDA KVarN kernels"                ON)
 option(GGML_CUDA_GRAPHS                     "ggml: use CUDA graphs (llama.cpp only)"          ${GGML_CUDA_GRAPHS_DEFAULT})
+
+set(GGML_CUDA_KVARN_DEFAULT_PAIRS
+    k8-v8
+    k8-v6
+    k8-v5
+    k6-v6
+    k6-v5
+    k6-v4
+    k5-v5
+    k5-v4
+    k5-v3
+    k4-v4
+    k4-v3
+    k4-v2
+    k3-v3
+    k3-v2
+    k2-v2
+)
+
+list(LENGTH GGML_CUDA_KVARN_DEFAULT_PAIRS GGML_CUDA_KVARN_DEFAULT_PAIR_COUNT)
+if (NOT GGML_CUDA_KVARN_DEFAULT_PAIR_COUNT EQUAL 15)
+    message(FATAL_ERROR "Default KVarN fast decode policy expected 15 pairs, got ${GGML_CUDA_KVARN_DEFAULT_PAIR_COUNT}")
+endif()
+set(GGML_CUDA_KVARN_ALL_PAIR_COUNT 36)
+
+function(ggml_cuda_select_kvarn_fast_decode_sources OUT_VAR PREFIX)
+    set(_sources ${ARGN})
+
+    if (NOT GGML_CUDA_KVARN)
+        list(FILTER _sources EXCLUDE REGEX "fattn-mma-kvarn")
+        set(${OUT_VAR} ${_sources} PARENT_SCOPE)
+        return()
+    endif()
+
+    if (GGML_CUDA_FA_ALL_QUANTS)
+        set(_selected_sources ${_sources})
+        set(_expected_pair_count ${GGML_CUDA_KVARN_ALL_PAIR_COUNT})
+    else()
+        set(_selected_sources)
+        foreach(SRC ${_sources})
+            if (NOT SRC MATCHES "fattn-mma-kvarn-decode-instance-")
+                list(APPEND _selected_sources "${SRC}")
+            endif()
+        endforeach()
+
+        foreach(PAIR ${GGML_CUDA_KVARN_DEFAULT_PAIRS})
+            list(APPEND _selected_sources "${PREFIX}/fattn-mma-kvarn-decode-instance-${PAIR}.cu")
+        endforeach()
+        set(_expected_pair_count ${GGML_CUDA_KVARN_DEFAULT_PAIR_COUNT})
+    endif()
+
+    set(_selected_decode_sources ${_selected_sources})
+    list(FILTER _selected_decode_sources INCLUDE REGEX "fattn-mma-kvarn-decode-instance-")
+    list(LENGTH _selected_decode_sources _selected_pair_count)
+    if (NOT _selected_pair_count EQUAL _expected_pair_count)
+        message(FATAL_ERROR
+            "KVarN fast decode selected ${_selected_pair_count} pair instances; expected ${_expected_pair_count}")
+    endif()
+
+    set(${OUT_VAR} ${_selected_sources} PARENT_SCOPE)
+endfunction()
 option(GGML_CUDA_NCCL                       "ggml: use NVIDIA Collective Comm. Library"       ON)
 set   (GGML_CUDA_COMPRESSION_MODE "size" CACHE STRING
                                             "ggml: cuda link binary compression mode; requires cuda 12.8+")

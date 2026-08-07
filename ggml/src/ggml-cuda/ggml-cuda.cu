@@ -27,6 +27,7 @@
 #include "ggml-cuda/diagmask.cuh"
 #include "ggml-cuda/diag.cuh"
 #include "ggml-cuda/fattn.cuh"
+#include "ggml-cuda/fattn-kvarn-dispatch.cuh"
 #include "ggml-cuda/fwht.cuh"
 #include "ggml-cuda/getrows.cuh"
 #include "ggml-cuda/im2col.cuh"
@@ -313,6 +314,7 @@ static ggml_cuda_device_info ggml_cuda_init() {
         info.devices[id].nsm        = prop.multiProcessorCount;
         info.devices[id].smpb       = prop.sharedMemPerBlock;
         info.devices[id].warp_size  = prop.warpSize;
+        info.devices[id].max_threads_per_block = prop.maxThreadsPerBlock;
 
 #ifndef GGML_USE_MUSA
         int supports_coop_launch = 0;
@@ -2529,8 +2531,27 @@ static void ggml_backend_cuda_synchronize(ggml_backend_t backend) {
 
 static bool ggml_cuda_is_view_or_noop(const ggml_tensor * t) {
     return ggml_is_empty(t) || t->op == GGML_OP_RESHAPE || t->op == GGML_OP_TRANSPOSE ||
-           t->op == GGML_OP_VIEW || t->op == GGML_OP_PERMUTE || t->op == GGML_OP_NONE;
+           t->op == GGML_OP_VIEW || t->op == GGML_OP_PERMUTE || t->op == GGML_OP_KVARN_VIEW ||
+           t->op == GGML_OP_NONE;
 }
+
+// Bufferless KVarN view handling: KVARN_VIEW-backed K/V srcs of FLASH_ATTN_EXT do not
+// own their own GPU buffer (they are descriptor-based views into a packed cache), so the
+// debug graph-compute buffer assertions must be skipped for them.
+#ifndef NDEBUG
+static const ggml_tensor * ggml_cuda_kvarn_view_base(const ggml_tensor * t) {
+    while (t != nullptr && (t->op == GGML_OP_RESHAPE || t->op == GGML_OP_PERMUTE)) {
+        t = t->src[0];
+    }
+    return t != nullptr && t->op == GGML_OP_KVARN_VIEW ? t : nullptr;
+}
+
+static bool ggml_cuda_allows_bufferless_kvarn_src(const ggml_tensor * node, int src_index, const ggml_tensor * src) {
+    return node->op == GGML_OP_FLASH_ATTN_EXT &&
+        (src_index == 1 || src_index == 2) &&
+        ggml_cuda_kvarn_view_base(src) != nullptr;
+}
+#endif
 
 #ifdef USE_CUDA_GRAPH
 static bool ggml_cuda_graph_check_compability(ggml_cgraph * cgraph) {
@@ -4062,6 +4083,9 @@ static void ggml_cuda_graph_evaluate_and_capture(ggml_backend_cuda_context * cud
                 assert(node->buffer->buft == ggml_backend_cuda_buffer_type(cuda_ctx->device));
                 for (int j = 0; j < GGML_MAX_SRC; j++) {
                     if (node->src[j] != nullptr) {
+                        if (ggml_cuda_allows_bufferless_kvarn_src(node, j, node->src[j])) {
+                            continue;
+                        }
                         assert(node->src[j]->buffer);
                         assert(node->src[j]->buffer->buft == ggml_backend_cuda_buffer_type(cuda_ctx->device) ||
                                (integrated && ggml_backend_buft_is_cuda_host(node->src[j]->buffer->buft)));
@@ -5364,8 +5388,8 @@ static ggml_backend_feature * ggml_backend_cuda_get_features(ggml_backend_reg_t 
     GGML_UNUSED(reg);
 }
 
-// KVarN KV-cache backend capability handshake (Phase 3: store/materialize kernels only).
-// Phase 4 fills the attention route families once the fattn-kvarn decode kernels are ported.
+// KVarN KV-cache backend capability handshake. Phase 3 supplied the store/materialize
+// kernels; Phase 4 fills the attention route families from the fattn-kvarn decode kernels.
 static bool ggml_backend_cuda_kvarn_capabilities(
         ggml_backend_dev_t dev,
         ggml_backend_kvarn_capabilities * result) {
@@ -5385,29 +5409,24 @@ static bool ggml_backend_cuda_kvarn_capabilities(
         return false;
     }
 
-    // Phase 3: the KVARN_STORE / KVARN_MATERIALIZE / KVARN_WHT kernels are present.
-    // Attention decode route families are added in Phase 4 (fattn-kvarn).
-    const uint32_t head_dims =
-        GGML_BACKEND_KVARN_HEAD_DIM_128 |
-        GGML_BACKEND_KVARN_HEAD_DIM_256 |
-        GGML_BACKEND_KVARN_HEAD_DIM_512;
+    const auto capabilities = ggml_cuda_fattn_kvarn_device_capabilities(device);
 
     *result = {
         /* .struct_size                      = */ sizeof(*result),
         /* .abi_version                      = */ GGML_BACKEND_KVARN_CAPABILITIES_ABI_VERSION,
-        /* .route_families                   = */ 0,
-        /* .supported_head_dims              = */ head_dims,
-        /* .store_materialize                = */ 1,
-        /* .portable_direct_body             = */ 0,
-        /* .portable_integrated_tail_f16     = */ 0,
-        /* .portable_integrated_tail_bf16    = */ 0,
-        /* .specialized_generic_mma          = */ 0,
-        /* .specialized_decode_split         = */ 0,
-        /* .specialized_decode_vector        = */ 0,
-        /* .original_v_domain                = */ 0,
-        /* .rotated_query_max_portable       = */ 0,
-        /* .rotated_query_max_specialized    = */ 0,
-        /* .physical_warp_size               = */ (uint32_t) info.devices[device].warp_size,
+        /* .route_families                   = */ capabilities.route_families,
+        /* .supported_head_dims              = */ capabilities.supported_head_dims,
+        /* .store_materialize                = */ capabilities.store_materialize,
+        /* .portable_direct_body             = */ capabilities.portable_native,
+        /* .portable_integrated_tail_f16     = */ capabilities.portable_tail_f16,
+        /* .portable_integrated_tail_bf16    = */ capabilities.portable_tail_bf16,
+        /* .specialized_generic_mma          = */ capabilities.generic_mma,
+        /* .specialized_decode_split         = */ capabilities.decode_split,
+        /* .specialized_decode_vector        = */ capabilities.decode_vector,
+        /* .original_v_domain                = */ capabilities.original_v_domain,
+        /* .rotated_query_max_portable       = */ capabilities.rotated_query_max_portable,
+        /* .rotated_query_max_specialized    = */ capabilities.rotated_query_max_specialized,
+        /* .physical_warp_size               = */ (uint32_t) capabilities.physical_wave_size,
         /* .reserved                         = */ 0,
         /* .minimum_dynamic_shared_bytes     = */ ggml_cuda_kvarn_required_shared_bytes(),
     };
@@ -5437,6 +5456,18 @@ static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, con
     }
     if (strcmp(name, "ggml_backend_kvarn_capabilities") == 0) {
         return (void *)ggml_backend_cuda_kvarn_capabilities;
+    }
+    if (strcmp(name, "ggml_backend_kvarn_route_stats_reset") == 0) {
+        return (void *)ggml_cuda_fattn_kvarn_route_stats_reset;
+    }
+    if (strcmp(name, "ggml_backend_kvarn_route_stats_get") == 0) {
+        return (void *)ggml_cuda_fattn_kvarn_route_stats_get;
+    }
+    if (strcmp(name, "ggml_backend_kvarn_store_route_stats_reset") == 0) {
+        return (void *)ggml_cuda_kvarn_store_route_stats_reset;
+    }
+    if (strcmp(name, "ggml_backend_kvarn_store_route_stats_get") == 0) {
+        return (void *)ggml_cuda_kvarn_store_route_stats_get;
     }
     return nullptr;
 }
