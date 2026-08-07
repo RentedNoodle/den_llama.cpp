@@ -2111,7 +2111,7 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
                                             for (int e=0;e<16;e++) {
                                                 int nb=h_deq[16+g*8+e/2];
                                                 if(e&1)nb>>=4;else nb&=0x0F;
-                                                float v=(nb&8?-1:1)*((float[]){0,0.5,1,1.5,2,3,4,6}[nb&7]);
+                                                float e2m1_lut[8]={0,0.5f,1,1.5f,2,3,4,6}; float v=(nb&8?-1:1)*e2m1_lut[nb&7];
                                                 h_deq[g*16+e]=v*s;
                                             }
                                         }
