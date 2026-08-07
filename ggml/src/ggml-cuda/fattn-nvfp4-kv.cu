@@ -392,7 +392,19 @@ __global__ void kv_store_quantize_kernel(
 
 den_nvfp4_kv_cache g_nvfp4_kv;
 
+bool den_nvfp4_kv_is_wanted(void) {
+    static int checked = 0;
+    static int wanted = 0;
+    if (!checked) {
+        const char * env = getenv("DEN_NVFP4_KV_CACHE");
+        wanted = (env && env[0] == '1');
+        checked = 1;
+    }
+    return wanted;
+}
+
 bool den_nvfp4_kv_is_active(void) {
+    if (!den_nvfp4_kv_is_wanted()) return false;
     return g_nvfp4_kv.enabled && g_nvfp4_kv.initialized;
 }
 

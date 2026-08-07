@@ -88,7 +88,8 @@ int  den_nvfp4_kv_set_seq_len(den_nvfp4_kv_cache * cache, int layer, int len);
 void den_nvfp4_kv_free  (den_nvfp4_kv_cache * cache);
 double den_nvfp4_kv_compression_ratio(const den_nvfp4_kv_cache * cache);
 
-// Check if NVFP4 KV is active and has cached buffers for a given tensor
+// Check if NVFP4 KV is wanted (env var) and active (initialized)
+bool den_nvfp4_kv_is_wanted(void);
 bool den_nvfp4_kv_is_active(void);
 bool den_nvfp4_kv_has_cache_for(const float * d_kv_tensor);
 void den_nvfp4_kv_set_active_cache(den_nvfp4_kv_cache * cache);
