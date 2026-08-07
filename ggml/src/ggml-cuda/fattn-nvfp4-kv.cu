@@ -497,7 +497,7 @@ void ggml_backend_cuda_nvfp4_kv_init(
             }
         }
 
-        // GPU setup: anchor (token 0) + tiles (tokens 1-2)
+        // GPU setup: anchor (token 0) + tiles (tokens 1-2) QUANTIZED
         float *d_Q, *d_out, *d_k_anchor, *d_v_anchor, *d_k_tiles, *d_v_tiles;
         cudaMalloc(&d_Q, n_heads*head_dim*sizeof(float));
         cudaMalloc(&d_out, n_heads*head_dim*sizeof(float));
@@ -507,9 +507,64 @@ void ggml_backend_cuda_nvfp4_kv_init(
         cudaMalloc(&d_k_tiles, tiles_sz);
         cudaMalloc(&d_v_tiles, tiles_sz);
         cudaMemcpy(d_Q, h_Q, n_heads*head_dim*sizeof(float), cudaMemcpyHostToDevice);
+        // Token 0 -> anchor (exact F32 copy)
         cudaMemcpy(d_k_anchor, h_K, n_kv_heads*head_dim*sizeof(float), cudaMemcpyHostToDevice);
         cudaMemcpy(d_v_anchor, h_V, n_kv_heads*head_dim*sizeof(float), cudaMemcpyHostToDevice);
-        cudaMemset(d_k_tiles, 0, tiles_sz); cudaMemset(d_v_tiles, 0, tiles_sz);
+        // Tokens 1-2 -> quantize to tiles using store kernel
+        {
+            int blk = (n_kv_heads + 127) / 128;
+            // Token 1: different K/V from anchor
+            float *h_K1 = (float*)calloc(n_kv_heads*head_dim, sizeof(float));
+            float *h_V1 = (float*)calloc(n_kv_heads*head_dim, sizeof(float));
+            for (int i=0;i<n_kv_heads*head_dim;i++){h_K1[i]=(float)rand()/RAND_MAX;h_V1[i]=(float)rand()/RAND_MAX;}
+            float *d_K1,*d_V1;
+            cudaMalloc(&d_K1,n_kv_heads*head_dim*sizeof(float));
+            cudaMalloc(&d_V1,n_kv_heads*head_dim*sizeof(float));
+            cudaMemcpy(d_K1,h_K1,n_kv_heads*head_dim*sizeof(float),cudaMemcpyHostToDevice);
+            cudaMemcpy(d_V1,h_V1,n_kv_heads*head_dim*sizeof(float),cudaMemcpyHostToDevice);
+            kv_store_quantize_kernel<<<blk,128>>>(d_K1,d_V1,d_k_tiles,d_v_tiles,nullptr,nullptr,n_kv_heads,head_dim,1,seq_len+1,0,0);
+            // Token 2
+            float *h_K2=(float*)calloc(n_kv_heads*head_dim,sizeof(float));
+            float *h_V2=(float*)calloc(n_kv_heads*head_dim,sizeof(float));
+            for(int i=0;i<n_kv_heads*head_dim;i++){h_K2[i]=(float)rand()/RAND_MAX;h_V2[i]=(float)rand()/RAND_MAX;}
+            float *d_K2,*d_V2;
+            cudaMalloc(&d_K2,n_kv_heads*head_dim*sizeof(float));
+            cudaMalloc(&d_V2,n_kv_heads*head_dim*sizeof(float));
+            cudaMemcpy(d_K2,h_K2,n_kv_heads*head_dim*sizeof(float),cudaMemcpyHostToDevice);
+            cudaMemcpy(d_V2,h_V2,n_kv_heads*head_dim*sizeof(float),cudaMemcpyHostToDevice);
+            kv_store_quantize_kernel<<<blk,128>>>(d_K2,d_V2,d_k_tiles,d_v_tiles,nullptr,nullptr,n_kv_heads,head_dim,2,seq_len+1,0,0);
+            cudaDeviceSynchronize();
+            // Update CPU ref: K/V now has 3 tokens: anchor (token0), K1/V1 (token1), K2/V2 (token2)
+            // Recompute CPU reference with all 3 tokens
+            float *allK = (float*)calloc(n_kv_heads*head_dim*3,sizeof(float));
+            float *allV = (float*)calloc(n_kv_heads*head_dim*3,sizeof(float));
+            memcpy(allK, h_K, n_kv_heads*head_dim*sizeof(float));
+            memcpy(allK+n_kv_heads*head_dim, h_K1, n_kv_heads*head_dim*sizeof(float));
+            memcpy(allK+2*n_kv_heads*head_dim, h_K2, n_kv_heads*head_dim*sizeof(float));
+            memcpy(allV, h_V, n_kv_heads*head_dim*sizeof(float));
+            memcpy(allV+n_kv_heads*head_dim, h_V1, n_kv_heads*head_dim*sizeof(float));
+            memcpy(allV+2*n_kv_heads*head_dim, h_V2, n_kv_heads*head_dim*sizeof(float));
+            for (int h=0;h<n_heads;h++){
+                int kv_h=(n_kv_heads==n_heads)?h:(h*n_kv_heads/n_heads);
+                float sc[8]={0};
+                for(int t=0;t<seq_len;t++){
+                    float d=0;
+                    for(int d_=0;d_<head_dim;d_++) d+=h_Q[h*head_dim+d_]*allK[(t*n_kv_heads+kv_h)*head_dim+d_];
+                    sc[t]=d/sqrtf(head_dim);
+                }
+                float mx=sc[0]; for(int t=1;t<seq_len;t++) if(sc[t]>mx)mx=sc[t];
+                float se=0; for(int t=0;t<seq_len;t++){sc[t]=expf(sc[t]-mx);se+=sc[t];}
+                for(int t=0;t<seq_len;t++) sc[t]/=se;
+                for(int d_=0;d_<head_dim;d_++){
+                    float vs=0;
+                    for(int t=0;t<seq_len;t++) vs+=sc[t]*allV[(t*n_kv_heads+kv_h)*head_dim+d_];
+                    cpu_out[h*head_dim+d_]=vs;
+                }
+            }
+            cudaFree(d_K1);cudaFree(d_V1);cudaFree(d_K2);cudaFree(d_V2);
+            free(h_K1);free(h_V1);free(h_K2);free(h_V2);
+            free(allK);free(allV);
+        }
 
         // Launch attention kernel (all tokens from anchor since tiles empty)
         size_t smem = seq_len * sizeof(float);
