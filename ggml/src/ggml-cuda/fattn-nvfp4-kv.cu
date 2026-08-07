@@ -413,6 +413,20 @@ void den_nvfp4_kv_set_active_cache(den_nvfp4_kv_cache * cache) {
     (void)cache; // unused — the global is the active one
 }
 
+// Roundtrip test kernel
+__global__ void kv_rt_test_kernel(float * in, float * out, float * err, int n_heads, int hdim) {
+    int h = blockIdx.x * blockDim.x + threadIdx.x;
+    if (h >= n_heads) return;
+    const float * src = in + (size_t)h * hdim;
+    float * dst = out + (size_t)h * hdim;
+    uint8_t tile[DEN_NVFP4_KV_TILE_BYTES];
+    kv_quantize_tile(src, tile, hdim);
+    kv_dequantize_tile(tile, dst, hdim);
+    float me = 0;
+    for (int i = 0; i < hdim; i++) { float e = fabsf(src[i]-dst[i]); if(e>me) me=e; }
+    err[h] = me;
+}
+
 // Public API: called from common.cpp after model load.
 void ggml_backend_cuda_nvfp4_kv_init(
     int n_attn_layers, int n_kv_heads, int head_dim, int max_seq)
@@ -422,6 +436,35 @@ void ggml_backend_cuda_nvfp4_kv_init(
     if (max_seq > DEN_NVFP4_KV_MAX_SEQ) max_seq = DEN_NVFP4_KV_MAX_SEQ;
     if (max_seq < 1) max_seq = 1;
     den_nvfp4_kv_init(&g_nvfp4_kv, n_attn_layers, n_kv_heads, head_dim, max_seq);
+
+    // Run quant→dequant roundtrip test
+    {
+        const int n_heads = 8, n_elem = n_heads * head_dim;
+        float *h_in = (float*)malloc(n_elem * sizeof(float));
+        for (int i = 0; i < n_elem; i++)
+            h_in[i] = ((float)rand() / RAND_MAX - 0.5f) * 6.0f;
+        float *d_in, *d_out, *d_err;
+        cudaMalloc(&d_in, n_elem*sizeof(float));
+        cudaMalloc(&d_out, n_elem*sizeof(float));
+        cudaMalloc(&d_err, n_heads*sizeof(float));
+        cudaMemcpy(d_in, h_in, n_elem*sizeof(float), cudaMemcpyHostToDevice);
+        kv_rt_test_kernel<<<1, n_heads>>>(d_in, d_out, d_err, n_heads, head_dim);
+        cudaDeviceSynchronize();
+        float *h_out = (float*)malloc(n_elem*sizeof(float));
+        float *h_err = (float*)malloc(n_heads*sizeof(float));
+        cudaMemcpy(h_out, d_out, n_elem*sizeof(float), cudaMemcpyDeviceToHost);
+        cudaMemcpy(h_err, d_err, n_heads*sizeof(float), cudaMemcpyDeviceToHost);
+        float max_err=0, sum_sq=0, s_in=0, s_out=0, dot=0;
+        for (int i=0; i<n_elem; i++) {
+            float e=fabsf(h_in[i]-h_out[i]); if(e>max_err)max_err=e;
+            sum_sq+=e*e; s_in+=h_in[i]*h_in[i]; s_out+=h_out[i]*h_out[i]; dot+=h_in[i]*h_out[i];
+        }
+        fprintf(stderr, "NVFP4 roundtrip: max_err=%.4f rmse=%.4f cos=%.4f %s\n",
+                max_err, sqrtf(sum_sq/n_elem), dot/(sqrtf(s_in)*sqrtf(s_out)),
+                dot/(sqrtf(s_in)*sqrtf(s_out)) > 0.99f ? "PASS" : "FAIL");
+        cudaFree(d_in); cudaFree(d_out); cudaFree(d_err);
+        free(h_in); free(h_out); free(h_err);
+    }
 }
 
 // Lazy init: called from ggml-cuda.cu SET_ROWS hook on first cache access.
