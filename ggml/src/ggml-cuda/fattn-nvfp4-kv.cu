@@ -539,6 +539,11 @@ int den_nvfp4_kv_store(den_nvfp4_kv_cache * cache, int layer,
         return -1;
     }
 
+    // Sync: ensure compute stream finished writing K/V before we read them.
+    // The store hook fires on the ggml-cuda compute stream; we queue to
+    // a separate NVFP4 stream. Without sync, we may read stale/incomplete data.
+    cudaDeviceSynchronize();
+
     // seq_len is advanced externally by the hook (after K+V pair is stored)
     cudaStream_t stream = (cudaStream_t)cache->cuda_stream;
     int block_size = 128;
