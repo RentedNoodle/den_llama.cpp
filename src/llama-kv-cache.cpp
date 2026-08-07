@@ -303,6 +303,58 @@ llama_kv_cache::llama_kv_cache(
         }
     }
 
+    // If sparse VMM is enabled, replace CUDA GPU buffer type with sparse VMM buffer type
+    // so KV cache tensors are allocated in the sparse virtual address space
+#ifdef GGML_USE_CUDA
+    if (sparse_kv) {
+        bool sparse_ok = false;
+        for (auto it = ctx_map.begin(); it != ctx_map.end() && !sparse_ok; ) {
+            ggml_backend_buffer_type_t buft = it->first;
+            const char * buft_name = ggml_backend_buft_name(buft);
+            // Match CUDA GPU buffer types (not Host)
+            if (strstr(buft_name, "CUDA") && !strstr(buft_name, "Host")) {
+                if (ggml_backend_cuda_sparse_vmm_supported()) {
+                    // Compute total KV cache bytes for tensors in this context
+                    size_t kv_bytes = 0;
+                    ggml_context * ctx = it->second.get();
+                    for (ggml_tensor * t = ggml_get_first_tensor(ctx); t != nullptr; t = ggml_get_next_tensor(ctx, t)) {
+                        kv_bytes += ggml_nbytes(t);
+                    }
+
+                    // Reserve 4x the current requirement for future growth,
+                    // commit only the current needed bytes initially
+                    size_t reserve_bytes = kv_bytes * 4;
+                    den_sparse_vmm_t pool = den_sparse_vmm_create(reserve_bytes, kv_bytes);
+                    if (pool) {
+                        ggml_backend_buffer_type_t sparse_buft = ggml_backend_cuda_sparse_vmm_buffer_type(pool);
+                        if (sparse_buft) {
+                            sparse_pool = (den_sparse_vmm_pool *)pool;
+                            LLAMA_LOG_INFO("%s: sparse VMM pool created: reserved %.2f MiB, committed %.2f MiB\n",
+                                __func__, reserve_bytes / (1024.0 * 1024.0), kv_bytes / (1024.0 * 1024.0));
+
+                            // Re-key the context under the sparse buft
+                            auto nh = ctx_map.extract(it);
+                            nh.key() = sparse_buft;
+                            ctx_map.insert(std::move(nh));
+                            sparse_ok = true;
+                        } else {
+                            LLAMA_LOG_WARN("%s: sparse VMM buft creation failed, falling back to standard allocation\n", __func__);
+                            den_sparse_vmm_destroy(pool);
+                        }
+                    } else {
+                        LLAMA_LOG_WARN("%s: sparse VMM pool creation failed, falling back to standard allocation\n", __func__);
+                    }
+                } else {
+                    LLAMA_LOG_WARN("%s: sparse VMM not supported on device, falling back to standard allocation\n", __func__);
+                    sparse_kv = false;
+                }
+                break;
+            }
+            ++it;
+        }
+    }
+#endif
+
     // allocate tensors and initialize the buffers to avoid NaNs in the padding
     for (auto & [buft, ctx] : ctx_map) {
         ggml_backend_buffer_t buf;
@@ -768,6 +820,21 @@ llama_memory_context_ptr llama_kv_cache::init_full() {
     return std::make_unique<llama_kv_cache_context>(this);
 }
 
+#ifdef GGML_USE_CUDA
+void llama_kv_cache::grow_sparse_kv_if_needed(size_t total_kv_bytes) const {
+    if (!sparse_pool || !sparse_kv) return;
+
+    // Import sparse VMM types (opaque from ggml-cuda)
+    typedef struct den_sparse_vmm_pool * den_sparse_vmm_t;
+    extern int den_sparse_vmm_ensure(den_sparse_vmm_t, size_t);
+
+    den_sparse_vmm_t pool = (den_sparse_vmm_t)sparse_pool;
+    den_sparse_vmm_ensure(pool, total_kv_bytes);
+}
+#else
+void llama_kv_cache::grow_sparse_kv_if_needed(size_t) const {}
+#endif
+
 llama_memory_context_ptr llama_kv_cache::init_update(llama_context * lctx, bool optimize) {
     GGML_UNUSED(optimize);
 
@@ -993,6 +1060,9 @@ llama_kv_cache::slot_info llama_kv_cache::find_slot(const llama_ubatch & ubatch,
 
     uint32_t n_tokens = ubatch.n_tokens;
     uint32_t n_seqs   = 1;
+
+    // Check if we need to grow sparse VMM committed capacity
+    grow_kv_if_needed(n_tokens);
 
     if (n_stream > 1) {
         GGML_ASSERT(n_tokens % ubatch.n_seqs_unq == 0);
@@ -1863,6 +1933,39 @@ size_t llama_kv_cache::size_v_bytes() const {
     }
 
     return size_v_bytes;
+}
+
+void llama_kv_cache::grow_kv_if_needed(uint32_t n_tokens) const {
+#ifdef GGML_USE_CUDA
+    if (!sparse_pool || !sparse_kv) {
+        return;
+    }
+
+    // Check if n_tokens approaches 80% of committed capacity
+    // Committed capacity = total buffer size / (bytes_per_token)
+    // In practice, compare n_tokens vs kv_size (logical cell count)
+    const uint32_t kv_size = get_size();
+    const uint32_t threshold = (uint32_t)(kv_size * 0.8);
+
+    if (n_tokens < threshold) {
+        return;
+    }
+
+    // Compute bytes needed for the next growth step (another kv_size worth)
+    const size_t current_bytes = size_k_bytes() + size_v_bytes();
+    const size_t new_bytes = current_bytes * 2; // double committed capacity
+
+    LLAMA_LOG_INFO("%s: n_tokens=%u approaching 80%% of committed %u, growing to %.2f MiB\n",
+            __func__, n_tokens, kv_size, new_bytes / (1024.0 * 1024.0));
+
+    den_sparse_vmm_t pool = (den_sparse_vmm_t)sparse_pool;
+    int rc = den_sparse_vmm_ensure(pool, new_bytes);
+    if (rc != 0) {
+        LLAMA_LOG_WARN("%s: sparse VMM grow failed (OOM?), keeping current commitment\n", __func__);
+    }
+#else
+    GGML_UNUSED(n_tokens);
+#endif
 }
 
 ggml_tensor * llama_kv_cache::build_rope_shift(

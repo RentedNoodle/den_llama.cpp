@@ -432,8 +432,11 @@ private:
     llama_kv_cache * other;
 
     // sparse VMM pool for on-demand KV cache physical page commitment (CUDA-only)
-    struct den_sparse_vmm_pool * sparse_pool = nullptr;
-    bool sparse_kv = false;
+    mutable struct den_sparse_vmm_pool * sparse_pool = nullptr;
+    mutable bool sparse_kv = false;
+
+    // Grow sparse VMM physical capacity if KV usage approaches limit
+    void grow_sparse_kv_if_needed(size_t total_kv_bytes) const;
 
     std::shared_ptr<llama_kv_cells_vec> v_cells_impl;
 
@@ -456,7 +459,7 @@ private:
     size_t size_v_bytes() const;
 
     // Grow sparse VMM committed capacity if n_tokens approaches limit
-    void grow_kv_if_needed(uint32_t n_tokens);
+    void grow_kv_if_needed(uint32_t n_tokens) const;
 
     ggml_tensor * build_rope_shift(
             const llama_cparams & cparams,
