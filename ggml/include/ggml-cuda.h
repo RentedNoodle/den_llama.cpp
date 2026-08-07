@@ -48,6 +48,10 @@ GGML_BACKEND_API ggml_backend_reg_t ggml_backend_cuda_reg(void);
 GGML_BACKEND_API void ggml_backend_cuda_nvfp4_kv_init(
     int n_attn_layers, int n_kv_heads, int head_dim, int max_seq);
 
+// Reset all NVFP4 KV cache sequence lengths to 0.
+// Must be called after warmup or cache clear.
+GGML_BACKEND_API void ggml_backend_cuda_nvfp4_kv_reset_all(void);
+
 #ifdef  __cplusplus
 }
 #endif

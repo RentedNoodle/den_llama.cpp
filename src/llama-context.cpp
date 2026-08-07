@@ -3923,6 +3923,11 @@ void llama_memory_clear(llama_memory_t mem, bool data) {
     }
 
     mem->clear(data);
+
+    // Reset NVFP4 KV cache seq_len after warmup/clear (Gap 4)
+#ifdef GGML_USE_CUDA
+    ggml_backend_cuda_nvfp4_kv_reset_all();
+#endif
 }
 
 bool llama_memory_seq_rm(

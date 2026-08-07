@@ -424,6 +424,10 @@ void ggml_backend_cuda_nvfp4_kv_init(
     den_nvfp4_kv_init(&g_nvfp4_kv, n_attn_layers, n_kv_heads, head_dim, max_seq);
 }
 
+void ggml_backend_cuda_nvfp4_kv_reset_all(void) {
+    den_nvfp4_kv_reset_all_seq_len(&g_nvfp4_kv);
+}
+
 // Lazy init: called from ggml-cuda.cu SET_ROWS hook on first cache access.
 void den_nvfp4_kv_lazy_init(int n_kv_heads, int head_dim, int max_seq) {
     if (g_nvfp4_kv.initialized) return;
@@ -503,6 +507,9 @@ int den_nvfp4_kv_init(den_nvfp4_kv_cache * cache,
     }
 
     cache->initialized = 1;
+
+    // Reset all seq_len to 0 (safety: warmup may have stored dummy tokens)
+    den_nvfp4_kv_reset_all_seq_len(cache);
 
     fprintf(stderr,
         "KV NVFP4: ENABLED (%d layers, %d KV heads, head_dim=%d, max_seq=%d)\n"
@@ -642,6 +649,13 @@ int den_nvfp4_kv_set_seq_len(den_nvfp4_kv_cache * cache, int layer, int len) {
     if (len < 0 || len > cache->max_seq) return -1;
     cache->layers[layer].seq_len = len;
     return 0;
+}
+
+void den_nvfp4_kv_reset_all_seq_len(den_nvfp4_kv_cache * cache) {
+    if (!cache || !cache->initialized) return;
+    for (int l = 0; l < cache->n_attn_layers; l++) {
+        cache->layers[l].seq_len = 0;
+    }
 }
 
 void den_nvfp4_kv_free(den_nvfp4_kv_cache * cache) {

@@ -85,6 +85,7 @@ int  den_nvfp4_kv_attention(den_nvfp4_kv_cache * cache, int layer,
                             const float * d_Q, float * d_output, int n_heads);
 int  den_nvfp4_kv_seq_len(const den_nvfp4_kv_cache * cache, int layer);
 int  den_nvfp4_kv_set_seq_len(den_nvfp4_kv_cache * cache, int layer, int len);
+void den_nvfp4_kv_reset_all_seq_len(den_nvfp4_kv_cache * cache);
 void den_nvfp4_kv_free  (den_nvfp4_kv_cache * cache);
 double den_nvfp4_kv_compression_ratio(const den_nvfp4_kv_cache * cache);
 
