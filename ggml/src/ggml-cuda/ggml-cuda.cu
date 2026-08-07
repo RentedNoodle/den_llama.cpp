@@ -4,8 +4,6 @@
 
 #include "den_expert_stage.h"
 
-#include "ggml-cuda/fattn-nvfp4-kv.cuh"
-
 #include "ggml-cuda/allreduce.cuh"
 #include "ggml-cuda/common.cuh"
 #include "ggml-cuda/acc.cuh"
@@ -2063,41 +2061,6 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
             break;
         case GGML_OP_SET_ROWS:
             ggml_cuda_op_set_rows(ctx, dst);
-            // NVFP4 KV cache hook: only during non-captured execution
-            cudaGetLastError(); // clear stale errors before NVFP4 checks
-            if (dst->data && den_nvfp4_kv_is_active() &&
-                cudaStreamIsCapturing(0, nullptr) != cudaSuccess) {
-                const char * name = ggml_get_name(dst);
-                if (name) {
-                    int is_k = (strncmp(name, "cache_k_l", 9) == 0) ? 1 : 0;
-                    int is_v = (!is_k && strncmp(name, "cache_v_l", 9) == 0) ? 1 : 0;
-                    if (is_k || is_v) {
-                        int layer = atoi(name + 9);
-                        const ggml_tensor * src0 = dst->src[0];
-                        const ggml_tensor * src1 = dst->src[1];
-                        // n_tokens from indices tensor shape (reliable for both 2D/3D)
-                        int n_tokens = src1 ? (int)src1->ne[0] : 1;
-                        int base_seq = den_nvfp4_kv_seq_len(&g_nvfp4_kv, layer);
-                        // SET_ROWS writes ne[0] elements per token
-                        size_t per_token = (size_t)src0->ne[0];
-                        const float * base_data = (const float *)src0->data;
-                        if (base_data && base_seq >= 0 && n_tokens > 0 && n_tokens < 65536) {
-                            for (int t = 0; t < n_tokens; t++) {
-                                int seq_pos = base_seq + t;
-                                const float * tok_data = base_data + t * per_token;
-                                if (is_k) {
-                                    den_nvfp4_kv_store(&g_nvfp4_kv, layer, seq_pos, tok_data, nullptr);
-                                } else {
-                                    den_nvfp4_kv_store(&g_nvfp4_kv, layer, seq_pos, nullptr, tok_data);
-                                }
-                            }
-                            if (!is_k) {
-                                den_nvfp4_kv_set_seq_len(&g_nvfp4_kv, layer, base_seq + n_tokens);
-                            }
-                        }
-                    }
-                }
-            }
             break;
         case GGML_OP_SET:
             ggml_cuda_op_set(ctx, dst);

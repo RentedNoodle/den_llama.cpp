@@ -8,9 +8,6 @@
 
 #include <cstdint>
 #include <unordered_map>
-
-// Forward declaration for sparse VMM pool (opaque, defined in ggml-cuda)
-struct den_sparse_vmm_pool;
 #include <utility>
 #include <vector>
 
@@ -123,7 +120,6 @@ public:
         const layer_filter_cb & filter,
         const  layer_reuse_cb & reuse,
         const  layer_share_cb & share,
-                     bool   sparse_kv_enabled = false,
                  uint32_t   n_ubatch = 0,
                  uint32_t   tail_tokens = 0,
                 ggml_type   tail_type = GGML_TYPE_F16,
@@ -431,10 +427,6 @@ private:
     // TODO: temporary until we refactor to be able to share the same cells between 2 kv caches [TAG_KV_CACHE_SHARE_CELLS]
     llama_kv_cache * other;
 
-    // sparse VMM pool for on-demand KV cache physical page commitment (CUDA-only)
-    mutable struct den_sparse_vmm_pool * sparse_pool = nullptr;
-    mutable bool sparse_kv = false;
-
     std::shared_ptr<llama_kv_cells_vec> v_cells_impl;
 
     llama_kv_cells_vec & v_cells;
@@ -454,9 +446,6 @@ private:
 
     size_t size_k_bytes() const;
     size_t size_v_bytes() const;
-
-    // Grow sparse VMM committed capacity if n_tokens approaches limit
-    void grow_kv_if_needed(uint32_t n_tokens) const;
 
     ggml_tensor * build_rope_shift(
             const llama_cparams & cparams,

@@ -13,10 +13,6 @@
 #include <map>
 #include <stdexcept>
 
-#ifdef GGML_USE_CUDA
-#include "ggml-cuda.h"
-#endif
-
 static bool ggml_is_power_of_2(int n) {
     return (n & (n - 1)) == 0;
 }
@@ -82,7 +78,6 @@ llama_kv_cache::llama_kv_cache(
     const layer_filter_cb & filter,
     const  layer_reuse_cb & reuse,
     const  layer_share_cb & share,
-                     bool   sparse_kv_enabled,
                  uint32_t   n_ubatch,
                  uint32_t   tail_tokens,
                 ggml_type   tail_type,
@@ -93,7 +88,6 @@ llama_kv_cache::llama_kv_cache(
     model(model), hparams(hparams), v_trans(v_trans),
     n_seq_max(n_seq_max), n_stream(unified ? 1 : n_seq_max), n_pad(n_pad), n_swa(n_swa), swa_type(swa_type),
     other(static_cast<llama_kv_cache *>(mem_other)),
-    sparse_kv(sparse_kv_enabled),
     v_cells_impl(other ? other->v_cells_impl : std::make_shared<llama_kv_cells_vec>()),
     v_cells(*v_cells_impl),
     tail_tokens(tail_tokens), tail_type(tail_type), tail_rollback_tokens(tail_rollback_tokens),
@@ -292,11 +286,6 @@ llama_kv_cache::llama_kv_cache(
             LLAMA_LOG_DEBUG("%s: - layer %3d: reuse layer %d, is_swa = %d\n", __func__, il, il_reuse, hparams.is_swa(il));
         }
     }
-
-    // TODO: sparse VMM integration — requires cross-DLL API resolution.
-    // The sparse-vmm.cu/sparse-buft.cu infrastructure exists in ggml-cuda.dll.
-    // When enabled, the CUDA backend should create a sparse pool and expose
-    // the buffer type via ggml_backend_dev_buffer_type().
 
     // allocate tensors and initialize the buffers to avoid NaNs in the padding
     for (auto & [buft, ctx] : ctx_map) {
@@ -988,8 +977,6 @@ llama_kv_cache::slot_info llama_kv_cache::find_slot(const llama_ubatch & ubatch,
 
     uint32_t n_tokens = ubatch.n_tokens;
     uint32_t n_seqs   = 1;
-
-    // TODO: grow_kv_if_needed — sparse VMM deferred
 
     if (n_stream > 1) {
         GGML_ASSERT(n_tokens % ubatch.n_seqs_unq == 0);
@@ -1860,11 +1847,6 @@ size_t llama_kv_cache::size_v_bytes() const {
     }
 
     return size_v_bytes;
-}
-
-void llama_kv_cache::grow_kv_if_needed(uint32_t n_tokens) const {
-    // TODO: sparse VMM growth — deferred until cross-DLL API resolved
-    GGML_UNUSED(n_tokens);
 }
 
 ggml_tensor * llama_kv_cache::build_rope_shift(

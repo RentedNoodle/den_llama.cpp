@@ -1135,7 +1135,6 @@ llama_kv_cache_kvarn::llama_kv_cache_kvarn(
         [](int32_t) { return false; },
         nullptr,
         nullptr,
-        false, // sparse_kv_enabled
         n_ubatch,
         tail_tokens,
         tail_type_requested,
@@ -1574,7 +1573,6 @@ std::unique_ptr<llama_kv_cache> llama_kv_cache_kvarn::make_metadata_cache() cons
             [](int32_t) { return false; },
             nullptr,
             nullptr,
-            false, // sparse_kv_enabled
             metadata_n_ubatch,
             exact_tail_tokens,
             exact_tail_type_requested,
