@@ -135,10 +135,12 @@ static const ggml_backend_buffer_type_i sparse_vmm_buft_interface = {
 // ═══════════════════════════════════════════════════════
 
 bool ggml_backend_cuda_sparse_vmm_supported(void) {
-    int device;
-    if (cudaGetDevice(&device) != cudaSuccess) return false;
+    CUdevice device;
+    CUcontext ctx;
+    if (cuCtxGetCurrent(&ctx) != CUDA_SUCCESS) return false;
+    if (cuCtxGetDevice(&device) != CUDA_SUCCESS) return false;
     auto & info = ggml_cuda_info();
-    return info.devices[device].vmm_granularity > 0;
+    return info.devices[(int)device].vmm_granularity > 0;
 }
 
 ggml_backend_buffer_type_t ggml_backend_cuda_sparse_vmm_buffer_type(den_sparse_vmm_t pool) {

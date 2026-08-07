@@ -32,18 +32,21 @@ struct den_sparse_vmm_pool {
 // ═══════════════════════════════════════════════════════
 
 den_sparse_vmm_t den_sparse_vmm_create(size_t reserve_bytes, size_t initial_bytes) {
-    // Get device + granularity from existing ggml_cuda info
-    int device;
-    CU_CHECK(cudaGetDevice(&device));
+    // Get device + granularity using CUDA Driver API
+    CUdevice device;
+    CUcontext ctx;
+    CU_CHECK(cuCtxGetCurrent(&ctx));
+    CU_CHECK(cuCtxGetDevice(&device));
 
     auto & info = ggml_cuda_info();
-    size_t granularity = info.devices[device].vmm_granularity;
+    int device_ordinal = (int)device; // CUdevice is int on all platforms
+    size_t granularity = info.devices[device_ordinal].vmm_granularity;
     if (granularity == 0) {
-        fprintf(stderr, "SparseVMM: VMM not supported on device %d\n", device);
+        fprintf(stderr, "SparseVMM: VMM not supported on device %d\n", device_ordinal);
         return nullptr;
     }
 
-    int physical_device = ggml_cuda_get_physical_device(device);
+    int physical_device = device_ordinal;
 
     den_sparse_vmm_pool * pool = (den_sparse_vmm_pool *)calloc(1, sizeof(*pool));
     if (!pool) return nullptr;
