@@ -2075,16 +2075,17 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
                     if (is_k || is_v) {
                         int layer = atoi(name + 9);
                         const ggml_tensor * src0 = dst->src[0];
-                        int n_tokens = (int)(src0->ne[2] > 0 ? src0->ne[2] : 1);
+                        const ggml_tensor * src1 = dst->src[1];
+                        // n_tokens from indices tensor shape (reliable for both 2D/3D)
+                        int n_tokens = src1 ? (int)src1->ne[0] : 1;
                         int base_seq = den_nvfp4_kv_seq_len(&g_nvfp4_kv, layer);
-                        // Stride between tokens in floats — use nb[2] if available
-                        size_t stride_floats = src0->ne[0] * src0->ne[1];
-                        if (src0->nb[2] > 0) stride_floats = src0->nb[2] / sizeof(float);
+                        // SET_ROWS writes ne[0] elements per token
+                        size_t per_token = (size_t)src0->ne[0];
                         const float * base_data = (const float *)src0->data;
-                        if (base_data && base_seq >= 0) {
+                        if (base_data && base_seq >= 0 && n_tokens > 0 && n_tokens < 65536) {
                             for (int t = 0; t < n_tokens; t++) {
                                 int seq_pos = base_seq + t;
-                                const float * tok_data = base_data + t * stride_floats;
+                                const float * tok_data = base_data + t * per_token;
                                 if (is_k) {
                                     den_nvfp4_kv_store(&g_nvfp4_kv, layer, seq_pos, tok_data, nullptr);
                                 } else {
