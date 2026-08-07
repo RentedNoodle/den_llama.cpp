@@ -707,5 +707,5 @@ private:
     int32_t n_kv;
 
     // default slot_info backing for current_sinfo() when the context has no batch
-    llama_kv_cache::slot_info fallback_sinfo;
+    llama_kv_cache::slot_info fallback_sinfo{}; // zero-init: s0=0, s1=0
 };

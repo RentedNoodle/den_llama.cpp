@@ -1357,15 +1357,11 @@ llama_kv_cache_kvarn::llama_kv_cache_kvarn(
 
     size_t total_bytes = 0;
     for (auto & [buft, ctx] : ctx_map) {
-        ggml_backend_buffer_t buf;
-        if (hparams.no_alloc) {
-            buf = ggml_backend_buft_alloc_buffer(buft, 0);
-            for (auto * tensor = ggml_get_first_tensor(ctx.get()); tensor != nullptr; tensor = ggml_get_next_tensor(ctx.get(), tensor)) {
-                tensor->buffer = buf;
-            }
-        } else {
-            buf = ggml_backend_alloc_ctx_tensors_from_buft(ctx.get(), buft);
-        }
+        // KVarN cache buffers are runtime infrastructure — always allocate real
+        // GPU memory regardless of the model's no_alloc flag (which skips weight
+        // allocation for dry-run memory estimation in the fit code path).
+        // Otherwise the scheduler crashes on 0-byte buffers during the fit pass.
+        ggml_backend_buffer_t buf = ggml_backend_alloc_ctx_tensors_from_buft(ctx.get(), buft);
         if (!buf) {
             throw std::runtime_error("failed to allocate KVarN cache buffer");
         }
