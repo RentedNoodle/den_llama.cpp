@@ -2074,15 +2074,25 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
                     int is_v = (!is_k && strncmp(name, "cache_v_l", 9) == 0) ? 1 : 0;
                     if (is_k || is_v) {
                         int layer = atoi(name + 9);
-                        int seq_pos = den_nvfp4_kv_seq_len(&g_nvfp4_kv, layer);
-                        const float * d_data = (const float *)dst->src[0]->data;
-                        if (d_data && seq_pos >= 0 && seq_pos < 65536) {
-                            if (is_k) {
-                                den_nvfp4_kv_store(&g_nvfp4_kv, layer, seq_pos, d_data, nullptr);
-                            } else {
-                                // V: same seq_pos as K, then advance for next token
-                                den_nvfp4_kv_store(&g_nvfp4_kv, layer, seq_pos, nullptr, d_data);
-                                den_nvfp4_kv_set_seq_len(&g_nvfp4_kv, layer, seq_pos + 1);
+                        const ggml_tensor * src0 = dst->src[0];
+                        int n_tokens = (int)(src0->ne[2] > 0 ? src0->ne[2] : 1);
+                        int base_seq = den_nvfp4_kv_seq_len(&g_nvfp4_kv, layer);
+                        // Stride between tokens in floats — use nb[2] if available
+                        size_t stride_floats = src0->ne[0] * src0->ne[1];
+                        if (src0->nb[2] > 0) stride_floats = src0->nb[2] / sizeof(float);
+                        const float * base_data = (const float *)src0->data;
+                        if (base_data && base_seq >= 0) {
+                            for (int t = 0; t < n_tokens; t++) {
+                                int seq_pos = base_seq + t;
+                                const float * tok_data = base_data + t * stride_floats;
+                                if (is_k) {
+                                    den_nvfp4_kv_store(&g_nvfp4_kv, layer, seq_pos, tok_data, nullptr);
+                                } else {
+                                    den_nvfp4_kv_store(&g_nvfp4_kv, layer, seq_pos, nullptr, tok_data);
+                                }
+                            }
+                            if (!is_k) {
+                                den_nvfp4_kv_set_seq_len(&g_nvfp4_kv, layer, base_seq + n_tokens);
                             }
                         }
                     }
