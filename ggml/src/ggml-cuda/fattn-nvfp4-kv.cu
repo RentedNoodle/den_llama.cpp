@@ -523,7 +523,7 @@ void ggml_backend_cuda_nvfp4_kv_init(
             cudaMalloc(&d_V1,n_kv_heads*head_dim*sizeof(float));
             cudaMemcpy(d_K1,h_K1,n_kv_heads*head_dim*sizeof(float),cudaMemcpyHostToDevice);
             cudaMemcpy(d_V1,h_V1,n_kv_heads*head_dim*sizeof(float),cudaMemcpyHostToDevice);
-            kv_store_quantize_kernel<<<blk,128>>>(d_K1,d_V1,d_k_tiles,d_v_tiles,nullptr,nullptr,n_kv_heads,head_dim,1,seq_len+1,0,0);
+            kv_store_quantize_kernel<<<blk,128>>>(d_K1,d_V1,d_k_tiles,d_v_tiles,nullptr,nullptr,n_kv_heads,head_dim,1,seq_len+1,1,1);
             // Token 2
             float *h_K2=(float*)calloc(n_kv_heads*head_dim,sizeof(float));
             float *h_V2=(float*)calloc(n_kv_heads*head_dim,sizeof(float));
