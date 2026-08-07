@@ -42,6 +42,12 @@ GGML_BACKEND_API void ggml_backend_cuda_unregister_host_buffer(void * buffer);
 
 GGML_BACKEND_API ggml_backend_reg_t ggml_backend_cuda_reg(void);
 
+// NVFP4 KV Cache: initialize the per-layer GPU tile buffers.
+// Must be called after model load (when n_kv_heads + head_dim are known).
+// Reads DEN_NVFP4_KV_CACHE env var (default: enabled).
+GGML_BACKEND_API void ggml_backend_cuda_nvfp4_kv_init(
+    int n_attn_layers, int n_kv_heads, int head_dim, int max_seq);
+
 #ifdef  __cplusplus
 }
 #endif

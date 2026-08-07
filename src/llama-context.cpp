@@ -3634,6 +3634,22 @@ llama_context * llama_init_from_model(
 
     try {
         auto * ctx = new llama_context(*model, params);
+
+#ifdef GGML_USE_CUDA
+        if (params.nvfp4_kv_enabled) {
+            extern void ggml_backend_cuda_nvfp4_kv_init(int, int, int, int);
+            uint32_t il0 = 0;
+            while (il0 < model->hparams.n_layer_all && !model->hparams.has_kv(il0)) il0++;
+            if (il0 < model->hparams.n_layer_all) {
+                ggml_backend_cuda_nvfp4_kv_init(
+                    (int)model->hparams.n_layer_kv(),
+                    (int)model->hparams.n_head_kv(il0),
+                    (int)model->hparams.n_embd_head_k(il0),
+                    (int)ctx->cparams.n_ctx_seq);
+            }
+        }
+#endif
+
         return ctx;
     } catch (const std::exception & err) {
         LLAMA_LOG_ERROR("%s: failed to initialize the context: %s\n", __func__, err.what());
