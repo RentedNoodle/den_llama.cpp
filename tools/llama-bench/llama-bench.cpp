@@ -478,6 +478,9 @@ static void print_usage(int /* argc */, char ** argv) {
 }
 
 static ggml_type ggml_type_from_name(const std::string & s) {
+    if (s == "f32") {
+        return GGML_TYPE_F32;
+    }
     if (s == "f16") {
         return GGML_TYPE_F16;
     }
