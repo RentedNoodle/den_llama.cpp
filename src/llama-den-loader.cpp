@@ -365,7 +365,13 @@ void llama_den_loader::read_tensor_data(size_t i, void * dst, size_t size) const
 
     switch (t.hw_target) {
     case DEN_TARGET_NVFP4:
-        pimpl_->read_nvfp4_tensor(t, dst, size);
+        if (t.is_wh4) {
+            // WH4: keep raw tiles, copy as-is (WHT-domain OMMA dispatch handles them directly)
+            size_t copy_size = std::min(size, t.src_size);
+            memcpy(dst, pimpl_->data_region + t.src_offset, copy_size);
+        } else {
+            pimpl_->read_nvfp4_tensor(t, dst, size);
+        }
         break;
     case DEN_TARGET_BF16:
     case DEN_TARGET_F16:
@@ -669,10 +675,15 @@ void llama_den_loader::impl::read_nvfp4_tensor(
     const uint8_t * src = data_region + desc.src_offset;
     uint8_t * d = (uint8_t *)dst;
 
-    int64_t M = desc.ne[1]; // rows
     int64_t K = desc.ne[0]; // columns (inner dimension)
 
-    if (K == 0 || M == 0) {
+    // Total rows = ne[1] * ne[2] * ne[3] (flat row-major layout for multi-dim tensors)
+    int64_t total_rows = desc.ne[1];
+    if (desc.ne[2] > 0) total_rows *= desc.ne[2];
+    if (desc.ne[3] > 0) total_rows *= desc.ne[3];
+    if (total_rows <= 0) total_rows = 1;
+
+    if (K == 0) {
         memset(dst, 0, dst_size);
         return;
     }
@@ -683,7 +694,7 @@ void llama_den_loader::impl::read_nvfp4_tensor(
     int64_t blocks_per_row = (K + QK_NVFP4 - 1) / QK_NVFP4;
     size_t dst_row_stride = (size_t)blocks_per_row * sizeof(block_nvfp4);
 
-    for (int64_t row = 0; row < M; row++) {
+    for (int64_t row = 0; row < total_rows; row++) {
         for (int64_t ti = 0; ti < tiles_per_row; ti++) {
             int64_t src_tile_offset = row * tiles_per_row * DEN_NVFP4_TILE_SIZE
                                       + ti * DEN_NVFP4_TILE_SIZE;
@@ -750,13 +761,15 @@ bool llama_den_loader::impl::build_tensor_inventory() {
                 // Standard NULLGLASS → GGML conversion
                 // Elements per block: QK_NVFP4 = 64
                 // Bytes per block:   sizeof(block_nvfp4) = 36
-                // Each row: ne[0] elements → (ne[0]/64) blocks → (ne[0]/64)*36 bytes
+                // Total rows = ne[1] * ne[2] * ne[3] (flat row-major layout)
                 int64_t K = desc.ne[0];
-                int64_t blocks_per_row = K / QK_NVFP4;
+                int64_t blocks_per_row = (K + QK_NVFP4 - 1) / QK_NVFP4;
                 if (blocks_per_row == 0) blocks_per_row = 1;
-                desc.dst_size = (size_t)(blocks_per_row * sizeof(block_nvfp4) * desc.ne[1]);
-                if (desc.ne[2] > 1) desc.dst_size *= (size_t)desc.ne[2];
-                if (desc.ne[3] > 1) desc.dst_size *= (size_t)desc.ne[3];
+                int64_t total_rows = desc.ne[1];
+                if (desc.ne[2] > 0) total_rows *= desc.ne[2];
+                if (desc.ne[3] > 0) total_rows *= desc.ne[3];
+                if (total_rows <= 0) total_rows = 1;
+                desc.dst_size = (size_t)(blocks_per_row * sizeof(block_nvfp4) * total_rows);
             }
 
             n_nvfp4++;
