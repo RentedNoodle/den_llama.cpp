@@ -714,6 +714,9 @@ ggml_backend_cuda_context::~ggml_backend_cuda_context() {
     if (copy_event != nullptr) {
         CUDA_CHECK(cudaEventDestroy(copy_event));
     }
+    if (dual_ce_stream != nullptr) {
+        CUDA_CHECK(cudaStreamDestroy(dual_ce_stream));
+    }
     for (int i = 0; i < GGML_CUDA_MAX_DEVICES; ++i) {
         for (int j = 0; j < GGML_CUDA_MAX_STREAMS; ++j) {
             if (streams[i][j] != nullptr) {
@@ -2463,7 +2466,29 @@ static void ggml_backend_cuda_set_tensor_async(ggml_backend_t backend, ggml_tens
 
     GGML_ASSERT(buf->buft == ggml_backend_cuda_buffer_type(cuda_ctx->device) && "unsupported buffer type");
 
-    CUDA_CHECK(cudaMemcpyAsync((char *) tensor->data + offset, data, size, cudaMemcpyHostToDevice, cuda_ctx->stream()));
+    // Dual CE: route large H2D through CE1 stream (Blocker 4 fix 1)
+    // Lazily create CE1 stream on first large transfer. Default = off.
+    cudaStream_t h2d_stream = cuda_ctx->stream();
+    if (size >= 1048576) { // >= 1MB = expert weight transfer
+        if (!cuda_ctx->dual_ce_stream) {
+            static int dual_ce_enabled = -1;
+            if (dual_ce_enabled == -1) {
+                const char * env = getenv("DEN_DUAL_CE");
+                dual_ce_enabled = (env && env[0] == '1') ? 1 : 0;
+            }
+            if (dual_ce_enabled) {
+                int least, greatest;
+                cudaDeviceGetStreamPriorityRange(&least, &greatest);
+                cudaStreamCreateWithPriority(&cuda_ctx->dual_ce_stream,
+                    cudaStreamNonBlocking, greatest);
+            }
+        }
+        if (cuda_ctx->dual_ce_stream) {
+            h2d_stream = cuda_ctx->dual_ce_stream;
+        }
+    }
+
+    CUDA_CHECK(cudaMemcpyAsync((char *) tensor->data + offset, data, size, cudaMemcpyHostToDevice, h2d_stream));
 }
 
 static void ggml_backend_cuda_get_tensor_async(ggml_backend_t backend, const ggml_tensor * tensor, void * data, size_t offset, size_t size) {
