@@ -208,6 +208,89 @@ __device__ static void kv_dequantize_tile(
 }
 
 // ═══════════════════════════════════════════════════════════
+// K8 tile: uint8 quantize / dequantize (ThriftAttention K8V4)
+// Same 16-group structure, but elements stored as full uint8
+// instead of 4-bit E2M1 nibbles. 2× quality at 2× storage.
+// ═══════════════════════════════════════════════════════════
+
+__device__ static void kv_quantize_tile_k8(
+    const float * __restrict__ vec,
+    uint8_t * tile,
+    int head_dim)
+{
+    for (int i = 0; i < DEN_NVFP4_KV_TILE_BYTES_K8; i += 16) {
+        if (i + 16 <= DEN_NVFP4_KV_TILE_BYTES_K8)
+            *(uint4 *)(tile + i) = make_uint4(0, 0, 0, 0);
+    }
+
+    int n_groups = (head_dim + DEN_NVFP4_KV_TILE_GROUP_SZ - 1) / DEN_NVFP4_KV_TILE_GROUP_SZ;
+    if (n_groups > DEN_NVFP4_KV_TILE_GROUPS) n_groups = DEN_NVFP4_KV_TILE_GROUPS;
+
+    double sum_sq = 0.0;
+    for (int i = 0; i < head_dim; i++)
+        sum_sq += (double)vec[i] * (double)vec[i];
+
+    for (int g = 0; g < n_groups; g++) {
+        int blk_start = g * DEN_NVFP4_KV_TILE_GROUP_SZ;
+        int blk_end = blk_start + DEN_NVFP4_KV_TILE_GROUP_SZ;
+        if (blk_end > head_dim) blk_end = head_dim;
+        int n_in_blk = blk_end - blk_start;
+
+        float max_abs = 0.0f;
+        for (int e = 0; e < n_in_blk; e++) {
+            float av = vec[blk_start + e];
+            if (av < 0.0f) av = -av;
+            if (av > max_abs) max_abs = av;
+        }
+
+        uint8_t scale_code = 0;
+        if (max_abs >= 1e-10f) {
+            float ideal_scale = max_abs / 6.0f;
+            float best_err = fabsf(ideal_scale - kv_ue4m3_lut[1]);
+            uint8_t best_code = 1;
+            #pragma unroll
+            for (int c = 2; c < 16; c++) {
+                float err = fabsf(ideal_scale - kv_ue4m3_lut[c]);
+                if (err < best_err) { best_err = err; best_code = (uint8_t)c; }
+            }
+            scale_code = best_code;
+        }
+        tile[g] = scale_code;
+        float scale = kv_ue4m3_lut[scale_code];
+
+        for (int e = 0; e < n_in_blk; e++) {
+            float val = vec[blk_start + e];
+            float qval = (scale > 1e-10f) ? val / (scale * 6.0f) : 0.0f;
+            if (qval > 1.0f) qval = 1.0f;
+            if (qval < -1.0f) qval = -1.0f;
+            int u8 = (int)((qval + 1.0f) * 127.5f);
+            if (u8 < 0) u8 = 0;
+            if (u8 > 255) u8 = 255;
+            tile[DEN_NVFP4_KV_TILE_SCALES + g * DEN_NVFP4_KV_TILE_GROUP_SZ + e] = (uint8_t)u8;
+        }
+    }
+
+    float tile_norm = (head_dim > 0) ? (float)sqrt(sum_sq / head_dim) : 1.0f;
+    if (tile_norm < 1e-10f) tile_norm = 1.0f;
+    *(float *)(tile + DEN_NVFP4_KV_TILE_NORM_OFF_K8) = tile_norm;
+    tile[DEN_NVFP4_KV_TILE_DISPATCH_K8] = DEN_NVFP4_KV_META_K8V4;
+    tile[DEN_NVFP4_KV_TILE_KSTRIDE_K8]  = (head_dim + 63) / 64;
+}
+
+__device__ __forceinline__ float kv_dequantize_element_k8(
+    const uint8_t * __restrict__ tile,
+    int elem_idx)
+{
+    int group    = elem_idx / DEN_NVFP4_KV_TILE_GROUP_SZ;
+    int in_group = elem_idx % DEN_NVFP4_KV_TILE_GROUP_SZ;
+    float scale  = kv_ue4m3_lut[tile[group] & 0x0F];
+    int byte_idx = DEN_NVFP4_KV_TILE_SCALES + group * DEN_NVFP4_KV_TILE_GROUP_SZ + in_group;
+    uint8_t u8   = tile[byte_idx];
+    float val = ((float)(int)u8 - 127.5f) / 127.5f * 6.0f;
+    return val * scale;
+}
+
+// ═══════════════════════════════════════════════════════════
 // Kernel: quantize float [n_kv_heads, head_dim] → tiles
 // ═══════════════════════════════════════════════════════════
 
@@ -255,12 +338,14 @@ __global__ void kv_nvfp4_attention_kernel(
     const uint8_t * __restrict__ d_v_tiles,
     float * __restrict__ d_output,
     int n_heads, int n_kv_heads, int head_dim,
-    int seq_len, int max_seq, int is_anchor)
+    int seq_len, int max_seq, int is_anchor,
+    int thrift_attention)
 {
     int head = blockIdx.x;
     if (head >= n_heads) return;
 
     int kv_head = (n_kv_heads == n_heads) ? head : (head * n_kv_heads / n_heads);
+    int k_tile_bytes = thrift_attention ? DEN_NVFP4_KV_TILE_BYTES_K8 : DEN_NVFP4_KV_TILE_BYTES;
 
     extern __shared__ float smem[];
     float inv_sqrt_hd = 1.0f / sqrtf((float)head_dim);
@@ -278,8 +363,12 @@ __global__ void kv_nvfp4_attention_kernel(
             int tile_idx = is_anchor ? (t - 1) : t;
             if (tile_idx < 0) tile_idx = 0;
             const uint8_t * tile = d_k_tiles +
-                ((size_t)tile_idx * n_kv_heads + kv_head) * DEN_NVFP4_KV_TILE_BYTES;
-            k_val = kv_dequantize_element(tile, tid);
+                ((size_t)tile_idx * n_kv_heads + kv_head) * k_tile_bytes;
+            if (thrift_attention) {
+                k_val = kv_dequantize_element_k8(tile, tid);
+            } else {
+                k_val = kv_dequantize_element(tile, tid);
+            }
         }
 
         float partial = q_val * k_val;
@@ -351,10 +440,13 @@ __global__ void kv_store_quantize_kernel(
     float       * __restrict__ d_v_anchor,
     int n_kv_heads, int head_dim,
     int tile_idx, int max_seq,
-    int store_k, int store_v)
+    int store_k, int store_v,
+    int thrift_attention)
 {
     int h = blockIdx.x * blockDim.x + threadIdx.x;
     if (h >= n_kv_heads) return;
+
+    int k_tile_bytes = thrift_attention ? DEN_NVFP4_KV_TILE_BYTES_K8 : DEN_NVFP4_KV_TILE_BYTES;
 
     if (tile_idx == 0) {
         if (store_k) {
@@ -376,8 +468,12 @@ __global__ void kv_store_quantize_kernel(
         if (t >= max_seq - 1) return;
         if (store_k) {
             const float * k_src = d_k + (size_t)h * head_dim;
-            uint8_t * k_tile = d_k_tiles + ((size_t)t * n_kv_heads + h) * DEN_NVFP4_KV_TILE_BYTES;
-            kv_quantize_tile(k_src, k_tile, head_dim);
+            uint8_t * k_tile = d_k_tiles + ((size_t)t * n_kv_heads + h) * k_tile_bytes;
+            if (thrift_attention) {
+                kv_quantize_tile_k8(k_src, k_tile, head_dim);
+            } else {
+                kv_quantize_tile(k_src, k_tile, head_dim);
+            }
         }
         if (store_v) {
             const float * v_src = d_v + (size_t)h * head_dim;
@@ -420,13 +516,14 @@ void den_nvfp4_kv_set_active_cache(den_nvfp4_kv_cache * cache) {
 
 // Public API: called from llama_init_from_model.
 void ggml_backend_cuda_nvfp4_kv_init(
-    int n_attn_layers, int n_kv_heads, int head_dim, int max_seq)
+    int n_attn_layers, int n_kv_heads, int head_dim, int max_seq,
+    int thrift_attention)
 {
     if (g_nvfp4_kv.initialized) return;
     if (head_dim != 128 && head_dim != 256) return;
     if (max_seq > DEN_NVFP4_KV_MAX_SEQ) max_seq = DEN_NVFP4_KV_MAX_SEQ;
     if (max_seq < 1) max_seq = 1;
-    den_nvfp4_kv_init(&g_nvfp4_kv, n_attn_layers, n_kv_heads, head_dim, max_seq);
+    den_nvfp4_kv_init(&g_nvfp4_kv, n_attn_layers, n_kv_heads, head_dim, max_seq, thrift_attention);
 }
 
 void ggml_backend_cuda_nvfp4_kv_reset_all(void) {
@@ -443,7 +540,7 @@ void den_nvfp4_kv_lazy_init(int n_kv_heads, int head_dim, int max_seq) {
     // Clamp max_seq to supported range
     if (max_seq > DEN_NVFP4_KV_MAX_SEQ) max_seq = DEN_NVFP4_KV_MAX_SEQ;
     if (max_seq < 1) max_seq = 1;
-    den_nvfp4_kv_init(&g_nvfp4_kv, DEN_NVFP4_KV_MAX_LAYERS, n_kv_heads, head_dim, max_seq);
+    den_nvfp4_kv_init(&g_nvfp4_kv, DEN_NVFP4_KV_MAX_LAYERS, n_kv_heads, head_dim, max_seq, 0);
 }
 
 // ═══════════════════════════════════════════════════════════
@@ -452,7 +549,8 @@ void den_nvfp4_kv_lazy_init(int n_kv_heads, int head_dim, int max_seq) {
 
 int den_nvfp4_kv_init(den_nvfp4_kv_cache * cache,
                        int n_attn_layers, int n_kv_heads,
-                       int head_dim, int max_seq)
+                       int head_dim, int max_seq,
+                       int thrift_attention)
 {
     if (!cache) return -1;
     memset(cache, 0, sizeof(*cache));
@@ -463,6 +561,7 @@ int den_nvfp4_kv_init(den_nvfp4_kv_cache * cache,
         return 0;
     }
 
+    cache->thrift_attention = thrift_attention;
     cache->n_attn_layers = n_attn_layers;
     cache->n_kv_heads    = n_kv_heads;
     cache->head_dim      = head_dim;
@@ -485,7 +584,10 @@ int den_nvfp4_kv_init(den_nvfp4_kv_cache * cache,
     }
 
     size_t anchor_bytes = (size_t)n_kv_heads * head_dim * sizeof(float);
-    size_t tiles_per_layer = (size_t)(cache->max_seq - 1) * n_kv_heads * DEN_NVFP4_KV_TILE_BYTES;
+    int k_tile_bytes = thrift_attention ? DEN_NVFP4_KV_TILE_BYTES_K8 : DEN_NVFP4_KV_TILE_BYTES;
+    int v_tile_bytes = DEN_NVFP4_KV_TILE_BYTES; // V always stays 4-bit
+    size_t k_tiles_per_layer = (size_t)(cache->max_seq - 1) * n_kv_heads * k_tile_bytes;
+    size_t v_tiles_per_layer = (size_t)(cache->max_seq - 1) * n_kv_heads * v_tile_bytes;
 
     int l = 0;
     for (l = 0; l < n_attn_layers; l++) {
@@ -495,9 +597,9 @@ int den_nvfp4_kv_init(den_nvfp4_kv_cache * cache,
         if (cudaMalloc(&layer->d_v_anchor, anchor_bytes) != cudaSuccess) goto fail;
 
         if (cache->max_seq > 1) {
-            if (cudaMalloc(&layer->d_k_tiles, tiles_per_layer) != cudaSuccess) goto fail;
-            if (cudaMalloc(&layer->d_v_tiles, tiles_per_layer) != cudaSuccess) goto fail;
-            if (cudaMalloc(&layer->d_scratch_tile, (size_t)n_kv_heads * DEN_NVFP4_KV_TILE_BYTES) != cudaSuccess) goto fail;
+            if (cudaMalloc(&layer->d_k_tiles, k_tiles_per_layer) != cudaSuccess) goto fail;
+            if (cudaMalloc(&layer->d_v_tiles, v_tiles_per_layer) != cudaSuccess) goto fail;
+            if (cudaMalloc(&layer->d_scratch_tile, (size_t)n_kv_heads * k_tile_bytes) != cudaSuccess) goto fail;
         }
 
         if (cudaMallocHost(&layer->h_readback, anchor_bytes) != cudaSuccess) goto fail;
@@ -516,11 +618,18 @@ int den_nvfp4_kv_init(den_nvfp4_kv_cache * cache,
     // Reset all seq_len to 0 (safety: warmup may have stored dummy tokens)
     den_nvfp4_kv_reset_all_seq_len(cache);
 
+    const char * mode_str = thrift_attention ? "K8V4 ThriftAttention" : "K4V4";
+    size_t k_vram = (size_t)n_attn_layers * ((size_t)(cache->max_seq - 1) * n_kv_heads * k_tile_bytes + anchor_bytes);
+    size_t v_vram = (size_t)n_attn_layers * ((size_t)(cache->max_seq - 1) * n_kv_heads * v_tile_bytes + anchor_bytes);
     fprintf(stderr,
-        "KV NVFP4: ENABLED (%d layers, %d KV heads, head_dim=%d, max_seq=%d)\n"
-        "  BF16=%.1f MB vs NVFP4=%.1f MB per layer\n",
+        "KV NVFP4: ENABLED (%s, %d layers, %d KV heads, head_dim=%d, max_seq=%d)\n"
+        "  BF16=%.1f MB vs NVFP4=%.1f MB per layer (K=%.1f MB V=%.1f MB)\n",
+        mode_str,
         n_attn_layers, n_kv_heads, head_dim, cache->max_seq,
         (double)n_attn_layers * cache->max_seq * n_kv_heads * head_dim * 2 / (1024.0 * 1024.0),
+        (double)(k_vram + v_vram) / (1024.0 * 1024.0),
+        (double)k_vram / (1024.0 * 1024.0),
+        (double)v_vram / (1024.0 * 1024.0));
         (double)n_attn_layers * ((size_t)(cache->max_seq - 1) * n_kv_heads * DEN_NVFP4_KV_TILE_BYTES + anchor_bytes) / (1024.0 * 1024.0));
 
     return 0;
@@ -567,7 +676,8 @@ int den_nvfp4_kv_store(den_nvfp4_kv_cache * cache, int layer,
         kv_layer->d_k_tiles, kv_layer->d_v_tiles,
         kv_layer->d_k_anchor, kv_layer->d_v_anchor,
         cache->n_kv_heads, cache->head_dim,
-        seq_pos, kv_layer->max_seq, store_k, store_v);
+        seq_pos, kv_layer->max_seq, store_k, store_v,
+        cache->thrift_attention);
 
     CUDA_CHECK(cudaGetLastError());
     return 0;
@@ -636,7 +746,8 @@ int den_nvfp4_kv_attention(den_nvfp4_kv_cache * cache, int layer,
         kv_layer->d_k_tiles, kv_layer->d_v_tiles,
         d_output,
         n_heads, cache->n_kv_heads, cache->head_dim,
-        seq_len, kv_layer->max_seq, 1);
+        seq_len, kv_layer->max_seq, 1,
+        cache->thrift_attention);
 
     CUDA_CHECK(cudaGetLastError());
     return 0;

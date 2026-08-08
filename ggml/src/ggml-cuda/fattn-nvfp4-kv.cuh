@@ -24,17 +24,23 @@ extern "C" {
 // Tile geometry
 // ═══════════════════════════════════════════════════════════
 
-#define DEN_NVFP4_KV_TILE_BYTES      160
+#define DEN_NVFP4_KV_TILE_BYTES      160   // K4V4: 16 scales + 128 nibbles + 4 norm + 2 meta + 10 pad
+#define DEN_NVFP4_KV_TILE_BYTES_K8   288   // K8V4: 16 scales + 256 uint8 + 4 norm + 2 meta + 10 pad
 #define DEN_NVFP4_KV_TILE_ELEMS      256
 #define DEN_NVFP4_KV_TILE_SCALES     16
 #define DEN_NVFP4_KV_TILE_NIBBLES    128
+#define DEN_NVFP4_KV_TILE_UINT8      256   // K8 element data size
 #define DEN_NVFP4_KV_TILE_GROUPS     16
 #define DEN_NVFP4_KV_TILE_GROUP_SZ   16
 #define DEN_NVFP4_KV_TILE_NORM_OFF   144
+#define DEN_NVFP4_KV_TILE_NORM_OFF_K8 272
 #define DEN_NVFP4_KV_TILE_DISPATCH   148
+#define DEN_NVFP4_KV_TILE_DISPATCH_K8 276
 #define DEN_NVFP4_KV_TILE_KSTRIDE    149
+#define DEN_NVFP4_KV_TILE_KSTRIDE_K8 277
 
-#define DEN_NVFP4_KV_META_SW         0x30
+#define DEN_NVFP4_KV_META_SW         0x30  // K4V4: both 4-bit E2M1 nibbles
+#define DEN_NVFP4_KV_META_K8V4       0x31  // K8V4: keys 8-bit uint8, values 4-bit E2M1
 #define DEN_NVFP4_KV_MAX_SEQ         4096
 #define DEN_NVFP4_KV_MAX_LAYERS      64
 
@@ -67,6 +73,7 @@ typedef struct {
     int max_seq;
     int enabled;
     int initialized;
+    int thrift_attention; // K8V4: keys at 8-bit, values at 4-bit
     void * cuda_stream;
 } den_nvfp4_kv_cache;
 
@@ -76,7 +83,8 @@ typedef struct {
 
 int  den_nvfp4_kv_init (den_nvfp4_kv_cache * cache,
                         int n_attn_layers, int n_kv_heads,
-                        int head_dim, int max_seq);
+                        int head_dim, int max_seq,
+                        int thrift_attention);
 int  den_nvfp4_kv_store(den_nvfp4_kv_cache * cache, int layer,
                         int seq_pos, const float * d_k, const float * d_v);
 int  den_nvfp4_kv_load (den_nvfp4_kv_cache * cache, int layer,

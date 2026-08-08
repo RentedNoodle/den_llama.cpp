@@ -3662,11 +3662,14 @@ llama_context * llama_init_from_model(
             uint32_t il0 = 0;
             while (il0 < model->hparams.n_layer_all && !model->hparams.has_kv(il0)) il0++;
             if (il0 < model->hparams.n_layer_all) {
+                int thrift = (getenv("DEN_THRIFT_ATTENTION") &&
+                              getenv("DEN_THRIFT_ATTENTION")[0] == '1') ? 1 : 0;
                 ggml_backend_cuda_nvfp4_kv_init(
                     (int)model->hparams.n_layer_kv(),
                     (int)model->hparams.n_head_kv(il0),
                     (int)model->hparams.n_embd_head_k(il0),
-                    (int)llama_n_ctx_seq(ctx));
+                    (int)llama_n_ctx_seq(ctx),
+                    thrift);
                 if (nvfp4_auto && !params.nvfp4_kv_enabled) {
                     LLAMA_LOG_INFO("%s: auto-enabled NVFP4 KV for qwen35/Ornith model\n", __func__);
                 }
