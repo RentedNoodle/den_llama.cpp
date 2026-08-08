@@ -107,6 +107,55 @@ def extract_nvfp4_info(text: str) -> Tuple[bool, Optional[float], str]:
     return enabled, ratio, note
 
 
+def extract_den_banner_info(text: str) -> Dict[str, Tuple[bool, Optional[float], str]]:
+    """
+    Scan stderr for model-specific NVFP4/KV info lines.
+    Lines like:
+        KV NVFP4: ENABLED  (model: ornith-35B)
+        TurboQuant KV: ENABLED (4.1x compression) [den_llama.cpp]
+    Returns dict keyed by model match string -> (enabled, ratio, note).
+    """
+    info: Dict[str, Tuple[bool, Optional[float], str]] = {}
+
+    # Try to associate NVFP4 lines with nearby model references
+    # Look for patterns like:
+    #   [some model name]  KV NVFP4: ENABLED
+    #   KV NVFP4: ENABLED (3.1x) for qwen35-9B
+    nvfp4_line_pat = re.compile(
+        r"(?:KV\s+NVFP4|NVFP4\s+KV\s+cache|KVarN|TurboQuant\s+KV)\s*:\s*ENABLED",
+        re.IGNORECASE
+    )
+
+    lines = text.splitlines()
+    for i, line in enumerate(lines):
+        if not nvfp4_line_pat.search(line):
+            continue
+
+        enabled, ratio, note = (True, None, "")
+        # Look for compression ratio on same or nearby lines
+        context = "\n".join(lines[max(0, i - 2):min(len(lines), i + 3)])
+        _, r, _ = extract_nvfp4_info(context)
+        if r is not None:
+            ratio = r
+            note = f"{r:.1f}x compression"
+
+        # Try to find associated model name
+        model_match = re.search(
+            r'(?:qwen|ornith|gemma|infatoshi|aeon|llama|mistral|mixtral)[\w.\-]*\d+[Bb]',
+            context, re.IGNORECASE
+        )
+        key = model_match.group(0).lower() if model_match else f"__global_line_{i}__"
+        info[key] = (enabled, ratio, note)
+
+    # If no line-by-line associations found, do a global scan
+    if not info:
+        e, r, n = extract_nvfp4_info(text)
+        if e or r is not None:
+            info["__global__"] = (e, r, n)
+
+    return info
+
+
 def short_model_name(filename: str, model_type: str) -> str:
     """Derive a short, readable model name from filename and type."""
     # Prefer model_type if it's meaningful
@@ -340,6 +389,14 @@ def _parse_md_table_lines(table_lines: List[str], source_file: str) -> List[Benc
 
 # ─── Aggregation and table building ──────────────────────────────────────────
 
+def _normalize_model_for_matching(name: str) -> str:
+    """Normalize a model name for fuzzy matching across formats."""
+    n = name.lower()
+    n = re.sub(r'[\s\-_]+', '', n)
+    n = re.sub(r'[\(\)]', '', n)
+    return n
+
+
 def build_model_groups(all_results: List[BenchResult],
                        nvfp4_info: Dict[str, Tuple[bool, Optional[float], str]]) -> Dict[str, ModelGroup]:
     """
@@ -349,18 +406,21 @@ def build_model_groups(all_results: List[BenchResult],
     groups: Dict[str, ModelGroup] = {}
 
     for r in all_results:
-        # Create a grouping key: model + KV config
-        kv_tag = f"{r.type_k}/{r.type_v}"
+        # Determine KV config tag
         if r.nvfp4_kv_enabled:
             kv_tag = "NVFP4"
-        elif r.type_k in ("f32", "float32") and r.type_v in ("f32", "float32"):
-            kv_tag = "F32"
-        elif "q8_0" in r.type_k or "q8_0" in r.type_v:
-            kv_tag = "q8_0"
         elif "nvfp4" in r.type_k.lower() or "nvfp4" in r.type_v.lower():
             kv_tag = "NVFP4"
         elif "kvarn" in r.type_k.lower() or "kvarn" in r.type_v.lower():
             kv_tag = "KVarN4"
+        elif r.type_k in ("f32", "float32") and r.type_v in ("f32", "float32"):
+            kv_tag = "F32"
+        elif r.type_k in ("q8_0", "q8_1") or r.type_v in ("q8_0", "q8_1"):
+            kv_tag = "q8_0"
+        elif r.type_k in ("q4_0", "q4_1") or r.type_v in ("q4_0", "q4_1"):
+            kv_tag = "q4_0"
+        else:
+            kv_tag = f"{r.type_k}/{r.type_v}"
 
         model_key, display = infer_model_key(r.model_filename, r.model_type)
         group_key = f"{model_key}|{kv_tag}"
@@ -371,23 +431,32 @@ def build_model_groups(all_results: List[BenchResult],
 
         groups[group_key].results.append(r)
 
-    # Apply NVFP4 info
+    # Apply NVFP4 info from JSON fields
     for key, g in groups.items():
-        # Check if any result has NVFP4 enabled
         for r in g.results:
             if r.nvfp4_kv_enabled:
                 g.nvfp4_enabled = True
                 break
 
-        # Check NVFP4 info from stderr for this model
+    # Apply NVFP4 info from stderr — match by normalized model name
+    for key, g in groups.items():
+        norm_model = _normalize_model_for_matching(g.model_key)
+        norm_display = _normalize_model_for_matching(g.display_name)
         for info_key, (enabled, ratio, note) in nvfp4_info.items():
-            if g.model_key.lower() in info_key.lower() or info_key.lower() in g.model_key.lower():
+            norm_info = _normalize_model_for_matching(info_key)
+            # Match if any of: model_key, display_name, or info_key overlap
+            if (norm_model in norm_info or norm_info in norm_model or
+                norm_display in norm_info or norm_info in norm_display or
+                info_key == "__global__"):
                 if enabled:
                     g.nvfp4_enabled = True
-                if ratio is not None:
+                if ratio is not None and g.nvfp4_compression_ratio is None:
                     g.nvfp4_compression_ratio = ratio
-                if note:
-                    g.nvfp4_note = note
+                if note and note not in (g.nvfp4_note or ""):
+                    if g.nvfp4_note:
+                        g.nvfp4_note += "; " + note
+                    else:
+                        g.nvfp4_note = note
 
     return groups
 
@@ -421,17 +490,20 @@ def build_comparison_table(groups: Dict[str, ModelGroup]) -> str:
         rows_data: List[Tuple[str, float, float, float, str, str]] = []
 
         for _, g in entries:
-            # Extract KV config label
+            # Extract KV config label and NVFP4 status from actual results
             kv_label = ""
             tg64_val = 0.0
             pp64_val = 0.0
             stddev = 0.0
+            row_nvfp4 = False  # NVFP4 status for THIS specific row
 
             for r in g.results:
                 if r.type_k and r.type_v:
-                    kv_label = f"{r.type_k} / {r.type_v}"
-                if r.nvfp4_kv_enabled:
-                    kv_label += " + NVFP4"
+                    if r.nvfp4_kv_enabled:
+                        kv_label = f"NVFP4 ({r.type_k}/{r.type_v})"
+                        row_nvfp4 = True
+                    else:
+                        kv_label = f"{r.type_k} / {r.type_v}"
 
                 if r.n_gen == 64 and r.n_prompt == 0:
                     tg64_val = r.avg_ts
@@ -444,14 +516,14 @@ def build_comparison_table(groups: Dict[str, ModelGroup]) -> str:
                 elif r.n_prompt > 0:
                     pp64_val = r.avg_ts
 
-            # Build notes
+            # Build notes — only include NVFP4 notes for rows where it's active
             note_parts = []
-            if g.nvfp4_enabled:
-                note_parts.append("NVFP4 KV")
-            if g.nvfp4_compression_ratio:
+            if row_nvfp4:
+                note_parts.append("NVFP4 KV active")
+            if row_nvfp4 and g.nvfp4_compression_ratio:
                 note_parts.append(f"{g.nvfp4_compression_ratio:.1f}x compression")
-            if g.nvfp4_note and g.nvfp4_note not in " ".join(note_parts):
-                note_parts.append(g.nvfp4_note)
+            elif g.nvfp4_compression_ratio:
+                note_parts.append(f"{g.nvfp4_compression_ratio:.1f}x KV compression")
 
             # Detect expert offload
             for r in g.results:
@@ -559,10 +631,9 @@ def main() -> None:
 
             text = decode_raw(fpath)
 
-            # Always scan for NVFP4 info from stderr/side-channel text
-            nvfp4_enabled, ratio, note = extract_nvfp4_info(text)
-            if nvfp4_enabled or ratio is not None:
-                global_nvfp4_info[fpath] = (nvfp4_enabled, ratio, note)
+            # Scan stderr for model-specific NVFP4 status lines
+            banner_info = extract_den_banner_info(text)
+            global_nvfp4_info.update(banner_info)
 
             # Try JSON first (it's richer), then markdown
             json_results = parse_json_input(text, fpath)
@@ -579,9 +650,8 @@ def main() -> None:
         # Read from stdin
         text = sys.stdin.read()
 
-        nvfp4_enabled, ratio, note = extract_nvfp4_info(text)
-        if nvfp4_enabled or ratio is not None:
-            global_nvfp4_info["stdin"] = (nvfp4_enabled, ratio, note)
+        banner_info = extract_den_banner_info(text)
+        global_nvfp4_info.update(banner_info)
 
         json_results = parse_json_input(text, "stdin")
         if json_results:
