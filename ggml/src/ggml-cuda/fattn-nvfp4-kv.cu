@@ -357,11 +357,11 @@ __global__ void kv_nvfp4_attention_kernel(
     // Phase 1: Q @ K^T for all cached tokens
     for (int t = 0; t < seq_len; t++) {
         float k_val;
-        if (t == 0 && is_anchor) {
-            k_val = d_k_anchor[(size_t)kv_head * head_dim + tid];
+        if (t < DEN_NVFP4_KV_ANCHOR_TOKENS) {
+            // KVSink: first 4 tokens from FP16 anchors
+            k_val = d_k_anchor[((size_t)t * n_kv_heads + kv_head) * head_dim + tid];
         } else {
-            int tile_idx = is_anchor ? (t - 1) : t;
-            if (tile_idx < 0) tile_idx = 0;
+            int tile_idx = t - DEN_NVFP4_KV_ANCHOR_TOKENS;
             const uint8_t * tile = d_k_tiles +
                 ((size_t)tile_idx * n_kv_heads + kv_head) * k_tile_bytes;
             if (thrift_attention) {
@@ -412,11 +412,11 @@ __global__ void kv_nvfp4_attention_kernel(
     float output_val = 0.0f;
     for (int t = 0; t < seq_len; t++) {
         float v_val;
-        if (t == 0 && is_anchor) {
-            v_val = d_v_anchor[(size_t)kv_head * head_dim + tid];
+        if (t < DEN_NVFP4_KV_ANCHOR_TOKENS) {
+            // KVSink: first 4 tokens from FP16 anchors
+            v_val = d_v_anchor[((size_t)t * n_kv_heads + kv_head) * head_dim + tid];
         } else {
-            int tile_idx = is_anchor ? (t - 1) : t;
-            if (tile_idx < 0) tile_idx = 0;
+            int tile_idx = t - DEN_NVFP4_KV_ANCHOR_TOKENS;
             const uint8_t * tile = d_v_tiles +
                 ((size_t)tile_idx * n_kv_heads + kv_head) * DEN_NVFP4_KV_TILE_BYTES;
             v_val = kv_dequantize_element(tile, tid);
@@ -448,24 +448,21 @@ __global__ void kv_store_quantize_kernel(
 
     int k_tile_bytes = thrift_attention ? DEN_NVFP4_KV_TILE_BYTES_K8 : DEN_NVFP4_KV_TILE_BYTES;
 
-    if (tile_idx == 0) {
+    if (tile_idx < DEN_NVFP4_KV_ANCHOR_TOKENS) {
+        // KVSink: first 4 tokens stored at FP16 precision
         if (store_k) {
             const float * k_src = d_k + (size_t)h * head_dim;
-            float * k_dst = d_k_anchor + (size_t)h * head_dim;
-            for (int i = 0; i < head_dim; i++) {
-                k_dst[i] = k_src[i];
-            }
+            float * k_dst = d_k_anchor + ((size_t)tile_idx * n_kv_heads + h) * head_dim;
+            for (int i = 0; i < head_dim; i++) k_dst[i] = k_src[i];
         }
         if (store_v) {
             const float * v_src = d_v + (size_t)h * head_dim;
-            float * v_dst = d_v_anchor + (size_t)h * head_dim;
-            for (int i = 0; i < head_dim; i++) {
-                v_dst[i] = v_src[i];
-            }
+            float * v_dst = d_v_anchor + ((size_t)tile_idx * n_kv_heads + h) * head_dim;
+            for (int i = 0; i < head_dim; i++) v_dst[i] = v_src[i];
         }
     } else {
-        int t = tile_idx - 1;
-        if (t >= max_seq - 1) return;
+        int t = tile_idx - DEN_NVFP4_KV_ANCHOR_TOKENS;
+        if (t >= max_seq - DEN_NVFP4_KV_ANCHOR_TOKENS) return;
         if (store_k) {
             const float * k_src = d_k + (size_t)h * head_dim;
             uint8_t * k_tile = d_k_tiles + ((size_t)t * n_kv_heads + h) * k_tile_bytes;
@@ -583,11 +580,13 @@ int den_nvfp4_kv_init(den_nvfp4_kv_cache * cache,
         return -1;
     }
 
-    size_t anchor_bytes = (size_t)n_kv_heads * head_dim * sizeof(float);
+    size_t anchor_bytes = (size_t)n_kv_heads * head_dim * DEN_NVFP4_KV_ANCHOR_TOKENS * sizeof(float);
     int k_tile_bytes = thrift_attention ? DEN_NVFP4_KV_TILE_BYTES_K8 : DEN_NVFP4_KV_TILE_BYTES;
     int v_tile_bytes = DEN_NVFP4_KV_TILE_BYTES; // V always stays 4-bit
-    size_t k_tiles_per_layer = (size_t)(cache->max_seq - 1) * n_kv_heads * k_tile_bytes;
-    size_t v_tiles_per_layer = (size_t)(cache->max_seq - 1) * n_kv_heads * v_tile_bytes;
+    int tile_count = cache->max_seq - DEN_NVFP4_KV_ANCHOR_TOKENS;
+    if (tile_count < 0) tile_count = 0;
+    size_t k_tiles_per_layer = (size_t)tile_count * n_kv_heads * k_tile_bytes;
+    size_t v_tiles_per_layer = (size_t)tile_count * n_kv_heads * v_tile_bytes;
 
     int l = 0;
     for (l = 0; l < n_attn_layers; l++) {

@@ -41,6 +41,7 @@ extern "C" {
 
 #define DEN_NVFP4_KV_META_SW         0x30  // K4V4: both 4-bit E2M1 nibbles
 #define DEN_NVFP4_KV_META_K8V4       0x31  // K8V4: keys 8-bit uint8, values 4-bit E2M1
+#define DEN_NVFP4_KV_ANCHOR_TOKENS   4     // KVSink: first 4 tokens kept at FP16 precision
 #define DEN_NVFP4_KV_MAX_SEQ         4096
 #define DEN_NVFP4_KV_MAX_LAYERS      64
 
