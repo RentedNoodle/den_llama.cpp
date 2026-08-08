@@ -269,7 +269,7 @@ if (CUDAToolkit_FOUND)
         list(APPEND CUDA_FLAGS -Xcompiler ${CUDA_CXX_FLAGS_JOINED})
     endif()
 
-    target_compile_options(ggml-cuda PRIVATE "$<$<COMPILE_LANGUAGE:CUDA>:${CUDA_FLAGS}>")
+    target_compile_options(ggml-cuda PRIVATE "$<$<COMPILE_LANGUAGE:CUDA>:${CUDA_FLAGS}>" "$<$<COMPILE_LANGUAGE:CUDA>:-diag-suppress=177>")
 else()
     message(FATAL_ERROR "CUDA Toolkit not found")
 endif()
