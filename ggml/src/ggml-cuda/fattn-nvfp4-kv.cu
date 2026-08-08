@@ -617,19 +617,20 @@ int den_nvfp4_kv_init(den_nvfp4_kv_cache * cache,
     // Reset all seq_len to 0 (safety: warmup may have stored dummy tokens)
     den_nvfp4_kv_reset_all_seq_len(cache);
 
-    const char * mode_str = thrift_attention ? "K8V4 ThriftAttention" : "K4V4";
-    size_t k_vram = (size_t)n_attn_layers * ((size_t)(cache->max_seq - 1) * n_kv_heads * k_tile_bytes + anchor_bytes);
-    size_t v_vram = (size_t)n_attn_layers * ((size_t)(cache->max_seq - 1) * n_kv_heads * v_tile_bytes + anchor_bytes);
-    fprintf(stderr,
-        "KV NVFP4: ENABLED (%s, %d layers, %d KV heads, head_dim=%d, max_seq=%d)\n"
-        "  BF16=%.1f MB vs NVFP4=%.1f MB per layer (K=%.1f MB V=%.1f MB)\n",
-        mode_str,
-        n_attn_layers, n_kv_heads, head_dim, cache->max_seq,
-        (double)n_attn_layers * cache->max_seq * n_kv_heads * head_dim * 2 / (1024.0 * 1024.0),
-        (double)(k_vram + v_vram) / (1024.0 * 1024.0),
-        (double)k_vram / (1024.0 * 1024.0),
-        (double)v_vram / (1024.0 * 1024.0));
-        (double)n_attn_layers * ((size_t)(cache->max_seq - 1) * n_kv_heads * DEN_NVFP4_KV_TILE_BYTES + anchor_bytes) / (1024.0 * 1024.0));
+    {
+        const char * mode_str = thrift_attention ? "K8V4 ThriftAttention" : "K4V4";
+        size_t k_vram = (size_t)n_attn_layers * ((size_t)(cache->max_seq - 1) * n_kv_heads * k_tile_bytes + anchor_bytes);
+        size_t v_vram = (size_t)n_attn_layers * ((size_t)(cache->max_seq - 1) * n_kv_heads * v_tile_bytes + anchor_bytes);
+        fprintf(stderr,
+            "KV NVFP4: ENABLED (%s, %d layers, %d KV heads, head_dim=%d, max_seq=%d)\n"
+            "  BF16=%.1f MB vs NVFP4=%.1f MB per layer (K=%.1f MB V=%.1f MB)\n",
+            mode_str,
+            n_attn_layers, n_kv_heads, head_dim, cache->max_seq,
+            (double)n_attn_layers * cache->max_seq * n_kv_heads * head_dim * 2 / (1024.0 * 1024.0),
+            (double)(k_vram + v_vram) / (1024.0 * 1024.0),
+            (double)k_vram / (1024.0 * 1024.0),
+            (double)v_vram / (1024.0 * 1024.0));
+    }
 
     return 0;
 
