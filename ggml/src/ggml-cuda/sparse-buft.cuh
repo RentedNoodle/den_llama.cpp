@@ -12,12 +12,9 @@
 extern "C" {
 #endif
 
-// Get the buffer type for a given sparse VMM pool.
-// Returns NULL if VMM is unsupported on the current device.
-ggml_backend_buffer_type_t ggml_backend_cuda_sparse_vmm_buffer_type(den_sparse_vmm_t pool);
-
-// Check if VMM is supported on the current CUDA device.
-bool ggml_backend_cuda_sparse_vmm_supported(void);
+// NOTE: Public API declarations are in ggml/include/ggml-cuda.h with GGML_BACKEND_API.
+// This header is internal — only the implementation includes it.
+// See ggml-cuda.h for ggml_backend_cuda_sparse_vmm_buffer_type() and friends.
 
 #ifdef __cplusplus
 }
