@@ -511,8 +511,8 @@ llama_context::~llama_context() {
     ggml_opt_free(opt_ctx);
 
 #ifdef GGML_USE_CUDA
-    if (sparse_vmm_pool) {
-        ggml_backend_cuda_sparse_vmm_destroy(sparse_vmm_pool);
+    if ((ggml_sparse_vmm_t)sparse_vmm_pool) {
+        ggml_backend_cuda_sparse_vmm_destroy((ggml_sparse_vmm_t)sparse_vmm_pool);
         sparse_vmm_pool = nullptr;
     }
 #endif
@@ -3681,7 +3681,7 @@ llama_context * llama_init_from_model(
             size_t reserve_bytes  = (size_t)16 * 1024 * 1024 * 1024; // 16 GB VA
             size_t initial_bytes  = (size_t) 2 * 1024 * 1024 * 1024; //  2 GB physical
             ctx->sparse_vmm_pool = ggml_backend_cuda_sparse_vmm_create(reserve_bytes, initial_bytes);
-            if (ctx->sparse_vmm_pool) {
+            if (ctx->(ggml_sparse_vmm_t)sparse_vmm_pool) {
                 LLAMA_LOG_INFO("%s: sparse VMM pool created (16 GB VA, 2 GB physical)\n", __func__);
             }
         }
@@ -3962,7 +3962,7 @@ void llama_memory_clear(llama_memory_t mem, bool data) {
 }
 
 int llama_sparse_vmm_ensure(struct llama_context * ctx, size_t required_bytes) {
-    if (!ctx || !ctx->sparse_vmm_pool) return -1;
+    if (!ctx || !ctx->(ggml_sparse_vmm_t)sparse_vmm_pool) return -1;
 #ifdef GGML_USE_CUDA
     return ggml_backend_cuda_sparse_vmm_ensure(ctx->sparse_vmm_pool, required_bytes);
 #else
@@ -3971,10 +3971,10 @@ int llama_sparse_vmm_ensure(struct llama_context * ctx, size_t required_bytes) {
 }
 
 int llama_sparse_vmm_grow_if_needed(struct llama_context * ctx) {
-    if (!ctx || !ctx->sparse_vmm_pool) return 0;
+    if (!ctx || !ctx->(ggml_sparse_vmm_t)sparse_vmm_pool) return 0;
 #ifdef GGML_USE_CUDA
-    size_t committed = ggml_backend_cuda_sparse_vmm_committed(ctx->sparse_vmm_pool);
-    size_t reserved  = ggml_backend_cuda_sparse_vmm_reserved(ctx->sparse_vmm_pool);
+    size_t committed = ggml_backend_cuda_sparse_vmm_committed(ctx->(ggml_sparse_vmm_t)sparse_vmm_pool);
+    size_t reserved  = ggml_backend_cuda_sparse_vmm_reserved(ctx->(ggml_sparse_vmm_t)sparse_vmm_pool);
 
     // Estimate current KV cache usage based on context size
     size_t ctx_bytes = (size_t)llama_n_ctx_seq(ctx);

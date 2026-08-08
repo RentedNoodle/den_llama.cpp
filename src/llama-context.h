@@ -290,9 +290,8 @@ private:
 
 #ifdef GGML_USE_CUDA
     // Sparse VMM pool for KV cache (600K+ context)
-    // Forward-declared — ggml-cuda.h not in include chain for non-CUDA TUs
-    struct den_sparse_vmm_pool;
-    struct den_sparse_vmm_pool * sparse_vmm_pool = nullptr;
+    // void* — ggml-cuda.h typedef not in include chain for non-CUDA TUs
+    void * sparse_vmm_pool = nullptr;
 #endif
 
     // decode output (2-dimensional array: [n_outputs][n_vocab])
