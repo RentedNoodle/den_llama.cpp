@@ -398,7 +398,12 @@ bool den_nvfp4_kv_is_wanted(void) {
     static int wanted = 0;
     if (!checked) {
         const char * env = getenv("DEN_NVFP4_KV_CACHE");
-        wanted = (env && env[0] == '1');
+        // env=1: explicitly enabled, env=0: explicitly disabled, unset: auto-detect
+        if (env && env[0] == '0') {
+            wanted = 0;
+        } else {
+            wanted = 1; // enabled by default or via env=1 — auto-enable handled by init caller
+        }
         checked = 1;
     }
     return wanted;

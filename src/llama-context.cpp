@@ -3649,7 +3649,15 @@ llama_context * llama_init_from_model(
         auto * ctx = new llama_context(*model, params);
 
 #ifdef GGML_USE_CUDA
-        if (params.nvfp4_kv_enabled && getenv("DEN_NVFP4_KV_CACHE")) {
+        // Auto-enable NVFP4 KV for Ornith/qwen35 models (Gap 9c)
+        // DEN_NVFP4_KV_CACHE=0 disables even for auto-enable models
+        bool nvfp4_auto = (model->arch == LLM_ARCH_QWEN35 ||
+                           model->arch == LLM_ARCH_QWEN35MOE);
+        const char *env_kv = getenv("DEN_NVFP4_KV_CACHE");
+        bool nvfp4_env_off = (env_kv && strcmp(env_kv, "0") == 0);
+        bool nvfp4_wanted = (params.nvfp4_kv_enabled && !nvfp4_env_off) ||
+                            (nvfp4_auto && !nvfp4_env_off);
+        if (nvfp4_wanted) {
             // declared in ggml-cuda.h with GGML_BACKEND_API (dllimport)
             uint32_t il0 = 0;
             while (il0 < model->hparams.n_layer_all && !model->hparams.has_kv(il0)) il0++;
@@ -3659,6 +3667,9 @@ llama_context * llama_init_from_model(
                     (int)model->hparams.n_head_kv(il0),
                     (int)model->hparams.n_embd_head_k(il0),
                     (int)llama_n_ctx_seq(ctx));
+                if (nvfp4_auto && !params.nvfp4_kv_enabled) {
+                    LLAMA_LOG_INFO("%s: auto-enabled NVFP4 KV for qwen35/Ornith model\n", __func__);
+                }
             }
         }
 
