@@ -288,8 +288,10 @@ private:
 
     llama_memory_ptr memory;
 
+#ifdef GGML_USE_CUDA
     // Sparse VMM pool for KV cache (600K+ context)
     ggml_sparse_vmm_t sparse_vmm_pool = nullptr;
+#endif
 
     // decode output (2-dimensional array: [n_outputs][n_vocab])
     buffer_view<float> logits = {nullptr, 0};
