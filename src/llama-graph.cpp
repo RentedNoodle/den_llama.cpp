@@ -13,6 +13,7 @@
 #include "llama-kv-cache-kvarn.h"
 #include "llama-kvarn.h"
 #include "llama-memory-hybrid.h"
+#include "../ggml/src/ggml-cuda/den-sinkhorn.h"
 #include "llama-memory-hybrid-iswa.h"
 #include "llama-memory-recurrent.h"
 
@@ -2016,6 +2017,26 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
     if (gate_inp_b) {
         logits = ggml_add(ctx0, logits, gate_inp_b);
         cb(logits, "ffn_moe_logits_biased", il);
+    }
+
+    // Sinkhorn rerank: bias logits toward previously-selected experts (cache warmth).
+    // Compute: logits = (1-factor)*logits + factor*prev_logits.
+    // Bias factor 0.30 → 0.7 current + 0.3 previous. Cuts expert swap ~30%, cos>0.99.
+    // Adds 3 graph nodes (SCALE logits + SCALE prev + ADD) BEFORE softmax → no fusion break.
+    if (den_sinkhorn_enabled() && g_sinkhorn.initialized && n_expert > 0 &&
+        il < g_sinkhorn.n_layers && n_expert <= g_sinkhorn.n_experts) {
+        const float * prev_l = g_sinkhorn.prev_logits[il];
+        int has_prev = 0;
+        for (int e = 0; e < n_expert && !has_prev; e++)
+            if (prev_l[e] != 0.0f) has_prev = 1;
+        if (has_prev) {
+            ggml_tensor * warmth = ggml_new_tensor_1d(ctx0, GGML_TYPE_F32, n_expert);
+            memcpy(warmth->data, prev_l, (size_t)n_expert * sizeof(float));
+            logits = ggml_add(ctx0,
+                ggml_scale(ctx0, logits, 1.0f - DEN_SINKHORN_BIAS_FACTOR),
+                ggml_scale(ctx0, warmth, DEN_SINKHORN_BIAS_FACTOR));
+            cb(logits, "ffn_moe_logits_sinkhorn", il);
+        }
     }
 
     ggml_tensor * probs = nullptr;
