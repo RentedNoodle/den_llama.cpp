@@ -774,6 +774,17 @@ extern "C" {
             llama_memory_t mem,
                       bool data);
 
+    // Sparse VMM: ensure at least `required_bytes` of physical memory is committed
+    // Returns 0 on success, -1 on OOM. Use after decode when context grows.
+    LLAMA_API int llama_sparse_vmm_ensure(
+            struct llama_context * ctx,
+                         size_t required_bytes);
+
+    // Sparse VMM: grow pool if committed is <80% utilized by current context
+    // Safe to call after each decode batch.
+    LLAMA_API int llama_sparse_vmm_grow_if_needed(
+            struct llama_context * ctx);
+
     // Removes all tokens that belong to the specified sequence and have positions in [p0, p1)
     // Returns false if a partial sequence cannot be removed. Removing a whole sequence never fails
     // seq_id < 0 : match any sequence

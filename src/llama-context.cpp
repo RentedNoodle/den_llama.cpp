@@ -509,6 +509,13 @@ llama_context::~llama_context() {
         }
     }
     ggml_opt_free(opt_ctx);
+
+#ifdef GGML_USE_CUDA
+    if (sparse_vmm_pool) {
+        ggml_backend_cuda_sparse_vmm_destroy(sparse_vmm_pool);
+        sparse_vmm_pool = nullptr;
+    }
+#endif
 }
 
 void llama_context::resolve_fused_ops(const llama_memory_context_i * mctx, uint32_t n_seqs) {
@@ -3654,6 +3661,16 @@ llama_context * llama_init_from_model(
                     (int)llama_n_ctx_seq(ctx));
             }
         }
+
+        // Sparse VMM: reserve 16 GB VA, commit 2 GB initial for KV cache
+        if (params.sparse_kv_enabled && ggml_backend_cuda_sparse_vmm_supported()) {
+            size_t reserve_bytes  = (size_t)16 * 1024 * 1024 * 1024; // 16 GB VA
+            size_t initial_bytes  = (size_t) 2 * 1024 * 1024 * 1024; //  2 GB physical
+            ctx->sparse_vmm_pool = ggml_backend_cuda_sparse_vmm_create(reserve_bytes, initial_bytes);
+            if (ctx->sparse_vmm_pool) {
+                LLAMA_LOG_INFO("%s: sparse VMM pool created (16 GB VA, 2 GB physical)\n", __func__);
+            }
+        }
 #endif
 
         return ctx;
@@ -3927,6 +3944,44 @@ void llama_memory_clear(llama_memory_t mem, bool data) {
     // Reset NVFP4 KV cache seq_len after warmup/clear (Gap 4)
 #ifdef GGML_USE_CUDA
     ggml_backend_cuda_nvfp4_kv_reset_all();
+#endif
+}
+
+int llama_sparse_vmm_ensure(struct llama_context * ctx, size_t required_bytes) {
+    if (!ctx || !ctx->sparse_vmm_pool) return -1;
+#ifdef GGML_USE_CUDA
+    return ggml_backend_cuda_sparse_vmm_ensure(ctx->sparse_vmm_pool, required_bytes);
+#else
+    return -1;
+#endif
+}
+
+int llama_sparse_vmm_grow_if_needed(struct llama_context * ctx) {
+    if (!ctx || !ctx->sparse_vmm_pool) return 0;
+#ifdef GGML_USE_CUDA
+    size_t committed = ggml_backend_cuda_sparse_vmm_committed(ctx->sparse_vmm_pool);
+    size_t reserved  = ggml_backend_cuda_sparse_vmm_reserved(ctx->sparse_vmm_pool);
+
+    // Estimate current KV cache usage based on context size
+    size_t ctx_bytes = (size_t)llama_n_ctx_seq(ctx);
+    // Rough estimate: n_kv_heads * head_dim * layers * 2 (K+V) * sizeof(float)
+    // Use committed as baseline; grow if >80% utilized
+    if (committed == 0) return 0;
+
+    double utilization = (double)ctx_bytes / (double)committed;
+    if (utilization > 0.80) {
+        // Grow by 2 GB chunks
+        size_t grow_bytes = (size_t)2 * 1024 * 1024 * 1024;
+        size_t new_target = committed + grow_bytes;
+        if (new_target > reserved) new_target = reserved;
+        if (new_target <= committed) return 0; // at max
+        LLAMA_LOG_INFO("%s: KV cache %.0f%% utilized, growing sparse VMM to %zu MB\n",
+                       __func__, utilization * 100.0, new_target / (1024*1024));
+        return ggml_backend_cuda_sparse_vmm_ensure(ctx->sparse_vmm_pool, new_target);
+    }
+    return 0;
+#else
+    return 0;
 #endif
 }
 

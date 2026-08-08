@@ -156,3 +156,35 @@ ggml_backend_buffer_type_t ggml_backend_cuda_sparse_vmm_buffer_type(den_sparse_v
 
     return buft;
 }
+
+// ═══════════════════════════════════════════════════════
+// Public API wrappers (GGML_BACKEND_API compatible)
+// ═══════════════════════════════════════════════════════
+
+extern "C" {
+
+ggml_sparse_vmm_t ggml_backend_cuda_sparse_vmm_create(size_t reserve_bytes, size_t initial_bytes) {
+    return den_sparse_vmm_create(reserve_bytes, initial_bytes);
+}
+
+int ggml_backend_cuda_sparse_vmm_ensure(ggml_sparse_vmm_t pool, size_t required_bytes) {
+    return den_sparse_vmm_ensure(pool, required_bytes);
+}
+
+void ggml_backend_cuda_sparse_vmm_destroy(ggml_sparse_vmm_t pool) {
+    den_sparse_vmm_destroy(pool);
+}
+
+void * ggml_backend_cuda_sparse_vmm_ptr(ggml_sparse_vmm_t pool) {
+    return den_sparse_vmm_ptr(pool);
+}
+
+size_t ggml_backend_cuda_sparse_vmm_committed(ggml_sparse_vmm_t pool) {
+    return den_sparse_vmm_committed(pool);
+}
+
+size_t ggml_backend_cuda_sparse_vmm_reserved(ggml_sparse_vmm_t pool) {
+    return den_sparse_vmm_reserved(pool);
+}
+
+} // extern "C"
