@@ -707,6 +707,13 @@ static std::mutex ggml_cuda_lock;
 static std::condition_variable ggml_cuda_lock_cv;
 static std::atomic<int> ggml_cuda_lock_counter;
 
+// Set true for the duration of cudaStreamBeginCapture..cudaStreamEndCapture so that
+// den_nvfp4_kv_store (which normally uses a dedicated cross-stream path) can instead
+// launch on the capturing stream. A cross-stream event-wait during capture produces
+// "capturing stream has unjoined work" and fails the capture on sm_120a (GB203).
+// External linkage so fattn-nvfp4-kv.cu can read it.
+bool g_den_cuda_graph_capturing = false;
+
 ggml_backend_cuda_context::~ggml_backend_cuda_context() {
     std::unique_lock<std::mutex> lock(ggml_cuda_lock);
     ggml_cuda_lock_cv.wait(lock, []{ return ggml_cuda_lock_counter.load(std::memory_order_relaxed) == 0; });
@@ -2087,9 +2094,9 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
                                 int seq_pos = base_seq + t;
                                 const float * tok_data = base_data + t * per_token;
                                 if (is_k) {
-                                    den_nvfp4_kv_store(&g_nvfp4_kv, layer, seq_pos, tok_data, nullptr);
+                                    den_nvfp4_kv_store(&g_nvfp4_kv, layer, seq_pos, tok_data, nullptr, ctx.stream());
                                 } else {
-                                    den_nvfp4_kv_store(&g_nvfp4_kv, layer, seq_pos, nullptr, tok_data);
+                                    den_nvfp4_kv_store(&g_nvfp4_kv, layer, seq_pos, nullptr, tok_data, ctx.stream());
                                 }
                             }
                             if (!is_k) {
@@ -4273,9 +4280,12 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
         }
 
         CUDA_CHECK(cudaStreamBeginCapture(cuda_ctx->stream(), cudaStreamCaptureModeRelaxed));
+        g_den_cuda_graph_capturing = true; // den_nvfp4_kv_store must join the capture (no cross-stream wait)
     }
 
     ggml_cuda_graph_evaluate_and_capture(cuda_ctx, cgraph, use_cuda_graph, cuda_graph_update_required, graph_key);
+
+    g_den_cuda_graph_capturing = false; // capture bracketed; node evaluation / store done
 
     return GGML_STATUS_SUCCESS;
 }

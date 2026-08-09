@@ -366,7 +366,7 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
     return BEST_FATTN_KERNEL_NONE;
 #endif// FLASH_ATTN_AVAILABLE
 
-    if (false && den_nvfp4_kv_is_active()) {
+    if (den_nvfp4_kv_is_active()) {
         return BEST_FATTN_KERNEL_NVFP4_KV;
     }
 
@@ -598,7 +598,7 @@ static void ggml_cuda_flash_attn_ext_nvfp4_kv(ggml_backend_cuda_context & ctx, g
     const float * d_Q = (const float *)dst->src[0]->data;
     float * d_output = (float *)dst->data;
     int n_heads = (int)dst->src[0]->ne[1];
-    int ret = den_nvfp4_kv_attention(&g_nvfp4_kv, il, d_Q, d_output, n_heads);
+    int ret = den_nvfp4_kv_attention(&g_nvfp4_kv, il, d_Q, d_output, n_heads, ctx.stream());
     if (ret != 0) {
         ggml_cuda_flash_attn_ext_vec(ctx, dst);
     }

@@ -253,6 +253,10 @@ public:
 
     bool set_sampler(llama_seq_id seq_id, llama_sampler * sampler);
 
+    // Den: sparse VMM pool accessor (private member exposed to free-function helpers)
+    void * sparse_vmm_get() const { return sparse_vmm_pool; }
+    void   sparse_vmm_set(void * pool) { sparse_vmm_pool = pool; }
+
 private:
     llm_graph_params graph_params(
                         llm_graph_result * res,

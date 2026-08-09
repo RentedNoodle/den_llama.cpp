@@ -19,8 +19,10 @@ def run_bench(model: str, n_tokens: int, nvfp4: bool, prompt: str = "The capital
     env = os.environ.copy()
     if nvfp4:
         env["DEN_NVFP4_KV_CACHE"] = "1"
+        env["DEN_THRIFT_ATTENTION"] = "1"  # K8V8: 8-bit K and V
     else:
         env.pop("DEN_NVFP4_KV_CACHE", None)
+        env.pop("DEN_THRIFT_ATTENTION", None)
 
     args = [
         str(CLI), "-m", model,
@@ -29,6 +31,7 @@ def run_bench(model: str, n_tokens: int, nvfp4: bool, prompt: str = "The capital
         "-ngl", "99", "-t", "4",
         "-no-cnv", "-st",
         "-c", "2048",
+        "--temp", "0", "-s", "42",
     ]
     if nvfp4:
         args += ["-ctk", "nvfp4_kv", "-ctv", "nvfp4_kv"]
@@ -36,7 +39,7 @@ def run_bench(model: str, n_tokens: int, nvfp4: bool, prompt: str = "The capital
         args += ["-ctk", "f32", "-ctv", "f32"]
 
     try:
-        result = subprocess.run(args, capture_output=True, text=True, timeout=300, env=env)
+        result = subprocess.run(args, capture_output=True, text=True, encoding='utf-8', errors='replace', timeout=300, env=env)
     except subprocess.TimeoutExpired:
         return "TIMEOUT"
     except FileNotFoundError:
@@ -155,7 +158,7 @@ def main():
                     "prompt": args.prompt,
                     "hash": result["nvfp4_hash"],
                     "match_rate": result["match_rate"],
-                    "timestamp": subprocess.run(["date", "/t"], capture_output=True, text=True, shell=True).stdout.strip(),
+                    "timestamp": subprocess.run(["date", "/t"], capture_output=True, text=True, encoding='utf-8', errors='replace', shell=True).stdout.strip(),
                 }, f, indent=2)
             print(f"Golden reference saved: {golden_path}")
         sys.exit(0)

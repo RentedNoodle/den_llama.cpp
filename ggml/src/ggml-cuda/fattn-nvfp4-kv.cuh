@@ -25,7 +25,7 @@ extern "C" {
 // ═══════════════════════════════════════════════════════════
 
 #define DEN_NVFP4_KV_TILE_BYTES      160   // K4V4: 16 scales + 128 nibbles + 4 norm + 2 meta + 10 pad
-#define DEN_NVFP4_KV_TILE_BYTES_K8   288   // K8V4: 16 scales + 256 uint8 + 4 norm + 2 meta + 10 pad
+#define DEN_NVFP4_KV_TILE_BYTES_K8   288   // K8V8: 16 scales + 256 uint8 + 4 norm + 2 meta + 10 pad
 #define DEN_NVFP4_KV_TILE_ELEMS      256
 #define DEN_NVFP4_KV_TILE_SCALES     16
 #define DEN_NVFP4_KV_TILE_NIBBLES    128
@@ -40,8 +40,16 @@ extern "C" {
 #define DEN_NVFP4_KV_TILE_KSTRIDE_K8 277
 
 #define DEN_NVFP4_KV_META_SW         0x30  // K4V4: both 4-bit E2M1 nibbles
-#define DEN_NVFP4_KV_META_K8V4       0x31  // K8V4: keys 8-bit uint8, values 4-bit E2M1
-#define DEN_NVFP4_KV_ANCHOR_TOKENS   4     // KVSink: first 4 tokens kept at FP16 precision
+#define DEN_NVFP4_KV_META_K8V8       0x31  // K8V8: keys 8-bit uint8, values 8-bit uint8
+// PRECISION TAIL: the LATEST DEN_NVFP4_KV_TAIL_TOKENS cache positions are kept at
+// F32 (exact); tokens older than the tail window are quantized to NVFP4 tiles.
+// Attention weights recent tokens most, so an exact recent window is near-lossless.
+// Default 256 is testable on 16 GB; override at runtime via env DEN_NVFP4_KV_TAIL.
+// The previous design kept only the first 4 tokens ("KVSink anchors") exact — that
+// was 256x too small AND conceptually inverted (attention barely weights the oldest
+// 4 tokens). This reverses the concept: exact window now slides at the FRONT.
+#define DEN_NVFP4_KV_TAIL_TOKENS    256    // default precision-tail size (F32), runtime-overridable
+#define DEN_NVFP4_KV_TAIL_ENV       "DEN_NVFP4_KV_TAIL"
 #define DEN_NVFP4_KV_MAX_SEQ         4096
 #define DEN_NVFP4_KV_MAX_LAYERS      64
 
@@ -50,14 +58,15 @@ extern "C" {
 // ═══════════════════════════════════════════════════════════
 
 typedef struct {
-    float  * d_k_anchor;     // [n_kv_heads * head_dim] F32 anchor (token 0)
-    float  * d_v_anchor;     // [n_kv_heads * head_dim] F32 anchor (token 0)
-    uint8_t * d_k_tiles;     // [(max_seq-1) * n_kv_heads * 160] NVFP4 tiles
-    uint8_t * d_v_tiles;     // [(max_seq-1) * n_kv_heads * 160] NVFP4 tiles
+    float  * d_k_tail;       // [tail_tokens * n_kv_heads * head_dim] F32 — latest tail_tokens tokens (PRECISION TAIL)
+    float  * d_v_tail;       // [tail_tokens * n_kv_heads * head_dim] F32 — latest tail_tokens tokens (PRECISION TAIL)
+    uint8_t * d_k_tiles;     // [(max_seq - tail_tokens) * n_kv_heads * 160] NVFP4 tiles (tokens OLDER than the tail)
+    uint8_t * d_v_tiles;     // [(max_seq - tail_tokens) * n_kv_heads * 160] NVFP4 tiles
     uint8_t * d_scratch_tile;// [n_kv_heads * 160]
     float  * h_readback;     // pinned host readback
     int seq_len;
     int max_seq;
+    int tail_tokens;         // precision-tail size (latest N tokens kept F32); 0 => cache disabled
     int n_kv_heads;
     int head_dim;
 } den_nvfp4_kv_layer;
@@ -72,9 +81,10 @@ typedef struct {
     int n_kv_heads;
     int head_dim;
     int max_seq;
+    int tail_tokens;       // precision-tail size (resolved: default or DEN_NVFP4_KV_TAIL env)
     int enabled;
     int initialized;
-    int thrift_attention; // K8V4: keys at 8-bit, values at 4-bit
+    int thrift_attention; // K8V8: keys at 8-bit, values at 8-bit
     void * cuda_stream;
 } den_nvfp4_kv_cache;
 
@@ -87,16 +97,23 @@ int  den_nvfp4_kv_init (den_nvfp4_kv_cache * cache,
                         int head_dim, int max_seq,
                         int thrift_attention);
 int  den_nvfp4_kv_store(den_nvfp4_kv_cache * cache, int layer,
-                        int seq_pos, const float * d_k, const float * d_v);
+                        int seq_pos, const float * d_k, const float * d_v,
+                        cudaStream_t main_stream);
 int  den_nvfp4_kv_load (den_nvfp4_kv_cache * cache, int layer,
-                        float * d_k_out, float * d_v_out, int seq_pos);
+                        float * d_k_out, float * d_v_out, int seq_pos,
+                        cudaStream_t main_stream);
 int  den_nvfp4_kv_attention(den_nvfp4_kv_cache * cache, int layer,
-                            const float * d_Q, float * d_output, int n_heads);
+                            const float * d_Q, float * d_output, int n_heads,
+                            cudaStream_t main_stream);
 int  den_nvfp4_kv_seq_len(const den_nvfp4_kv_cache * cache, int layer);
 int  den_nvfp4_kv_set_seq_len(den_nvfp4_kv_cache * cache, int layer, int len);
 void den_nvfp4_kv_reset_all_seq_len(den_nvfp4_kv_cache * cache);
 void den_nvfp4_kv_free  (den_nvfp4_kv_cache * cache);
 double den_nvfp4_kv_compression_ratio(const den_nvfp4_kv_cache * cache);
+
+// Scale-distribution probe (DEN_NVFP4_KV_HIST=1): begin/reset + dump histogram
+void den_nvfp4_kv_hist_begin(void);
+void den_nvfp4_kv_hist_dump(void);
 
 // Check if NVFP4 KV is wanted (env var) and active (initialized)
 bool den_nvfp4_kv_is_wanted(void);

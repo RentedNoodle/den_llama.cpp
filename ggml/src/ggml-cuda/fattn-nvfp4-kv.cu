@@ -7,6 +7,12 @@
 #include "common.cuh"
 #include "ggml-cuda.h"
 
+// Set by ggml-cuda.cu while CUDA graph capture is active (BeginCapture..EndCapture).
+// During capture this store must launch on the capturing (main) stream so its work is
+// JOINED to the capture; a cross-stream event-wait would fail capture with
+// "capturing stream has unjoined work".
+extern bool g_den_cuda_graph_capturing;
+
 #include <cuda_runtime.h>
 #include <cstdio>
 #include <cstdlib>
@@ -56,10 +62,61 @@ __device__ __constant__ const float kv_e2m1_lut[8] = {
 };
 
 __device__ __constant__ const float kv_ue4m3_lut[16] = {
-    0.0f, 0.0625f, 0.125f, 0.1875f, 0.25f, 0.3125f,
-    0.375f, 0.4375f, 1.0f, 1.125f, 1.25f, 1.375f,
-    1.5f, 1.625f, 1.75f, 1.875f
+    // UE4M3-unsigned scale table.
+    // DATA-DRIVEN (measured on ornith-1.0-35b-APEX-I-Mini-MTP, 104K K blocks +
+    // 104K V blocks): ideal_scale = max_abs/6. Median K=0.53, V=0.16; p99
+    // K=1.47, V=0.84; real max ~2.6. Saturation at 1.875 is negligible (0.09% K,
+    // 0.05% V). So density goes in 0.06-1.5 (covers ~99.9% of blocks); cap 1.5.
+    // NO codes above 1.5 — a too-coarse scale underflows qval and kills
+    // attention (a 4.0/16.0 code collapsed replay to 5.3%). The scale table is a
+    // SAFETY lever (per-block error is ~identical across LUTs); the precision
+    // win comes from the 8-bit element path (K8V8).
+    0.0f,  0.0625f, 0.125f, 0.1875f,
+    0.25f, 0.3125f, 0.375f, 0.4375f,
+    0.5f,  0.5625f, 0.625f, 0.75f,
+    0.875f, 1.0f,   1.25f,  1.5f
 };
+
+// ═══════════════════════════════════════════════════════════
+// Scale-distribution probe instrumentation
+// Histograms ideal_scale = max_abs/6 per 16-elem K/V block.
+// Gated by DEN_NVFP4_KV_HIST=1 (host sets g_kv_hist_enabled).
+// Hist pointer == NULL => no recording (zero overhead when off).
+// ═══════════════════════════════════════════════════════════
+
+#define DEN_KV_HIST_BINS 256
+#define DEN_KV_HIST_W     0.0625f
+
+__device__ unsigned int g_kv_hist_k[DEN_KV_HIST_BINS];
+__device__ unsigned int g_kv_hist_v[DEN_KV_HIST_BINS];
+__device__ unsigned long long g_kv_cnt_k;
+__device__ unsigned long long g_kv_cnt_v;
+__device__ unsigned int g_kv_hist_enabled;
+
+__device__ __forceinline__ void kv_hist_record(
+    const float * __restrict__ vec, int head_dim, unsigned int * hist)
+{
+    if (hist == NULL) return;
+    int n_groups = (head_dim + DEN_NVFP4_KV_TILE_GROUP_SZ - 1) / DEN_NVFP4_KV_TILE_GROUP_SZ;
+    if (n_groups > DEN_NVFP4_KV_TILE_GROUPS) n_groups = DEN_NVFP4_KV_TILE_GROUPS;
+    for (int g = 0; g < n_groups; g++) {
+        int blk_start = g * DEN_NVFP4_KV_TILE_GROUP_SZ;
+        int blk_end = blk_start + DEN_NVFP4_KV_TILE_GROUP_SZ;
+        if (blk_end > head_dim) blk_end = head_dim;
+        float max_abs = 0.0f;
+        for (int e = blk_start; e < blk_end; e++) {
+            float av = vec[e];
+            if (av < 0.0f) av = -av;
+            if (av > max_abs) max_abs = av;
+        }
+        if (max_abs < 1e-10f) continue; // zero block — no scale is chosen
+        float ideal = max_abs / 6.0f;
+        int idx = (int)(ideal / DEN_KV_HIST_W);
+        if (idx < 0) idx = 0;
+        if (idx >= DEN_KV_HIST_BINS) idx = DEN_KV_HIST_BINS - 1;
+        atomicAdd(&hist[idx], 1u);
+    }
+}
 
 // ═══════════════════════════════════════════════════════════
 // Device: quantize float vector → NVFP4 tile
@@ -69,8 +126,11 @@ __device__ __constant__ const float kv_ue4m3_lut[16] = {
 __device__ static void kv_quantize_tile(
     const float * __restrict__ vec,
     uint8_t * tile,
-    int head_dim)
+    int head_dim,
+    unsigned int * hist = NULL)
 {
+    kv_hist_record(vec, head_dim, hist);
+
     // Zero tile
     for (int i = 0; i < DEN_NVFP4_KV_TILE_BYTES; i += 16) {
         if (i + 16 <= DEN_NVFP4_KV_TILE_BYTES) {
@@ -208,7 +268,7 @@ __device__ static void kv_dequantize_tile(
 }
 
 // ═══════════════════════════════════════════════════════════
-// K8 tile: uint8 quantize / dequantize (ThriftAttention K8V4)
+// K8 tile: uint8 quantize / dequantize (ThriftAttention K8V8)
 // Same 16-group structure, but elements stored as full uint8
 // instead of 4-bit E2M1 nibbles. 2× quality at 2× storage.
 // ═══════════════════════════════════════════════════════════
@@ -216,8 +276,11 @@ __device__ static void kv_dequantize_tile(
 __device__ static void kv_quantize_tile_k8(
     const float * __restrict__ vec,
     uint8_t * tile,
-    int head_dim)
+    int head_dim,
+    unsigned int * hist = NULL)
 {
+    kv_hist_record(vec, head_dim, hist);
+
     for (int i = 0; i < DEN_NVFP4_KV_TILE_BYTES_K8; i += 16) {
         if (i + 16 <= DEN_NVFP4_KV_TILE_BYTES_K8)
             *(uint4 *)(tile + i) = make_uint4(0, 0, 0, 0);
@@ -273,7 +336,7 @@ __device__ static void kv_quantize_tile_k8(
     float tile_norm = (head_dim > 0) ? (float)sqrt(sum_sq / head_dim) : 1.0f;
     if (tile_norm < 1e-10f) tile_norm = 1.0f;
     *(float *)(tile + DEN_NVFP4_KV_TILE_NORM_OFF_K8) = tile_norm;
-    tile[DEN_NVFP4_KV_TILE_DISPATCH_K8] = DEN_NVFP4_KV_META_K8V4;
+    tile[DEN_NVFP4_KV_TILE_DISPATCH_K8] = DEN_NVFP4_KV_META_K8V8;
     tile[DEN_NVFP4_KV_TILE_KSTRIDE_K8]  = (head_dim + 63) / 64;
 }
 
@@ -288,6 +351,42 @@ __device__ __forceinline__ float kv_dequantize_element_k8(
     uint8_t u8   = tile[byte_idx];
     float val = ((float)(int)u8 - 127.5f) / 127.5f * 6.0f;
     return val * scale;
+}
+
+// K8 tile: dequantize entire 288-byte tile → float vector (for host load path)
+__device__ static void kv_dequantize_tile_k8(
+    const uint8_t * __restrict__ tile,
+    float * vec,
+    int head_dim)
+{
+    int n_groups = (head_dim + DEN_NVFP4_KV_TILE_GROUP_SZ - 1) / DEN_NVFP4_KV_TILE_GROUP_SZ;
+    if (n_groups > DEN_NVFP4_KV_TILE_GROUPS) n_groups = DEN_NVFP4_KV_TILE_GROUPS;
+
+    for (int g = 0; g < n_groups; g++) {
+        float scale = kv_ue4m3_lut[tile[g] & 0x0F];
+        int blk_start = g * DEN_NVFP4_KV_TILE_GROUP_SZ;
+        int blk_end   = blk_start + DEN_NVFP4_KV_TILE_GROUP_SZ;
+        if (blk_end > head_dim) blk_end = head_dim;
+
+        for (int e = 0; e < blk_end - blk_start; e++) {
+            int byte_idx = DEN_NVFP4_KV_TILE_SCALES + g * DEN_NVFP4_KV_TILE_GROUP_SZ + e;
+            uint8_t u8   = tile[byte_idx];
+            vec[blk_start + e] = (((float)(int)u8 - 127.5f) / 127.5f * 6.0f) * scale;
+        }
+    }
+}
+
+// Kernel: dequantize 288-byte k8 tiles → float [n_kv_heads, head_dim]
+__global__ void kv_dequantize_kernel_k8(
+    const uint8_t * __restrict__ d_tiles,
+    float         * __restrict__ d_vec,
+    int n_kv_heads, int head_dim)
+{
+    int h = blockIdx.x * blockDim.x + threadIdx.x;
+    if (h >= n_kv_heads) return;
+    const uint8_t * tile = d_tiles + (size_t)h * DEN_NVFP4_KV_TILE_BYTES_K8;
+    float * vec = d_vec + (size_t)h * head_dim;
+    kv_dequantize_tile_k8(tile, vec, head_dim);
 }
 
 // ═══════════════════════════════════════════════════════════
@@ -332,20 +431,35 @@ __global__ void kv_dequantize_kernel(
 
 __global__ void kv_nvfp4_attention_kernel(
     const float * __restrict__ d_Q,
-    const float * __restrict__ d_k_anchor,
-    const float * __restrict__ d_v_anchor,
+    const float * __restrict__ d_k_tail,
+    const float * __restrict__ d_v_tail,
     const uint8_t * __restrict__ d_k_tiles,
     const uint8_t * __restrict__ d_v_tiles,
     float * __restrict__ d_output,
     int n_heads, int n_kv_heads, int head_dim,
-    int seq_len, int max_seq, int is_anchor,
+    int seq_len, int max_seq, int tail_tokens,
     int thrift_attention)
 {
     int head = blockIdx.x;
     if (head >= n_heads) return;
 
-    int kv_head = (n_kv_heads == n_heads) ? head : (head * n_kv_heads / n_heads);
+    // GQA head map: all query heads in a group share ONE KV head.
+    //   gqa_ratio = n_heads / n_kv_heads  (query heads per KV head)
+    //   kv_head   = head / gqa_ratio
+    // e.g. 35B Ornith (16 query heads, 2 KV heads): heads 0-7 -> KV 0, heads 8-15 -> KV 1.
+    // This is the canonical grouped form; identical to `head * n_kv_heads / n_heads`
+    // when n_heads % n_kv_heads == 0, but explicit about the grouping.
+    const int gqa_ratio = (n_kv_heads > 0) ? (n_heads / n_kv_heads) : 1;
+    int kv_head = (gqa_ratio <= 1) ? head : (head / gqa_ratio);
     int k_tile_bytes = thrift_attention ? DEN_NVFP4_KV_TILE_BYTES_K8 : DEN_NVFP4_KV_TILE_BYTES;
+    int v_tile_bytes = thrift_attention ? DEN_NVFP4_KV_TILE_BYTES_K8 : DEN_NVFP4_KV_TILE_BYTES;
+
+    // PRECISION TAIL: the latest `tail_tokens` cache positions live at F32 in
+    // d_k_tail/d_v_tail (slot = position % tail_tokens). Positions older than the
+    // tail window are quantized NVFP4 tiles at absolute position t in d_k_tiles.
+    // A position p is in the tail iff p >= seq_len - tail_tokens (clamped to 0).
+    int tail_start = seq_len - tail_tokens;
+    if (tail_start < 0) tail_start = 0;
 
     extern __shared__ float smem[];
     float inv_sqrt_hd = 1.0f / sqrtf((float)head_dim);
@@ -357,13 +471,14 @@ __global__ void kv_nvfp4_attention_kernel(
     // Phase 1: Q @ K^T for all cached tokens
     for (int t = 0; t < seq_len; t++) {
         float k_val;
-        if (t < DEN_NVFP4_KV_ANCHOR_TOKENS) {
-            // KVSink: first 4 tokens from FP16 anchors
-            k_val = d_k_anchor[((size_t)t * n_kv_heads + kv_head) * head_dim + tid];
+        if (t >= tail_start) {
+            // PRECISION TAIL: exact F32 K for a recent token.
+            int slot = t % tail_tokens;
+            k_val = d_k_tail[((size_t)slot * n_kv_heads + kv_head) * head_dim + tid];
         } else {
-            int tile_idx = t - DEN_NVFP4_KV_ANCHOR_TOKENS;
+            // Old context: NVFP4 tile at absolute position t.
             const uint8_t * tile = d_k_tiles +
-                ((size_t)tile_idx * n_kv_heads + kv_head) * k_tile_bytes;
+                ((size_t)t * n_kv_heads + kv_head) * k_tile_bytes;
             if (thrift_attention) {
                 k_val = kv_dequantize_element_k8(tile, tid);
             } else {
@@ -412,14 +527,19 @@ __global__ void kv_nvfp4_attention_kernel(
     float output_val = 0.0f;
     for (int t = 0; t < seq_len; t++) {
         float v_val;
-        if (t < DEN_NVFP4_KV_ANCHOR_TOKENS) {
-            // KVSink: first 4 tokens from FP16 anchors
-            v_val = d_v_anchor[((size_t)t * n_kv_heads + kv_head) * head_dim + tid];
+        if (t >= tail_start) {
+            // PRECISION TAIL: exact F32 V for a recent token.
+            int slot = t % tail_tokens;
+            v_val = d_v_tail[((size_t)slot * n_kv_heads + kv_head) * head_dim + tid];
         } else {
-            int tile_idx = t - DEN_NVFP4_KV_ANCHOR_TOKENS;
+            // Old context: NVFP4 tile at absolute position t.
             const uint8_t * tile = d_v_tiles +
-                ((size_t)tile_idx * n_kv_heads + kv_head) * DEN_NVFP4_KV_TILE_BYTES;
-            v_val = kv_dequantize_element(tile, tid);
+                ((size_t)t * n_kv_heads + kv_head) * v_tile_bytes;
+            if (thrift_attention) {
+                v_val = kv_dequantize_element_k8(tile, tid);
+            } else {
+                v_val = kv_dequantize_element(tile, tid);
+            }
         }
         output_val += smem_scores[t] * v_val;
     }
@@ -436,47 +556,66 @@ __global__ void kv_store_quantize_kernel(
     const float * __restrict__ d_v,
     uint8_t     * __restrict__ d_k_tiles,
     uint8_t     * __restrict__ d_v_tiles,
-    float       * __restrict__ d_k_anchor,
-    float       * __restrict__ d_v_anchor,
+    float       * __restrict__ d_k_tail,
+    float       * __restrict__ d_v_tail,
     int n_kv_heads, int head_dim,
-    int tile_idx, int max_seq,
+    int seq_pos, int max_seq, int tail_tokens,
     int store_k, int store_v,
     int thrift_attention)
 {
     int h = blockIdx.x * blockDim.x + threadIdx.x;
     if (h >= n_kv_heads) return;
+    if (tail_tokens < 1) return;
 
     int k_tile_bytes = thrift_attention ? DEN_NVFP4_KV_TILE_BYTES_K8 : DEN_NVFP4_KV_TILE_BYTES;
+    int v_tile_bytes = thrift_attention ? DEN_NVFP4_KV_TILE_BYTES_K8 : DEN_NVFP4_KV_TILE_BYTES;
 
-    if (tile_idx < DEN_NVFP4_KV_ANCHOR_TOKENS) {
-        // KVSink: first 4 tokens stored at FP16 precision
-        if (store_k) {
-            const float * k_src = d_k + (size_t)h * head_dim;
-            float * k_dst = d_k_anchor + ((size_t)tile_idx * n_kv_heads + h) * head_dim;
-            for (int i = 0; i < head_dim; i++) k_dst[i] = k_src[i];
-        }
-        if (store_v) {
-            const float * v_src = d_v + (size_t)h * head_dim;
-            float * v_dst = d_v_anchor + ((size_t)tile_idx * n_kv_heads + h) * head_dim;
-            for (int i = 0; i < head_dim; i++) v_dst[i] = v_src[i];
-        }
-    } else {
-        int t = tile_idx - DEN_NVFP4_KV_ANCHOR_TOKENS;
-        if (t >= max_seq - DEN_NVFP4_KV_ANCHOR_TOKENS) return;
-        if (store_k) {
-            const float * k_src = d_k + (size_t)h * head_dim;
-            uint8_t * k_tile = d_k_tiles + ((size_t)t * n_kv_heads + h) * k_tile_bytes;
-            if (thrift_attention) {
-                kv_quantize_tile_k8(k_src, k_tile, head_dim);
-            } else {
-                kv_quantize_tile(k_src, k_tile, head_dim);
+    unsigned int * hist_k = (g_kv_hist_enabled) ? g_kv_hist_k : NULL;
+    unsigned int * hist_v = (g_kv_hist_enabled) ? g_kv_hist_v : NULL;
+
+    // tail slot this token occupies (ring): tail[seq_pos % tail_tokens]
+    int slot = seq_pos % tail_tokens;
+
+    // ── 1) EVICT the token aging OUT of the precision tail into the NVFP4 tiles ──
+    // The token at absolute position p = seq_pos - tail_tokens currently lives in
+    // tail[slot] (same ring slot we're about to overwrite). Once seq_pos reaches
+    // tail_tokens, position 0 leaves the window; each subsequent store evicts the
+    // token that is exactly tail_tokens behind. Quantize it BEFORE the new token
+    // overwrites the slot, so attention still finds it (as a tile) afterwards.
+    if (seq_pos >= tail_tokens) {
+        int evict_pos = seq_pos - tail_tokens;              // absolute position aging out
+        if (evict_pos < max_seq) {
+            const float * k_src = d_k_tail + ((size_t)slot * n_kv_heads + h) * head_dim;
+            const float * v_src = d_v_tail + ((size_t)slot * n_kv_heads + h) * head_dim;
+            if (store_k) {
+                uint8_t * k_tile = d_k_tiles + ((size_t)evict_pos * n_kv_heads + h) * k_tile_bytes;
+                if (thrift_attention) {
+                    kv_quantize_tile_k8(k_src, k_tile, head_dim, hist_k);
+                } else {
+                    kv_quantize_tile(k_src, k_tile, head_dim, hist_k);
+                }
+            }
+            if (store_v) {
+                uint8_t * v_tile = d_v_tiles + ((size_t)evict_pos * n_kv_heads + h) * v_tile_bytes;
+                if (thrift_attention) {
+                    kv_quantize_tile_k8(v_src, v_tile, head_dim, hist_v);
+                } else {
+                    kv_quantize_tile(v_src, v_tile, head_dim, hist_v);
+                }
             }
         }
-        if (store_v) {
-            const float * v_src = d_v + (size_t)h * head_dim;
-            uint8_t * v_tile = d_v_tiles + ((size_t)t * n_kv_heads + h) * DEN_NVFP4_KV_TILE_BYTES;
-            kv_quantize_tile(v_src, v_tile, head_dim);
-        }
+    }
+
+    // ── 2) STORE the new token at F32 in the precision tail ──
+    if (store_k) {
+        const float * k_src = d_k + (size_t)h * head_dim;
+        float * k_dst = d_k_tail + ((size_t)slot * n_kv_heads + h) * head_dim;
+        for (int i = 0; i < head_dim; i++) k_dst[i] = k_src[i];
+    }
+    if (store_v) {
+        const float * v_src = d_v + (size_t)h * head_dim;
+        float * v_dst = d_v_tail + ((size_t)slot * n_kv_heads + h) * head_dim;
+        for (int i = 0; i < head_dim; i++) v_dst[i] = v_src[i];
     }
 }
 
@@ -485,6 +624,9 @@ __global__ void kv_store_quantize_kernel(
 // ═══════════════════════════════════════════════════════════
 
 den_nvfp4_kv_cache g_nvfp4_kv;
+
+// Scale-distribution probe host gate (defined below, used by store above)
+static int kv_hist_host_enabled(void);
 
 bool den_nvfp4_kv_is_wanted(void) {
     static int checked = 0;
@@ -524,6 +666,10 @@ void ggml_backend_cuda_nvfp4_kv_init(
 }
 
 void ggml_backend_cuda_nvfp4_kv_reset_all(void) {
+    // Drain in-flight kernels (warmup on main_stream) before zeroing buffers.
+    // Without this, a warmup store on main_stream races with the memset on the
+    // default stream — stale warmup data survives the reset → 1.0% match.
+    cudaDeviceSynchronize();
     den_nvfp4_kv_reset_all_seq_len(&g_nvfp4_kv);
 }
 
@@ -558,12 +704,32 @@ int den_nvfp4_kv_init(den_nvfp4_kv_cache * cache,
         return 0;
     }
 
+    // Probe mode: reset/enable histogram here (host init, runs before any CUDA
+    // graph capture begins). Accumulation happens inside the store kernel, which
+    // is capture-safe. The dump is deferred to den_nvfp4_kv_free (post-capture).
+    den_nvfp4_kv_hist_begin();
+
     cache->thrift_attention = thrift_attention;
     cache->n_attn_layers = n_attn_layers;
     cache->n_kv_heads    = n_kv_heads;
     cache->head_dim      = head_dim;
     cache->max_seq       = (max_seq > 0 && max_seq <= DEN_NVFP4_KV_MAX_SEQ)
                            ? max_seq : DEN_NVFP4_KV_MAX_SEQ;
+
+    // PRECISION TAIL: resolve size — env DEN_NVFP4_KV_TAIL overrides the default
+    // (DEN_NVFP4_KV_TAIL_TOKENS). Clamp to [1, max_seq]: the tail can never exceed
+    // the cache, and needs at least 1 token. When tail_tokens == max_seq the entire
+    // cache is F32 (no tiles allocated).
+    cache->tail_tokens = DEN_NVFP4_KV_TAIL_TOKENS;
+    {
+        const char * env_tail = getenv(DEN_NVFP4_KV_TAIL_ENV);
+        if (env_tail && env_tail[0]) {
+            int v = atoi(env_tail);
+            if (v > 0) cache->tail_tokens = v;
+        }
+        if (cache->tail_tokens > cache->max_seq) cache->tail_tokens = cache->max_seq;
+        if (cache->tail_tokens < 1) cache->tail_tokens = 1;
+    }
 
     cudaError_t err = cudaStreamCreateWithFlags(
         (cudaStream_t *)&cache->cuda_stream, cudaStreamNonBlocking);
@@ -580,10 +746,12 @@ int den_nvfp4_kv_init(den_nvfp4_kv_cache * cache,
         return -1;
     }
 
-    size_t anchor_bytes = (size_t)n_kv_heads * head_dim * DEN_NVFP4_KV_ANCHOR_TOKENS * sizeof(float);
+    // PRECISION TAIL F32 buffers: [tail_tokens * n_kv_heads * head_dim] floats.
+    size_t tail_bytes = (size_t)n_kv_heads * head_dim * cache->tail_tokens * sizeof(float);
+    // NVFP4 tile buffers: only tokens OLDER than the tail window get quantized.
     int k_tile_bytes = thrift_attention ? DEN_NVFP4_KV_TILE_BYTES_K8 : DEN_NVFP4_KV_TILE_BYTES;
-    int v_tile_bytes = DEN_NVFP4_KV_TILE_BYTES; // V always stays 4-bit
-    int tile_count = cache->max_seq - DEN_NVFP4_KV_ANCHOR_TOKENS;
+    int v_tile_bytes = thrift_attention ? DEN_NVFP4_KV_TILE_BYTES_K8 : DEN_NVFP4_KV_TILE_BYTES; // V follows K (8-bit in thrift/K8V8)
+    int tile_count = cache->max_seq - cache->tail_tokens;
     if (tile_count < 0) tile_count = 0;
     size_t k_tiles_per_layer = (size_t)tile_count * n_kv_heads * k_tile_bytes;
     size_t v_tiles_per_layer = (size_t)tile_count * n_kv_heads * v_tile_bytes;
@@ -592,24 +760,33 @@ int den_nvfp4_kv_init(den_nvfp4_kv_cache * cache,
     for (l = 0; l < n_attn_layers; l++) {
         den_nvfp4_kv_layer * layer = &cache->layers[l];
 
-        if (cudaMalloc(&layer->d_k_anchor, anchor_bytes) != cudaSuccess) goto fail;
-        if (cudaMalloc(&layer->d_v_anchor, anchor_bytes) != cudaSuccess) goto fail;
+        if (cudaMalloc(&layer->d_k_tail, tail_bytes) != cudaSuccess) goto fail;
+        if (cudaMalloc(&layer->d_v_tail, tail_bytes) != cudaSuccess) goto fail;
 
-        if (cache->max_seq > 1) {
+        if (tile_count > 0) {
             if (cudaMalloc(&layer->d_k_tiles, k_tiles_per_layer) != cudaSuccess) goto fail;
             if (cudaMalloc(&layer->d_v_tiles, v_tiles_per_layer) != cudaSuccess) goto fail;
             if (cudaMalloc(&layer->d_scratch_tile, (size_t)n_kv_heads * k_tile_bytes) != cudaSuccess) goto fail;
         }
 
-        if (cudaMallocHost(&layer->h_readback, anchor_bytes) != cudaSuccess) goto fail;
+        if (cudaMallocHost(&layer->h_readback, tail_bytes) != cudaSuccess) goto fail;
 
-        cudaMemset(layer->d_k_anchor, 0, anchor_bytes);
-        cudaMemset(layer->d_v_anchor, 0, anchor_bytes);
+        cudaMemset(layer->d_k_tail, 0, tail_bytes);
+        cudaMemset(layer->d_v_tail, 0, tail_bytes);
 
-        layer->max_seq    = cache->max_seq;
-        layer->seq_len    = 0;
-        layer->n_kv_heads = n_kv_heads;
-        layer->head_dim   = head_dim;
+        // Zero tile buffers — cudaMalloc does NOT zero memory; stale pages
+        // from a prior process survive and cause binary-state toggle (GOOD/BAD).
+        if (tile_count > 0) {
+            cudaMemset(layer->d_k_tiles,      0, k_tiles_per_layer);
+            cudaMemset(layer->d_v_tiles,      0, v_tiles_per_layer);
+            cudaMemset(layer->d_scratch_tile, 0, (size_t)n_kv_heads * k_tile_bytes);
+        }
+
+        layer->max_seq     = cache->max_seq;
+        layer->tail_tokens = cache->tail_tokens;
+        layer->seq_len     = 0;
+        layer->n_kv_heads  = n_kv_heads;
+        layer->head_dim    = head_dim;
     }
 
     cache->initialized = 1;
@@ -618,18 +795,17 @@ int den_nvfp4_kv_init(den_nvfp4_kv_cache * cache,
     den_nvfp4_kv_reset_all_seq_len(cache);
 
     {
-        const char * mode_str = thrift_attention ? "K8V4 ThriftAttention" : "K4V4";
-        size_t k_vram = (size_t)n_attn_layers * ((size_t)(cache->max_seq - 1) * n_kv_heads * k_tile_bytes + anchor_bytes);
-        size_t v_vram = (size_t)n_attn_layers * ((size_t)(cache->max_seq - 1) * n_kv_heads * v_tile_bytes + anchor_bytes);
+        const char * mode_str = thrift_attention ? "K8V8 ThriftAttention" : "K4V4";
         fprintf(stderr,
-            "KV NVFP4: ENABLED (%s, %d layers, %d KV heads, head_dim=%d, max_seq=%d)\n"
-            "  BF16=%.1f MB vs NVFP4=%.1f MB per layer (K=%.1f MB V=%.1f MB)\n",
+            "KV NVFP4: ENABLED (%s, %d layers, %d KV heads, head_dim=%d, max_seq=%d, PRECISION TAIL=%d tokens F32)\n"
+            "  tiles(%d): K=%.1f MB V=%.1f MB   tail F32(K+V)=%.2f MB   BF16-equiv=%.1f MB\n",
             mode_str,
-            n_attn_layers, n_kv_heads, head_dim, cache->max_seq,
-            (double)n_attn_layers * cache->max_seq * n_kv_heads * head_dim * 2 / (1024.0 * 1024.0),
-            (double)(k_vram + v_vram) / (1024.0 * 1024.0),
-            (double)k_vram / (1024.0 * 1024.0),
-            (double)v_vram / (1024.0 * 1024.0));
+            n_attn_layers, n_kv_heads, head_dim, cache->max_seq, cache->tail_tokens,
+            tile_count,
+            (double)k_tiles_per_layer * n_attn_layers / (1024.0 * 1024.0),
+            (double)v_tiles_per_layer * n_attn_layers / (1024.0 * 1024.0),
+            (double)2.0 * tail_bytes * n_attn_layers / (1024.0 * 1024.0),
+            (double)n_attn_layers * cache->max_seq * n_kv_heads * head_dim * 2 / (1024.0 * 1024.0));
     }
 
     return 0;
@@ -642,7 +818,8 @@ fail:
 }
 
 int den_nvfp4_kv_store(den_nvfp4_kv_cache * cache, int layer,
-                        int seq_pos, const float * d_k, const float * d_v)
+                        int seq_pos, const float * d_k, const float * d_v,
+                        cudaStream_t main_stream)
 {
     if (!cache || !cache->initialized) return -1;
     if (layer < 0 || layer >= cache->n_attn_layers) return -1;
@@ -660,7 +837,12 @@ int den_nvfp4_kv_store(den_nvfp4_kv_cache * cache, int layer,
         return -1;
     }
 
-    cudaStream_t stream = (cudaStream_t)cache->cuda_stream;
+    // Always run the store on the caller's main compute stream when provided
+    // (falls back to the cache's own stream only if none is given). Same-stream
+    // launch guarantees FIFO ordering after the K/V producer on main and before
+    // any consumer on main — no cross-stream event wait is needed, which also
+    // keeps CUDA graph capture valid.
+    cudaStream_t stream = main_stream ? main_stream : (cudaStream_t)cache->cuda_stream;
     int block_size = 128;
     int grid_size  = (cache->n_kv_heads + block_size - 1) / block_size;
 
@@ -674,17 +856,30 @@ int den_nvfp4_kv_store(den_nvfp4_kv_cache * cache, int layer,
     kv_store_quantize_kernel<<<grid_size, block_size, 0, stream>>>(
         k_ptr, v_ptr,
         kv_layer->d_k_tiles, kv_layer->d_v_tiles,
-        kv_layer->d_k_anchor, kv_layer->d_v_anchor,
+        kv_layer->d_k_tail, kv_layer->d_v_tail,
         cache->n_kv_heads, cache->head_dim,
-        seq_pos, kv_layer->max_seq, store_k, store_v,
+        seq_pos, kv_layer->max_seq, kv_layer->tail_tokens,
+        store_k, store_v,
         cache->thrift_attention);
+
+    // Probe mode: throttled periodic dump (every 4 tokens, deduped across layers,
+    // and NOT during graph capture). Attention layers are indexed 3,7,11,... so we
+    // gate only on seq_pos (dedupe via last-dumped) instead of layer==0.
+    if (kv_hist_host_enabled() && !g_den_cuda_graph_capturing && (seq_pos & 3) == 0) {
+        static int last_dump_seq = -1;
+        if (seq_pos != last_dump_seq) {
+            last_dump_seq = seq_pos;
+            den_nvfp4_kv_hist_dump();
+        }
+    }
 
     CUDA_CHECK(cudaGetLastError());
     return 0;
 }
 
 int den_nvfp4_kv_load(den_nvfp4_kv_cache * cache, int layer,
-                       float * d_k_out, float * d_v_out, int seq_pos)
+                       float * d_k_out, float * d_v_out, int seq_pos,
+                       cudaStream_t main_stream)
 {
     if (!cache || !cache->initialized) return -1;
     if (layer < 0 || layer >= cache->n_attn_layers) return -1;
@@ -692,28 +887,44 @@ int den_nvfp4_kv_load(den_nvfp4_kv_cache * cache, int layer,
     den_nvfp4_kv_layer * kv_layer = &cache->layers[layer];
     if (seq_pos < 0 || seq_pos >= kv_layer->seq_len) return -1;
 
-    cudaStream_t stream = (cudaStream_t)cache->cuda_stream;
+    // Use the caller's main compute stream when provided (FIFO with main's
+    // consumers); fall back to the cache's own stream otherwise.
+    cudaStream_t stream = main_stream ? main_stream : (cudaStream_t)cache->cuda_stream;
 
-    if (seq_pos == 0) {
-        size_t bytes = (size_t)cache->n_kv_heads * cache->head_dim * sizeof(float);
-        CUDA_CHECK(cudaMemcpyAsync(d_k_out, kv_layer->d_k_anchor, bytes,
-                                   cudaMemcpyDeviceToDevice, stream));
-        CUDA_CHECK(cudaMemcpyAsync(d_v_out, kv_layer->d_v_anchor, bytes,
-                                   cudaMemcpyDeviceToDevice, stream));
+    int tail_start = kv_layer->seq_len - kv_layer->tail_tokens;
+    if (tail_start < 0) tail_start = 0;
+
+    if (seq_pos >= tail_start) {
+        // PRECISION TAIL: recent token lives at F32 in the tail buffer, slot = pos % tail_tokens
+        int slot = seq_pos % kv_layer->tail_tokens;
+        size_t per_token_bytes = (size_t)cache->n_kv_heads * cache->head_dim * sizeof(float);
+        size_t offset_bytes    = (size_t)slot * per_token_bytes;
+        CUDA_CHECK(cudaMemcpyAsync(d_k_out, (char *)kv_layer->d_k_tail + offset_bytes,
+                                   per_token_bytes, cudaMemcpyDeviceToDevice, stream));
+        CUDA_CHECK(cudaMemcpyAsync(d_v_out, (char *)kv_layer->d_v_tail + offset_bytes,
+                                   per_token_bytes, cudaMemcpyDeviceToDevice, stream));
     } else {
-        int tile_idx = seq_pos - 1;
+        int tile_idx = seq_pos; // tiles hold absolute positions older than the tail
+        int tb = cache->thrift_attention ? DEN_NVFP4_KV_TILE_BYTES_K8 : DEN_NVFP4_KV_TILE_BYTES;
         const uint8_t * k_tile_base = kv_layer->d_k_tiles +
-            (size_t)tile_idx * cache->n_kv_heads * DEN_NVFP4_KV_TILE_BYTES;
+            (size_t)tile_idx * cache->n_kv_heads * tb;
         const uint8_t * v_tile_base = kv_layer->d_v_tiles +
-            (size_t)tile_idx * cache->n_kv_heads * DEN_NVFP4_KV_TILE_BYTES;
+            (size_t)tile_idx * cache->n_kv_heads * tb;
 
         int block_size = 128;
         int grid_size  = (cache->n_kv_heads + block_size - 1) / block_size;
 
-        kv_dequantize_kernel<<<grid_size, block_size, 0, stream>>>(
-            k_tile_base, d_k_out, cache->n_kv_heads, cache->head_dim);
-        kv_dequantize_kernel<<<grid_size, block_size, 0, stream>>>(
-            v_tile_base, d_v_out, cache->n_kv_heads, cache->head_dim);
+        if (cache->thrift_attention) {
+            kv_dequantize_kernel_k8<<<grid_size, block_size, 0, stream>>>(
+                k_tile_base, d_k_out, cache->n_kv_heads, cache->head_dim);
+            kv_dequantize_kernel_k8<<<grid_size, block_size, 0, stream>>>(
+                v_tile_base, d_v_out, cache->n_kv_heads, cache->head_dim);
+        } else {
+            kv_dequantize_kernel<<<grid_size, block_size, 0, stream>>>(
+                k_tile_base, d_k_out, cache->n_kv_heads, cache->head_dim);
+            kv_dequantize_kernel<<<grid_size, block_size, 0, stream>>>(
+                v_tile_base, d_v_out, cache->n_kv_heads, cache->head_dim);
+        }
     }
 
     CUDA_CHECK(cudaStreamSynchronize(stream));
@@ -721,7 +932,8 @@ int den_nvfp4_kv_load(den_nvfp4_kv_cache * cache, int layer,
 }
 
 int den_nvfp4_kv_attention(den_nvfp4_kv_cache * cache, int layer,
-                            const float * d_Q, float * d_output, int n_heads)
+                            const float * d_Q, float * d_output, int n_heads,
+                            cudaStream_t main_stream)
 {
     if (!cache || !cache->initialized) return -1;
     if (layer < 0 || layer >= cache->n_attn_layers) return -1;
@@ -734,7 +946,11 @@ int den_nvfp4_kv_attention(den_nvfp4_kv_cache * cache, int layer,
     size_t smem_bytes = ((size_t)seq_len + (size_t)n_warps_smem) * sizeof(float);
     if (smem_bytes > DEN_SMEM_MAX_BYTES) smem_bytes = DEN_SMEM_MAX_BYTES;
 
-    cudaStream_t stream = (cudaStream_t)cache->cuda_stream;
+    // Always run attention on the caller's main compute stream when provided.
+    // d_output is read by the NEXT graph node on the main compute stream, so the
+    // write must be FIFO-ordered on the same stream to close the cross-stream
+    // read-before-write race. Falls back to the cache's own stream if none given.
+    cudaStream_t stream = main_stream ? main_stream : (cudaStream_t)cache->cuda_stream;
 
     // Clear stale errors before launch
     cudaGetLastError();
@@ -742,11 +958,11 @@ int den_nvfp4_kv_attention(den_nvfp4_kv_cache * cache, int layer,
     // blockDim = head_dim (128 or 256); smem holds seq_len scores + n_warps warp sums
     kv_nvfp4_attention_kernel<<<n_heads, cache->head_dim, smem_bytes, stream>>>(
         d_Q,
-        kv_layer->d_k_anchor, kv_layer->d_v_anchor,
+        kv_layer->d_k_tail, kv_layer->d_v_tail,
         kv_layer->d_k_tiles, kv_layer->d_v_tiles,
         d_output,
         n_heads, cache->n_kv_heads, cache->head_dim,
-        seq_len, kv_layer->max_seq, 1,
+        seq_len, kv_layer->max_seq, kv_layer->tail_tokens,
         cache->thrift_attention);
 
     CUDA_CHECK(cudaGetLastError());
@@ -770,16 +986,88 @@ int den_nvfp4_kv_set_seq_len(den_nvfp4_kv_cache * cache, int layer, int len) {
 void den_nvfp4_kv_reset_all_seq_len(den_nvfp4_kv_cache * cache) {
     if (!cache || !cache->initialized) return;
     for (int l = 0; l < cache->n_attn_layers; l++) {
-        cache->layers[l].seq_len = 0;
+        den_nvfp4_kv_layer * layer = &cache->layers[l];
+        layer->seq_len = 0;
+
+        // Zero tail buffers — seq_len=0 guarantees no reads, but stale
+        // warmup data in the ring buffer can produce 1.0%-match garbage if
+        // any code path reads a position that hasn't been overwritten yet.
+        size_t tail_bytes = (size_t)layer->n_kv_heads * layer->head_dim
+                          * layer->tail_tokens * sizeof(float);
+        if (tail_bytes > 0) {
+            cudaMemset(layer->d_k_tail, 0, tail_bytes);
+            cudaMemset(layer->d_v_tail, 0, tail_bytes);
+        }
+
+        // Also zero tiles to guarantee zero-score (silent) stale reads.
+        int k_tb = cache->thrift_attention ? DEN_NVFP4_KV_TILE_BYTES_K8 : DEN_NVFP4_KV_TILE_BYTES;
+        int v_tb = cache->thrift_attention ? DEN_NVFP4_KV_TILE_BYTES_K8 : DEN_NVFP4_KV_TILE_BYTES;
+        int tile_count = layer->max_seq - layer->tail_tokens;
+        if (tile_count < 0) tile_count = 0;
+        if (tile_count > 0) {
+            size_t kt_bytes = (size_t)tile_count * layer->n_kv_heads * k_tb;
+            size_t vt_bytes = (size_t)tile_count * layer->n_kv_heads * v_tb;
+            cudaMemset(layer->d_k_tiles, 0, kt_bytes);
+            cudaMemset(layer->d_v_tiles, 0, vt_bytes);
+        }
     }
+}
+
+// ── Scale-distribution probe: host control ──────────────────
+static int g_kv_hist_on = -1; // -1 = uninitialized
+static int kv_hist_host_enabled(void) {
+    if (g_kv_hist_on < 0) {
+        const char * env = getenv("DEN_NVFP4_KV_HIST");
+        g_kv_hist_on = (env && env[0] == '1') ? 1 : 0;
+    }
+    return g_kv_hist_on;
+}
+
+void den_nvfp4_kv_hist_begin(void) {
+    if (!kv_hist_host_enabled()) return;
+    cudaDeviceSynchronize();
+    void * addr = NULL;
+    cudaGetSymbolAddress(&addr, g_kv_hist_k);
+    cudaMemset(addr, 0, sizeof(g_kv_hist_k));
+    cudaGetSymbolAddress(&addr, g_kv_hist_v);
+    cudaMemset(addr, 0, sizeof(g_kv_hist_v));
+    const int one = 1;
+    cudaMemcpyToSymbol(g_kv_hist_enabled, &one, sizeof(int));
+}
+
+void den_nvfp4_kv_hist_dump(void) {
+    if (!kv_hist_host_enabled()) return;
+    cudaDeviceSynchronize();
+    unsigned int hk[DEN_KV_HIST_BINS], hv[DEN_KV_HIST_BINS];
+    cudaMemcpyFromSymbol(hk, g_kv_hist_k, sizeof(hk));
+    cudaMemcpyFromSymbol(hv, g_kv_hist_v, sizeof(hv));
+    FILE * f = fopen("kv_scale_hist.txt", "w");
+    if (!f) return;
+    unsigned long long tk = 0, tv = 0;
+    for (int i = 0; i < DEN_KV_HIST_BINS; i++) { tk += hk[i]; tv += hv[i]; }
+    fprintf(f, "# NVFP4 KV ideal_scale histogram (ideal_scale = max_abs/6 per 16-elem block)\n");
+    fprintf(f, "# bin i covers ideal_scale in [i*0.0625, (i+1)*0.0625)\n");
+    fprintf(f, "# K blocks=%llu  V blocks=%llu\n", tk, tv);
+    fprintf(f, "# idx lo hi k v\n");
+    for (int i = 0; i < DEN_KV_HIST_BINS; i++) {
+        float lo = i * DEN_KV_HIST_W;
+        float hi = (i + 1) * DEN_KV_HIST_W;
+        if (hk[i] || hv[i])
+            fprintf(f, "%d %.6f %.6f %u %u\n", i, lo, hi, hk[i], hv[i]);
+    }
+    fclose(f);
 }
 
 void den_nvfp4_kv_free(den_nvfp4_kv_cache * cache) {
     if (!cache) return;
+
+    // Probe mode: dump cumulative histogram at teardown (post-capture, safe to sync).
+    den_nvfp4_kv_hist_dump();
+
     for (int l = 0; l < cache->n_attn_layers; l++) {
         den_nvfp4_kv_layer * layer = &cache->layers[l];
-        if (layer->d_k_anchor)    cudaFree(layer->d_k_anchor);
-        if (layer->d_v_anchor)    cudaFree(layer->d_v_anchor);
+        if (layer->d_k_tail)      cudaFree(layer->d_k_tail);
+        if (layer->d_v_tail)      cudaFree(layer->d_v_tail);
         if (layer->d_k_tiles)     cudaFree(layer->d_k_tiles);
         if (layer->d_v_tiles)     cudaFree(layer->d_v_tiles);
         if (layer->d_scratch_tile)cudaFree(layer->d_scratch_tile);
@@ -798,9 +1086,13 @@ double den_nvfp4_kv_compression_ratio(const den_nvfp4_kv_cache * cache) {
     if (!cache || !cache->initialized) return 1.0;
     size_t bf16_per_layer = (size_t)cache->max_seq * cache->n_kv_heads *
                             cache->head_dim * 2;
-    size_t nvfp4_per_layer = (size_t)(cache->max_seq - 1) * cache->n_kv_heads *
-                             DEN_NVFP4_KV_TILE_BYTES +
-                             (size_t)cache->n_kv_heads * cache->head_dim * 4;
+    int tile_count = cache->max_seq - cache->tail_tokens;
+    if (tile_count < 0) tile_count = 0;
+    size_t tb = cache->thrift_attention ? DEN_NVFP4_KV_TILE_BYTES_K8 : DEN_NVFP4_KV_TILE_BYTES;
+    // NVFP4 footprint = tiles for the quantized region + F32 tail (K+V).
+    size_t nvfp4_per_layer = (size_t)tile_count * cache->n_kv_heads * tb +
+                             (size_t)cache->tail_tokens * cache->n_kv_heads *
+                             cache->head_dim * 2 * (size_t)sizeof(float);
     if (nvfp4_per_layer == 0) return 1.0;
     return (double)bf16_per_layer / (double)nvfp4_per_layer;
 }
@@ -813,7 +1105,7 @@ void den_nvfp4_kv_post_set_rows(const float * d_dst, const float * d_src,
                                 int n_kv_heads, int head_dim,
                                 int seq_pos, int layer) {
     if (!den_nvfp4_kv_is_active()) return;
-    den_nvfp4_kv_store(&g_nvfp4_kv, layer, seq_pos, d_src, d_src);
+    den_nvfp4_kv_store(&g_nvfp4_kv, layer, seq_pos, d_src, d_src, nullptr);
     (void)d_dst;
     (void)n_kv_heads;
     (void)head_dim;
