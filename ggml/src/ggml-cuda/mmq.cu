@@ -165,13 +165,15 @@ void ggml_cuda_mul_mat_q(
                                 ne11 * ne10_padded * sizeof(block_q8_1) / (QK8_1 * sizeof(int));
         const int64_t s13 = ne12*s12;
 
+        const int64_t stride_tiles_x = (src0->flags & GGML_TENSOR_FLAG_NULLGLASS) ? (ne00 / 256) : 0;
+        const int64_t effective_s01 = stride_tiles_x ? (ne00 / 64) : s01; // blocks_per_row for NULLGLASS
         const mmq_args args = {
             src0_d, src0->type, (const int *) src1_q8_1.ptr, nullptr, nullptr, dst_d,
             src0->type == GGML_TYPE_NVFP4 && use_native_fp4 ? src1_scale.ptr : nullptr,
-            ne00, ne01, ne1, s01, ne11, s1,
+            ne00, ne01, ne1, effective_s01, ne11, s1,
             ne02, ne12, s02, s12, s2,
             ne03, ne13, s03, s13, s3,
-            ne1};
+            ne1, stride_tiles_x};
         ggml_cuda_mul_mat_q_switch_type(ctx, args, stream);
         return;
     }
@@ -245,13 +247,15 @@ void ggml_cuda_mul_mat_q(
     const int64_t s13 = ne12*s12;
 
     // Note that ne02 is used instead of ne12 because the number of y channels determines the z dimension of the CUDA grid.
+    const int64_t stride_tiles_x = (src0->flags & GGML_TENSOR_FLAG_NULLGLASS) ? (ne00 / 256) : 0;
+    const int64_t effective_s01 = stride_tiles_x ? (ne00 / 64) : s01; // blocks_per_row for NULLGLASS
     const mmq_args args = {
         src0_d, src0->type, (const int *) src1_q8_1.get(), ids_dst.get(), expert_bounds.get(), dst_d,
         src1_scale.ptr,
-        ne00, ne01, ne_get_rows, s01, ne_get_rows, s1,
+        ne00, ne01, ne_get_rows, effective_s01, ne_get_rows, s1,
         ne02, ne02, s02, s12, s2,
         ne03, ne13, s03, s13, s3,
-        ne12};
+        ne12, stride_tiles_x};
 
     ggml_cuda_mul_mat_q_switch_type(ctx, args, stream);
 }

@@ -33,14 +33,16 @@
 // Hardware constants (GB203 / RTX 5070 Ti)
 // ──────────────────────────────────────────────────────────────
 
-#define N_SM           70          // GB203 SMs
+#define N_SM           70          // GB203 SMs (total)
+#define N_SAMPLE_SMS   23          // sampled: every 3rd SM (70/3 = 23)
 #define N_SM_MAX       128         // safe array sizing
-#define N_ITERS        10          // ping-pong iterations per pair
-#define N_PAIRS        ((N_SM) * ((N_SM) - 1) / 2)  // 2415
+#define N_ITERS        3           // ping-pong iterations per pair (reduced from 10)
+#define N_PAIRS        ((N_SAMPLE_SMS) * ((N_SAMPLE_SMS) - 1) / 2)  // 253
 #define CLOCK_MHZ      2482        // RTX 5070 Ti boost clock (approx)
+#define TIMEOUT_CYCLES 24820000ULL // 10ms timeout per pair @ 2482 MHz
+#define PROGRESS_EVERY 50          // print progress every N pairs
 #define L2_SLICE_STRIDE 256        // bytes — one cache line maps to one slice
 #define N_L2_STRIDES   256         // probe up to 256 slices (overprovision)
-#define WARMUP_PAIRS   100         // warmup iterations before timing
 
 // ──────────────────────────────────────────────────────────────
 // Test 1: SM↔SM ping-pong latency
@@ -70,8 +72,9 @@ __global__ void noc_sm_pingpong(
     uint32_t*    epoch,        // single counter
     uint32_t*    cur_src,      // current source SM (published by coordinator)
     uint32_t*    cur_dst,      // current destination SM
-    const uint32_t* pairs_src, // [N_PAIRS] — precomputed pair sources
-    const uint32_t* pairs_dst  // [N_PAIRS] — precomputed pair destinations
+    const uint32_t* pairs_src, // [N_PAIRS] — precomputed pair sources (sampled SMs)
+    const uint32_t* pairs_dst, // [N_PAIRS] — precomputed pair destinations (sampled SMs)
+    uint32_t*    skipped       // [1] — count of timed-out pairs
 ) {
     unsigned sm_id;
     asm volatile("mov.u32 %0, %%smid;" : "=r"(sm_id));
@@ -81,6 +84,7 @@ __global__ void noc_sm_pingpong(
         for (int p = 0; p < N_PAIRS; p++) {
             uint32_t go_epoch = (uint32_t)(it * 2ULL * N_PAIRS + 2ULL * p + 1);
             uint32_t src, dst;
+            int timed_out = 0;
 
             if (sm_id == 0) {
                 // ── Coordinator: publish pair, advance epoch ──
@@ -94,6 +98,11 @@ __global__ void noc_sm_pingpong(
                 cur_dst[0] = dst;
                 __threadfence();
                 epoch[0] = go_epoch;
+
+                // ── Progress print ──
+                if (it == 0 && (p % PROGRESS_EVERY) == 0) {
+                    printf("  pair %d/%d done\n", p, N_PAIRS);
+                }
             } else {
                 // ── Wait for coordinator to publish ──
                 while (atomicAdd(epoch, 0) < go_epoch) {
@@ -103,34 +112,62 @@ __global__ void noc_sm_pingpong(
                 dst = atomicAdd(cur_dst, 0);
             }
 
-            // ── Ping-pong ──
+            // ── Ping-pong (with timeout on busy SMs) ──
             if (sm_id == src) {
                 uint64_t t0 = clock64();
                 atomicAdd(&pong[dst], 1);               // PING
                 while (atomicAdd(&ping[src], 0) == 0) { // wait PONG
                     __threadfence();
+                    // Timeout: if dst SM is busy (WDDM/display), bail after 10ms
+                    if ((clock64() - t0) > TIMEOUT_CYCLES) {
+                        timed_out = 1;
+                        break;
+                    }
                 }
-                uint64_t t1 = clock64();
-                uint64_t dt  = t1 - t0;
-                uint64_t idx = (uint64_t)src * N_SM_MAX + dst;
-                if (it == 0 || dt < latency[idx]) {
-                    latency[idx] = dt;
+                if (!timed_out) {
+                    uint64_t t1 = clock64();
+                    uint64_t dt  = t1 - t0;
+                    uint64_t idx = (uint64_t)src * N_SM_MAX + dst;
+                    if (it == 0 || dt < latency[idx]) {
+                        latency[idx] = dt;
+                    }
                 }
             } else if (sm_id == dst) {
+                uint64_t t_wait = clock64();
                 while (atomicAdd(&pong[dst], 0) == 0) { // wait PING
                     __threadfence();
+                    if ((clock64() - t_wait) > TIMEOUT_CYCLES) {
+                        timed_out = 1;
+                        break;
+                    }
                 }
-                atomicAdd(&ping[src], 1);               // PONG
+                if (!timed_out) {
+                    atomicAdd(&ping[src], 1);           // PONG
+                }
             }
             // other SMs: nothing to do
 
-            // ── Coordinator: wait for ping-pong completion ──
+            // ── Coordinator: wait for ping-pong completion (with timeout) ──
             if (sm_id == 0) {
+                uint64_t t_wait = clock64();
                 while (atomicAdd(&ping[src], 0) == 0) {
                     __threadfence();
+                    if ((clock64() - t_wait) > TIMEOUT_CYCLES) {
+                        timed_out = 1;
+                        break;
+                    }
+                }
+                if (timed_out) {
+                    atomicAdd(skipped, 1);
+                    // Reset epoch so other SMs don't spin on stale state
+                    epoch[0] = go_epoch + 1;
                 }
             }
         }
+    }
+    // Final progress print for last batch
+    if (sm_id == 0) {
+        printf("  pair %d/%d done (all complete)\n", N_PAIRS, N_PAIRS);
     }
 }
 
@@ -277,8 +314,8 @@ static void write_report_sm_latency(const char* path,
 
     fprintf(f, "=== GB203 NoC SM-to-SM Latency Report ===\n\n");
     fprintf(f, "GPU clock: %.0f MHz (%.2f ns/cycle)\n", clock_mhz, 1000.0 / clock_mhz);
-    fprintf(f, "SMs: %d  Pairs measured: %d  Iterations per pair: %d\n\n",
-            N_SM, N_PAIRS, N_ITERS);
+    fprintf(f, "SMs: %d (sampled: %d, every 3rd)  Pairs measured: %d  Iterations per pair: %d\n\n",
+            N_SM, N_SAMPLE_SMS, N_PAIRS, N_ITERS);
 
     // Compute stats
     uint64_t total = 0, min_val = UINT64_MAX, max_val = 0;
@@ -448,18 +485,29 @@ int main(int argc, char** argv) {
     cudaDeviceProp props;
     CUDA_CHECK(cudaGetDeviceProperties(&props, dev));
     printf("Device: %s\n", props.name);
+    int clock_khz = 0;
+    cudaDeviceGetAttribute(&clock_khz, cudaDevAttrClockRate, 0);
     printf("SMs: %d  Clock: %d MHz (rated)\n\n",
-           props.multiProcessorCount, props.clockRate / 1000);
+           props.multiProcessorCount, clock_khz / 1000);
 
     // Use actual clock rate if available
-    double clock_mhz = (props.clockRate > 0) ? (double)props.clockRate / 1000.0 : CLOCK_MHZ;
+    double clock_mhz = (clock_khz > 0) ? (double)clock_khz / 1000.0 : CLOCK_MHZ;
 
     // ═══════════════════════════════════════
     // TEST 1: SM↔SM Ping-Pong Latency Matrix
     // ═══════════════════════════════════════
     printf("═══ Test 1: SM↔SM Ping-Pong Latency ═══\n\n");
 
-    // Precompute pair arrays on host
+    // Build sampled SM list: every 3rd SM (always include SM 0)
+    uint32_t sampled_sm[N_SAMPLE_SMS];
+    for (uint32_t i = 0; i < N_SAMPLE_SMS; i++) {
+        sampled_sm[i] = i * 3;  // SM 0, 3, 6, 9, ..., 66
+    }
+    printf("Sampled %u SMs out of %u (every 3rd): ", N_SAMPLE_SMS, N_SM);
+    for (uint32_t i = 0; i < N_SAMPLE_SMS; i++) printf("%u ", sampled_sm[i]);
+    printf("\n");
+
+    // Precompute pair arrays on host (pairs of sampled SM indices)
     uint32_t* h_pairs_src = (uint32_t*)malloc(N_PAIRS * sizeof(uint32_t));
     uint32_t* h_pairs_dst = (uint32_t*)malloc(N_PAIRS * sizeof(uint32_t));
     if (!h_pairs_src || !h_pairs_dst) {
@@ -467,7 +515,10 @@ int main(int argc, char** argv) {
         return 1;
     }
     for (uint32_t p = 0; p < N_PAIRS; p++) {
-        pair_from_index(p, N_SM, &h_pairs_src[p], &h_pairs_dst[p]);
+        uint32_t a, b;
+        pair_from_index(p, N_SAMPLE_SMS, &a, &b);
+        h_pairs_src[p] = sampled_sm[a];  // map to actual SM ID
+        h_pairs_dst[p] = sampled_sm[b];
     }
     printf("Pair index computed: %u pairs\n", N_PAIRS);
 
@@ -475,6 +526,7 @@ int main(int argc, char** argv) {
     uint64_t* d_latency;
     uint32_t* d_ping, *d_pong, *d_epoch, *d_cur_src, *d_cur_dst;
     uint32_t* d_pairs_src, *d_pairs_dst;
+    uint32_t* d_skipped;
 
     CUDA_CHECK(cudaMalloc(&d_latency,  N_SM_MAX * N_SM_MAX * sizeof(uint64_t)));
     CUDA_CHECK(cudaMalloc(&d_ping,     N_SM_MAX * sizeof(uint32_t)));
@@ -482,6 +534,7 @@ int main(int argc, char** argv) {
     CUDA_CHECK(cudaMalloc(&d_epoch,    sizeof(uint32_t)));
     CUDA_CHECK(cudaMalloc(&d_cur_src,  sizeof(uint32_t)));
     CUDA_CHECK(cudaMalloc(&d_cur_dst,  sizeof(uint32_t)));
+    CUDA_CHECK(cudaMalloc(&d_skipped,  sizeof(uint32_t)));
     CUDA_CHECK(cudaMalloc(&d_pairs_src, N_PAIRS * sizeof(uint32_t)));
     CUDA_CHECK(cudaMalloc(&d_pairs_dst, N_PAIRS * sizeof(uint32_t)));
 
@@ -490,26 +543,17 @@ int main(int argc, char** argv) {
     CUDA_CHECK(cudaMemset(d_ping,     0, N_SM_MAX * sizeof(uint32_t)));
     CUDA_CHECK(cudaMemset(d_pong,     0, N_SM_MAX * sizeof(uint32_t)));
     CUDA_CHECK(cudaMemset(d_epoch,    0, sizeof(uint32_t)));
+    CUDA_CHECK(cudaMemset(d_skipped,  0, sizeof(uint32_t)));
     CUDA_CHECK(cudaMemcpy(d_pairs_src, h_pairs_src, N_PAIRS * sizeof(uint32_t),
                           cudaMemcpyHostToDevice));
     CUDA_CHECK(cudaMemcpy(d_pairs_dst, h_pairs_dst, N_PAIRS * sizeof(uint32_t),
                           cudaMemcpyHostToDevice));
 
-    // Warmup launch (cold start overhead)
-    printf("Warming up...\n");
-    noc_sm_pingpong<<<N_SM, 1>>>(d_latency, d_ping, d_pong, d_epoch,
-                                   d_cur_src, d_cur_dst,
-                                   d_pairs_src, d_pairs_dst);
-    CUDA_CHECK(cudaDeviceSynchronize());
+    // No warmup — SM ping-pong is latency-bound, not memory/cache-bound.
+    // Measurements start immediately.
 
-    // Re-init and run timed
-    CUDA_CHECK(cudaMemset(d_latency, 0, N_SM_MAX * N_SM_MAX * sizeof(uint64_t)));
-    CUDA_CHECK(cudaMemset(d_epoch,   0, sizeof(uint32_t)));
-
-    printf("Running ping-pong probe (%d iterations x %d pairs)...\n",
+    printf("Running ping-pong probe (%d iterations x %d sampled pairs)...\n",
            N_ITERS, N_PAIRS);
-    printf("Estimated time: ~%.0f seconds...\n",
-           (double)N_ITERS * N_PAIRS * 0.0001); // rough estimate
 
     cudaEvent_t t1_start, t1_stop;
     CUDA_CHECK(cudaEventCreate(&t1_start));
@@ -518,7 +562,8 @@ int main(int argc, char** argv) {
 
     noc_sm_pingpong<<<N_SM, 1>>>(d_latency, d_ping, d_pong, d_epoch,
                                    d_cur_src, d_cur_dst,
-                                   d_pairs_src, d_pairs_dst);
+                                   d_pairs_src, d_pairs_dst,
+                                   d_skipped);
     CUDA_CHECK(cudaDeviceSynchronize());
     CUDA_CHECK(cudaGetLastError());
 
@@ -527,6 +572,14 @@ int main(int argc, char** argv) {
     float elapsed_ms;
     CUDA_CHECK(cudaEventElapsedTime(&elapsed_ms, t1_start, t1_stop));
     printf("Done in %.2f seconds\n\n", elapsed_ms / 1000.0f);
+
+    // Report skipped pairs
+    uint32_t h_skipped = 0;
+    CUDA_CHECK(cudaMemcpy(&h_skipped, d_skipped, sizeof(uint32_t),
+                          cudaMemcpyDeviceToHost));
+    if (h_skipped > 0) {
+        printf("  ⚠ %u pairs timed out (skipped — likely WDDM-occupied SMs)\n\n", h_skipped);
+    }
 
     // Copy results to host
     uint64_t* h_latency = (uint64_t*)calloc(N_SM_MAX * N_SM_MAX, sizeof(uint64_t));
@@ -549,6 +602,7 @@ int main(int argc, char** argv) {
     CUDA_CHECK(cudaFree(d_epoch));
     CUDA_CHECK(cudaFree(d_cur_src));
     CUDA_CHECK(cudaFree(d_cur_dst));
+    CUDA_CHECK(cudaFree(d_skipped));
     CUDA_CHECK(cudaFree(d_pairs_src));
     CUDA_CHECK(cudaFree(d_pairs_dst));
     free(h_latency);

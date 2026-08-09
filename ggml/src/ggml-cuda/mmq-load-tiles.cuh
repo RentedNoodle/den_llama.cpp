@@ -1758,3 +1758,67 @@ template <ggml_type type, int J, bool fallback> static __device__ __forceinline_
         x_u32_scale[i*sram_stride] = get_int_b4(bxi->d, 0);
     }
 }
+
+// ---------------------------------------------------------------------------------------------
+// NULLGLASS tile load — reads 160B tiles directly (OMMA-native layout), no GGUF repack
+// 1 NULLGLASS tile = 256 elements = 4 GGUF blocks. Stride = tiles_per_row (not blocks_per_row).
+// Pointer arithmetic uses 160-byte steps. Sub-block 0..3 maps to tile quarters.
+// SRAM write pattern is IDENTICAL to load_tiles_nvfp4_nvfp4 — vec_dot_fp4_fp4_mma unchanged.
+
+template <ggml_type type, int J, bool fallback>
+static __device__ __forceinline__ void ggml_cuda_mmq_load_tiles_nullglass_nvfp4(
+        const char * __restrict__ x, int * __restrict__ x_tile, const int kbx0, const int i_max, const int stride) {
+
+    // stride = tiles_per_row (each tile = 160 bytes)
+    // kbx0, kbx = block indices (64 elements each). 4 blocks = 1 NULLGLASS tile.
+
+    constexpr int warp_size       = ggml_cuda_get_physical_warp_size();
+    constexpr int nwarps          = ggml_cuda_mmq_get_nthreads(type, J, fallback) / warp_size;
+    constexpr int I               = ggml_cuda_mmq_get_I(type, J, fallback);
+    constexpr int iter_k          = ggml_cuda_mmq_get_K_vram(type, J, fallback);
+    constexpr int threads_per_row = iter_k / QK_NVFP4;
+    constexpr int rows_per_warp   = warp_size / threads_per_row;
+    constexpr int sram_stride     = ggml_cuda_mmq_get_sram_stride(type, J, fallback);
+
+    constexpr int NULLGLASS_TILE_BYTES = 160;
+    constexpr int BLOCKS_PER_TILE      = 4;  // 256 elems / 64 elems per block
+
+    uint32_t * x_u32 = (uint32_t *) x_tile;
+
+    const int txi = threadIdx.x;
+    const int kbx = txi % threads_per_row;
+    const int row_in_warp = txi / threads_per_row;
+
+    // Convert block-level offset to tile+sub-block
+    const int kb_total    = kbx0 + kbx;
+    const int tile_base   = kb_total / BLOCKS_PER_TILE;
+    const int sub_block   = kb_total % BLOCKS_PER_TILE;
+
+    const int tiles_per_row = stride;
+
+    uint32_t * x_u32_scale = x_u32 + 64 + kbx;
+
+#pragma unroll
+    for (int i0 = 0; i0 < I; i0 += rows_per_warp * nwarps) {
+        int i = i0 + threadIdx.y * rows_per_warp + row_in_warp;
+
+        if constexpr (fallback) {
+            i = min(i, i_max);
+        }
+
+        const int tile_idx = tile_base + i * tiles_per_row;
+        const uint8_t * tile = (const uint8_t *)x + tile_idx * NULLGLASS_TILE_BYTES;
+
+        // Nibbles: 32 bytes per sub-block (64 elems * 4 bits = 32 bytes = 8 uint32)
+        const uint32_t * src_qs = (const uint32_t *)(tile + sub_block * 32);
+
+#pragma unroll
+        for (int sub = 0; sub < QK_NVFP4 / QK_NVFP4_SUB; ++sub) {
+            x_u32[i*sram_stride + 8*kbx + 2*sub + 0] = src_qs[2*sub + 0];
+            x_u32[i*sram_stride + 8*kbx + 2*sub + 1] = src_qs[2*sub + 1];
+        }
+
+        // Scales: 4 bytes of UE4M3 at tile offset 128 + sub_block*4
+        x_u32_scale[i*sram_stride] = *(const uint32_t *)(tile + 128 + sub_block * 4);
+    }
+}

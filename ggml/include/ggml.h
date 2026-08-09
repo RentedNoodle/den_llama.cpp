@@ -678,6 +678,8 @@ extern "C" {
         GGML_TENSOR_FLAG_COMPUTE = 16, // ...must be computed
     };
 
+#define GGML_TENSOR_FLAG_NULLGLASS 32   // NVFP4 stored as 160B NULLGLASS tiles (OMMA-native)
+
     enum ggml_tri_type {
         GGML_TRI_TYPE_UPPER_DIAG = 0,
         GGML_TRI_TYPE_UPPER      = 1,

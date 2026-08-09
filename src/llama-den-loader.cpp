@@ -127,6 +127,7 @@ struct den_tensor_desc {
     size_t      dst_size;           // byte size in GGML format (output buffer)
     uint32_t    hw_target;          // original .den hw_target
     bool        is_wh4;             // true if WH4 WHT-domain tensor
+    bool        is_nullglass;       // true if raw 160B NULLGLASS tiles (bypass GGUF conversion)
     int         scale_format;       // scale format from tile[148] bits 7-6
 };
 
@@ -365,8 +366,8 @@ void llama_den_loader::read_tensor_data(size_t i, void * dst, size_t size) const
 
     switch (t.hw_target) {
     case DEN_TARGET_NVFP4:
-        if (t.is_wh4) {
-            // WH4: keep raw tiles, copy as-is (WHT-domain OMMA dispatch handles them directly)
+        if (t.is_wh4 || t.is_nullglass) {
+            // WH4 / NULLGLASS: keep raw 160B tiles, copy as-is (OMMA dispatch handles them directly)
             size_t copy_size = std::min(size, t.src_size);
             memcpy(dst, pimpl_->data_region + t.src_offset, copy_size);
         } else {
@@ -387,6 +388,11 @@ void llama_den_loader::read_tensor_data(size_t i, void * dst, size_t size) const
         memset(dst, 0, size);
         break;
     }
+}
+
+bool llama_den_loader::get_tensor_is_nullglass(size_t i) const {
+    if (!pimpl_->is_open || i >= pimpl_->tensors.size()) return false;
+    return pimpl_->tensors[i].is_nullglass;
 }
 
 const std::string & llama_den_loader::get_arch_name() const {
@@ -758,18 +764,18 @@ bool llama_den_loader::impl::build_tensor_inventory() {
             }
 
             if (!desc.is_wh4) {
-                // Standard NULLGLASS → GGML conversion
-                // Elements per block: QK_NVFP4 = 64
-                // Bytes per block:   sizeof(block_nvfp4) = 36
-                // Total rows = ne[1] * ne[2] * ne[3] (flat row-major layout)
+                // Direct NULLGLASS path: keep raw 160B tiles, bypass GGUF block_nvfp4 conversion.
+                // The OMMA kernel reads tiles directly — no repack needed.
+                // dst_size = src_size (both are raw tile bytes).
                 int64_t K = desc.ne[0];
-                int64_t blocks_per_row = (K + QK_NVFP4 - 1) / QK_NVFP4;
-                if (blocks_per_row == 0) blocks_per_row = 1;
+                int64_t tiles_per_row = (K + DEN_NVFP4_TILE_ELEMS - 1) / DEN_NVFP4_TILE_ELEMS;
+                if (tiles_per_row == 0) tiles_per_row = 1;
                 int64_t total_rows = desc.ne[1];
                 if (desc.ne[2] > 0) total_rows *= desc.ne[2];
                 if (desc.ne[3] > 0) total_rows *= desc.ne[3];
                 if (total_rows <= 0) total_rows = 1;
-                desc.dst_size = (size_t)(blocks_per_row * sizeof(block_nvfp4) * total_rows);
+                desc.dst_size = (size_t)(tiles_per_row * DEN_NVFP4_TILE_SIZE * total_rows);
+                desc.is_nullglass = true;
             }
 
             n_nvfp4++;

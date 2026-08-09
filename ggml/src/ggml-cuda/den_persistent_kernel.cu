@@ -277,6 +277,11 @@ __global__ void pk_forward_pass(
 
             if (warp_id <= 1) {
                 // ═══ PRODUCER (warps 0-1): load NVFP4 tiles global→SMEM ═══
+                // ═══ NON-COHERENT: __ldg() bypasses L1, loads through
+                // ═══ read-only cache. Weight tiles streaming through L1
+                // ═══ would evict activation data (consumer warp uses L1).
+                // ═══ Producer uses .nc (non-coherent) path; consumer keeps
+                // ═══ normal .ca (cache-all) loads for activations.
                 // Strided: each SM processes every sm_count-th N-tile row
                 int bank = 0;
                 for (int kt = 0; kt < n_tiles_K; kt++) {
@@ -285,9 +290,10 @@ __global__ void pk_forward_pass(
                         tile_buf[bank].consumed = 0;
 
                         const uint8_t* src = tiles + ((size_t)nt * n_tiles_K + kt) * DEN_TILE_BYTES;
-                        // 2 warps × 32 threads = 64 threads → each loads 40/64*4 = 2.5 → 3 uint32
+                        const uint32_t* __restrict__ src32 = (const uint32_t*)src;
+                        // __ldg() = ld.global.nc.u32 — read-only cache, bypass L1
                         for (int i = tid; i < DEN_TILE_BYTES / 4; i += 64)
-                            tile_buf[bank].data[i] = ((const uint32_t*)src)[i];
+                            tile_buf[bank].data[i] = __ldg(&src32[i]);
 
                         __syncwarp();
                         if (lane_id == 0) tile_buf[bank].ready = 1;

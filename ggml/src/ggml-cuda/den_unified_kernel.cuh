@@ -60,6 +60,17 @@
 #define DEN_TILE_SCALES     16     // 1 UE4M3 byte per group
 #define DEN_TILE_NORM_OFF   144    // float32 tile_norm at bytes 144-147
 
+// ── Meta-tile dispatch/format flags (tile[148]) ──
+// Copied from dengine/include/den_format.h — tile metadata accessors
+#define DEN_TILE_FORMAT_MASK    0x0F  // bits 0-3
+#define DEN_TILE_FORMAT_HOLO    0x02  // Holographic (scales from parent)
+#define DEN_TILE_OPMASK         0xF0  // bits 7-4: full tile operation routing
+#define DEN_TILE_OP_SKIP        0x20  // skip this tile (no compute, zero contribution)
+
+// ── Meta-tile K-stride + holographic parent (tile[149..151]) ──
+#define DEN_TILE_KSTRIDE(t)     ((t[149]) ? (t[149]) : 4)  // 0→full
+#define DEN_TILE_HOLO_PARENT(t) (*(uint16_t*)((t) + 150))
+
 // E2M1 codebook (8 values, 3-bit index)
 __device__ __constant__ const float DEN_E2M1[8] = {
     0.0f, 0.5f, 1.0f, 1.5f, 2.0f, 3.0f, 4.0f, 6.0f

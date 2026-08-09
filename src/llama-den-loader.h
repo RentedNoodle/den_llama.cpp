@@ -171,11 +171,15 @@ public:
     size_t get_tensor_size(size_t i) const;
 
     // Read tensor data into dst, converting from .den format to GGML format.
-    // NVFP4: NULLGLASS 160B tiles → GGML block_nvfp4 blocks
+    // NVFP4: NULLGLASS 160B tiles → GGML block_nvfp4 blocks (or raw copy if is_nullglass)
     // BF16:  direct memcpy
     // F32:   direct memcpy
     // dst must be at least get_tensor_size(i) bytes.
     void read_tensor_data(size_t i, void * dst, size_t size) const;
+
+    // Returns true if this tensor is stored as raw 160B NULLGLASS tiles.
+    // Caller should set GGML_TENSOR_FLAG_NULLGLASS on the ggml_tensor if true.
+    bool get_tensor_is_nullglass(size_t i) const;
 
     // Architecture name string (e.g. "qwen35", "qwen36-moe")
     const std::string & get_arch_name() const;
