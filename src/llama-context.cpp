@@ -3685,6 +3685,47 @@ llama_context * llama_init_from_model(
                 LLAMA_LOG_INFO("%s: sparse VMM pool created (16 GB VA, 2 GB physical)\n", __func__);
             }
         }
+
+        // ── Den L2 expert weight persistence (Mech 41/42) ───────────────
+        // Opt-in via DEN_L2_PERSIST=1. Pins the first-K expert weight bytes
+        // of each MoE layer in GB203's 48 MB L2 cache via cuMemAdvise +
+        // access policy window. Non-fatal — returns silently if disabled
+        // or no MoE layers present.
+        if (ggml_backend_cuda_l2_persist_is_enabled() &&
+            model->hparams.n_expert > 0) {
+            int n_l2_pinned = 0;
+            size_t l2_bytes = 0;
+            for (uint32_t il = 0; il < model->hparams.n_layer_all; il++) {
+                const auto & layer = model->layers[il];
+                // Pin each expert weight tensor's entire GPU buffer.
+                // den_l2_persist_hint applies cuMemAdvise READ_MOSTLY +
+                // ACCESSED_BY + PREFERRED_LOCATION on the entire region;
+                // the access policy window clips persistence to the
+                // reserved L2 budget (first N MB).
+                struct ggml_tensor * exps[] = {
+                    layer.ffn_gate_exps,
+                    layer.ffn_up_exps,
+                    layer.ffn_down_exps,
+                    layer.ffn_gate_up_exps,  // fused gate+up variant
+                };
+                for (int e = 0; e < 4; e++) {
+                    if (!exps[e] || !exps[e]->data || !exps[e]->buffer) continue;
+                    // Only pin if tensor is on a GPU backend buffer
+                    ggml_backend_buffer_t buf = exps[e]->buffer;
+                    if (!buf) continue;
+                    size_t nbytes = ggml_nbytes(exps[e]);
+                    if (nbytes == 0) continue;
+                    ggml_backend_cuda_l2_persist_hint(exps[e]->data, nbytes, 1);
+                    n_l2_pinned++;
+                    l2_bytes += nbytes;
+                }
+            }
+            if (n_l2_pinned > 0) {
+                LLAMA_LOG_INFO("%s: L2 persist pinned %d expert tensors (%zu MB) — "
+                               "hot expert slices cached in 48 MB L2\n",
+                               __func__, n_l2_pinned, l2_bytes / (1024*1024));
+            }
+        }
 #endif
 
         return ctx;

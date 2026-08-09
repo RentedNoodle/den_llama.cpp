@@ -67,6 +67,15 @@ GGML_BACKEND_API size_t ggml_backend_cuda_sparse_vmm_committed(ggml_sparse_vmm_t
 GGML_BACKEND_API size_t ggml_backend_cuda_sparse_vmm_reserved(ggml_sparse_vmm_t pool);
 GGML_BACKEND_API ggml_backend_buffer_type_t ggml_backend_cuda_sparse_vmm_buffer_type(ggml_sparse_vmm_t pool);
 
+// L2 cache persistence for MoE expert weights (Mech 41/42 — den_l2_persist.cuh).
+// Advise CUDA driver to keep expert weight GPU memory in L2 cache.
+// Must be called after tensor data is uploaded to GPU.
+// ptr: GPU device pointer, bytes: region size, priority: 0=workspace, 1=weight
+GGML_BACKEND_API void ggml_backend_cuda_l2_persist_hint(void * ptr, size_t bytes, int priority);
+
+// Query whether L2 persistence is enabled (DEN_L2_PERSIST=1).
+GGML_BACKEND_API int ggml_backend_cuda_l2_persist_is_enabled(void);
+
 #ifdef  __cplusplus
 }
 #endif

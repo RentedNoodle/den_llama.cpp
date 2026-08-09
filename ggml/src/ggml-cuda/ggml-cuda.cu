@@ -3,6 +3,7 @@
 #include "ggml-backend-impl.h"
 
 #include "den_expert_stage.h"
+#include "den-l2-persist.cuh"
 
 #include "ggml-cuda/fattn-nvfp4-kv.cuh"
 
@@ -5628,7 +5629,24 @@ ggml_backend_t ggml_backend_cuda_init(int device) {
         /* .context = */ ctx,
     };
 
+    // ── Den L2 persistence init (Mech 41/42) ────────────────────────────
+    // Opt-in via DEN_L2_PERSIST=1. Non-fatal — inference continues unpinned
+    // if unsupported or disabled.
+    den_l2_persist_init();
+
     return cuda_backend;
+}
+
+// ── Den L2 persistence wrappers (Mech 41/42) ────────────────────────────
+// Thin wrappers that expose den-l2-persist.cuh (header-only) to llama-context.cpp
+// via ggml-cuda.h, keeping the CUDA include boundary clean.
+
+void ggml_backend_cuda_l2_persist_hint(void * ptr, size_t bytes, int priority) {
+    den_l2_persist_hint(ptr, bytes, priority);
+}
+
+int ggml_backend_cuda_l2_persist_is_enabled(void) {
+    return den_l2_persist_enabled();
 }
 
 GGML_BACKEND_DL_IMPL(ggml_backend_cuda_reg)
