@@ -66,6 +66,10 @@ enum slot_state {
 
 struct server_slot; // forward declaration
 
+// Den PAD feedback: engine→PAD. tg64→arousal, top1→dominance.
+// Read by cognitive daemons via extern or FFI. Zero-cost when not read.
+static struct { float P, A, D; } g_den_pad = {0.2f, 0.5f, 0.75f};
+
 struct server_batch {
     llama_batch batch;
     bool batch_rendered = false;
@@ -3849,6 +3853,11 @@ private:
             if (slot.task->params.sampling.n_probs > 0) {
                 populate_token_probs(slot, result, slot.task->params.post_sampling_probs, params_base.special, tok_idx);
             }
+
+            // Den PAD feedback: tg64→arousal, top1→dominance
+            { float tg64 = (float)(1e3 * slot.n_decoded / slot.t_token_generation);
+              g_den_pad.A = tanhf(tg64 / 100.0f);
+              g_den_pad.D = result.prob; }
 
             if (!process_token(result, slot)) {
                 // release slot because of stop condition
