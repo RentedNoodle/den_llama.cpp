@@ -311,6 +311,13 @@ def _get_lib():
     return _LIB
 
 
+# Precision tail: the latest N tokens in the NVFP4 KV cache are kept at F32.
+# Tokens older than the tail window are quantized to NVFP4 tiles. The gate
+# MUST decode past the tail to actually measure quantization error — otherwise
+# it's comparing F32-vs-F32 (false negative for bugs, false positive for quality).
+# Source: ggml-cuda/fattn-nvfp4-kv.cuh:51
+NVFP4_KV_TAIL_TOKENS = 256
+
 # ─────────────────────────────────────────────────────────────────────────────
 # MATH HELPERS
 # ─────────────────────────────────────────────────────────────────────────────
@@ -504,12 +511,13 @@ RESET = "\033[0m"
 
 def test_accuracy_kv(
     model_path: str,
-    n_tokens: int = 200,
+    n_tokens: int = 500,
     ngl: int = 99,
     n_threads: int = 6,
     expert_stage: bool = True,
     prompt: str = None,
     n_prompt_tokens: int = 0,
+    tail_tokens: int = NVFP4_KV_TAIL_TOKENS,
 ) -> dict:
     """
     In-process NVFP4 KV accuracy gate.
@@ -563,19 +571,38 @@ def test_accuracy_kv(
         lf32 = m.get_logits_f32()
         lnv = m.get_logits_nvfp4()
 
-        # Accumulators
-        klds = []
-        cosines = []
-        top1_matches = 0
-        total_positions = 0
+        # Accumulators — split by region
+        # Tail region: all KV entries are F32 (no NVFP4 tiles exist yet)
+        # Tile region: KV cache > tail_tokens, older entries quantized to NVFP4
+        klds_tail = []       # positions 0..(tail-1) — F32-vs-F32 (should be EXACT)
+        klds_tile = []       # positions tail..end — F32-vs-NVFP4 (ACTUAL TEST)
+        cosines_tail = []
+        cosines_tile = []
+        top1_tail = 0
+        top1_tile = 0
+        total_tail = 0
+        total_tile = 0
 
         # Track worst-case position for diagnostics
         worst_step = -1
         worst_kld = -1.0
 
+        n_prompt = len(prompt_tokens)
+        # First step where KV cache exceeds tail → tile region starts
+        first_tile_step = max(0, tail_tokens - n_prompt + 1)
+        boundary_printed = False
+
         print(f"\n  {CYAN}Running shared decode loop ({n_tokens} tokens)...{RESET}")
-        print(f"  {'Step':>6}  {'KLD':>10}  {'Cosine':>10}  {'Top-1':>6}  {'Token'}")
-        print(f"  {'-'*6}  {'-'*10}  {'-'*10}  {'-'*6}  {'-'*10}")
+        print(f"  {YELLOW}KV tail size : {tail_tokens} tokens (F32 precision){RESET}")
+        print(f"  {YELLOW}Prompt tokens: {n_prompt} (KV cache starts at {n_prompt} entries){RESET}")
+        if first_tile_step >= n_tokens:
+            print(f"  {RED}WARNING: All {n_tokens} steps within F32 tail — NVFP4 tiles never read!{RESET}")
+            print(f"  {RED}  Increase --tokens above {tail_tokens - n_prompt + 1} to reach tile region.{RESET}")
+        else:
+            print(f"  {CYAN}Steps 0..{first_tile_step - 1}: F32 tail (exact), "
+                  f"steps {first_tile_step}..{n_tokens - 1}: NVFP4 tiles (measured){RESET}")
+        print(f"  {'Step':>6}  {'Region':>7}  {'KLD':>10}  {'Cosine':>10}  {'Top-1':>6}  {'Token'}")
+        print(f"  {'-'*6}  {'-'*7}  {'-'*10}  {'-'*10}  {'-'*6}  {'-'*10}")
 
         for step in range(n_tokens):
             # Compute metrics at current position
@@ -588,11 +615,26 @@ def test_accuracy_kv(
             cos = cos_sim(lf32, lnv)
             top1_match = int(np.argmax(lf32)) == int(np.argmax(lnv))
 
-            klds.append(kld)
-            cosines.append(cos)
-            if top1_match:
-                top1_matches += 1
-            total_positions += 1
+            # Classify region: tail (all-F32 KV) vs tile (NVFP4 tiles exist).
+            # At step S the KV cache has n_prompt+S entries. If KV size ≤ tail,
+            # every entry is F32. Once it exceeds the tail, the oldest entries
+            # (positions 0..KV_size-tail-1) are NVFP4-quantized tiles.
+            is_tile_region = step >= first_tile_step
+            region_label = "TILE" if is_tile_region else "TAIL"
+
+            # Route metrics to the correct accumulator
+            if is_tile_region:
+                klds_tile.append(kld)
+                cosines_tile.append(cos)
+                if top1_match:
+                    top1_tile += 1
+                total_tile += 1
+            else:
+                klds_tail.append(kld)
+                cosines_tail.append(cos)
+                if top1_match:
+                    top1_tail += 1
+                total_tail += 1
 
             if kld > worst_kld:
                 worst_kld = kld
@@ -601,10 +643,16 @@ def test_accuracy_kv(
             # Greedy next token from F32 oracle
             next_token = int(np.argmax(lf32))
 
-            # Periodic progress
-            if step % 20 == 0 or step == n_tokens - 1:
+            # Periodic progress — mark the tail→tile boundary
+            if step % 20 == 0 or step == n_tokens - 1 or (is_tile_region and not boundary_printed):
+                if is_tile_region and not boundary_printed:
+                    print(f"  {CYAN}{'─'*60}{RESET}")
+                    print(f"  {CYAN}>>> TILE BOUNDARY — NVFP4 quantized KV now active <<<{RESET}")
+                    print(f"  {CYAN}{'─'*60}{RESET}")
+                    boundary_printed = True
                 marker = " *" if not top1_match else ""
-                print(f"  {step:>6}  {kld:>10.6f}  {cos:>10.6f}  {'Y' if top1_match else 'N':>6}{marker}  {next_token}")
+                print(f"  {step:>6}  {region_label:>7}  {kld:>10.6f}  {cos:>10.6f}  "
+                      f"{'Y' if top1_match else 'N':>6}{marker}  {next_token}")
 
             # Decode same token on both contexts
             m.decode_both([next_token])
@@ -614,30 +662,62 @@ def test_accuracy_kv(
             lnv = m.get_logits_nvfp4()
 
         # ── Compute summary metrics ──────────────────────────────────────
-        klds = np.array(klds)
-        cosines = np.array(cosines)
+        # TAIL metrics: F32-vs-F32 — should be EXACT (cos=1.0, KLD=0).0)
+        # These quantify numeric noise (CUDA nondeterminism), not NVFP4 quality.
+        klds_tail_a = np.array(klds_tail) if klds_tail else np.array([0.0])
+        cosines_tail_a = np.array(cosines_tail) if cosines_tail else np.array([1.0])
 
-        median_kld = float(np.median(klds))
-        p999_kld = float(np.percentile(klds, 99.9)) if len(klds) >= 1000 else float(np.max(klds))
-        p99_kld = float(np.percentile(klds, 99.0))
-        p95_kld = float(np.percentile(klds, 95.0))
-        mean_kld = float(np.mean(klds))
-        max_kld = float(np.max(klds))
+        # TILE metrics: F32-vs-NVFP4 — the ACTUAL GATE measurement.
+        klds_tile_a = np.array(klds_tile) if klds_tile else np.array([0.0])
+        cosines_tile_a = np.array(cosines_tile) if cosines_tile else np.array([1.0])
 
-        mean_cos = float(np.mean(cosines))
-        min_cos = float(np.min(cosines))
-        median_cos = float(np.median(cosines))
+        total_positions = total_tail + total_tile
 
-        top1_rate = top1_matches / total_positions if total_positions > 0 else 0.0
+        # Tile region is the real gate — only gate on tile metrics
+        if total_tile > 0:
+            median_kld = float(np.median(klds_tile_a))
+            p999_kld = float(np.percentile(klds_tile_a, 99.9)) if len(klds_tile_a) >= 1000 else float(np.max(klds_tile_a))
+            p99_kld = float(np.percentile(klds_tile_a, 99.0))
+            p95_kld = float(np.percentile(klds_tile_a, 95.0))
+            mean_kld = float(np.mean(klds_tile_a))
+            max_kld = float(np.max(klds_tile_a))
 
-        # ── Threshold checks ─────────────────────────────────────────────
-        passed_kld_median = median_kld < 0.001
-        passed_kld_tail = p999_kld < 0.1
-        passed_cos_mean = mean_cos >= 0.9995
-        passed_cos_min = min_cos >= 0.99
-        passed_top1 = top1_rate >= 0.95  # informational
+            mean_cos = float(np.mean(cosines_tile_a))
+            min_cos = float(np.min(cosines_tile_a))
+            median_cos = float(np.median(cosines_tile_a))
 
-        hard_metrics = [passed_kld_median, passed_kld_tail, passed_cos_mean, passed_cos_min]
+            top1_rate = top1_tile / total_tile
+        else:
+            # No tile positions — gate is meaningless (everything is F32 tail)
+            median_kld = 0.0
+            p999_kld = 0.0
+            p99_kld = 0.0
+            p95_kld = 0.0
+            mean_kld = 0.0
+            max_kld = 0.0
+            mean_cos = 1.0
+            min_cos = 1.0
+            median_cos = 1.0
+            top1_rate = 1.0
+
+        # ── Threshold checks (gated on TILE region only) ─────────────────
+        if total_tile > 0:
+            passed_kld_median = median_kld < 0.001
+            passed_kld_tail = p999_kld < 0.1
+            passed_cos_mean = mean_cos >= 0.9995
+            passed_cos_min = min_cos >= 0.99
+            passed_top1 = top1_rate >= 0.95  # informational
+            passed_sufficient_tokens = True
+        else:
+            # FAIL: never entered tile region — gate cannot measure NVFP4 quality
+            passed_kld_median = False
+            passed_kld_tail = False
+            passed_cos_mean = False
+            passed_cos_min = False
+            passed_top1 = False
+            passed_sufficient_tokens = False
+
+        hard_metrics = [passed_kld_median, passed_kld_tail, passed_cos_mean, passed_cos_min, passed_sufficient_tokens]
         all_hard_passed = all(hard_metrics)
 
         # ── Build result dict ────────────────────────────────────────────
@@ -665,6 +745,11 @@ def test_accuracy_kv(
                     "value": top1_rate, "passed": passed_top1,
                     "threshold": ">= 0.95 (info)", "display": f"{top1_rate:.4f}",
                 },
+                "sufficient_tokens": {
+                    "value": total_tile, "passed": passed_sufficient_tokens,
+                    "threshold": f"> 0 (tokens past tail={tail_tokens})",
+                    "display": f"{total_tile} tile positions",
+                },
             },
             "extra": {
                 "mean_kld": mean_kld,
@@ -675,7 +760,18 @@ def test_accuracy_kv(
                 "worst_step": worst_step,
                 "worst_kld": worst_kld,
             },
-            "n_prompt_tokens": len(prompt_tokens),
+            "regions": {
+                "tail_tokens": tail_tokens,
+                "tail_positions": total_tail,
+                "tile_positions": total_tile,
+                "tail_summary": f"positions 0-{total_tail - 1}" if total_tail > 0 else "none",
+                "tile_summary": f"positions {total_tail}-{total_tail + total_tile - 1}" if total_tile > 0 else "none",
+                "tail_kld_mean": float(np.mean(klds_tail_a)) if len(klds_tail_a) > 0 else 0.0,
+                "tile_kld_mean": float(np.mean(klds_tile_a)) if len(klds_tile_a) > 0 else 0.0,
+                "tail_cos_mean": float(np.mean(cosines_tail_a)) if len(cosines_tail_a) > 0 else 1.0,
+                "tile_cos_mean": float(np.mean(cosines_tile_a)) if len(cosines_tile_a) > 0 else 1.0,
+            },
+            "n_prompt_tokens": n_prompt,
             "n_tokens": n_tokens,
             "n_positions": total_positions,
         }
@@ -711,15 +807,43 @@ def _print_kv_result(result: dict):
 
     m = result["metrics"]
     extra = result.get("extra", {})
+    regions = result.get("regions", {})
 
-    # ── Results table ───────────────────────────────────────────────────
+    # ── Region summary ──────────────────────────────────────────────────
     print(f"\n{BOLD}{'='*70}{RESET}")
-    print(f"{BOLD}  RESULTS{RESET}")
+    print(f"{BOLD}  REGION BREAKDOWN{RESET}")
+    print(f"{'='*70}")
+
+    tail_summary = regions.get("tail_summary", "none")
+    tile_summary = regions.get("tile_summary", "none")
+    tail_pos = regions.get("tail_positions", 0)
+    tile_pos = regions.get("tile_positions", 0)
+    tail_kld = regions.get("tail_kld_mean", 0.0)
+    tile_kld = regions.get("tile_kld_mean", 0.0)
+    tail_cos = regions.get("tail_cos_mean", 1.0)
+    tile_cos = regions.get("tile_cos_mean", 1.0)
+
+    print(f"  TAIL region ({tail_pos} positions): {tail_summary}")
+    print(f"    F32 vs F32 — expected KLD=0, cos=1.0 (numeric noise only)")
+    print(f"    mean KLD  : {tail_kld:.8f}")
+    print(f"    mean cos  : {tail_cos:.8f}")
+    print(f"  TILE region ({tile_pos} positions): {tile_summary}")
+    print(f"    F32 vs NVFP4 — ACTUAL KV quantization measurement")
+    print(f"    mean KLD  : {tile_kld:.8f}")
+    print(f"    mean cos  : {tile_cos:.8f}")
+
+    if tile_pos == 0:
+        print(f"\n  {RED}{BOLD}CRITICAL: 0 tile positions — gate measured F32-vs-F32, NOT F32-vs-NVFP4!{RESET}")
+        print(f"  {RED}Increase --tokens to at least {regions.get('tail_tokens', 256) + 1} to reach tile region.{RESET}")
+
+    # ── Results table (TILE REGION ONLY) ────────────────────────────────
+    print(f"\n{BOLD}{'='*70}{RESET}")
+    print(f"{BOLD}  GATE RESULTS (TILE region — NVFP4 quantized KV){RESET}")
     print(f"{'='*70}")
     print(f"  {'Metric':<20} {'Value':<14} {'Threshold':<18} {'Status'}")
     print(f"  {'-'*20} {'-'*14} {'-'*18} {'-'*8}")
 
-    for name in ["median_kld", "p99.9_kld", "mean_cos", "min_cos", "top1_rate"]:
+    for name in ["median_kld", "p99.9_kld", "mean_cos", "min_cos", "top1_rate", "sufficient_tokens"]:
         d = m[name]
         status = f"{GREEN}PASS{RESET}" if d["passed"] else f"{RED}FAIL{RESET}"
         val_str = d.get("display", f"{d['value']:.6f}")
@@ -728,8 +852,8 @@ def _print_kv_result(result: dict):
     print(f"  {'-'*20} {'-'*14} {'-'*18} {'-'*8}")
 
     # Additional diagnostics
-    print(f"\n  {CYAN}Diagnostics:{RESET}")
-    print(f"    Positions evaluated : {result['n_positions']}")
+    print(f"\n  {CYAN}Diagnostics (TILE region only):{RESET}")
+    print(f"    Positions evaluated : {result['n_positions']} (tail={tail_pos}, tile={tile_pos})")
     print(f"    Prompt tokens       : {result['n_prompt_tokens']}")
     print(f"    Mean KLD            : {extra.get('mean_kld', 'N/A'):.6f}")
     print(f"    Max KLD             : {extra.get('max_kld', 'N/A'):.6f}")
@@ -783,8 +907,9 @@ Examples:
     )
     parser.add_argument("--model", default=None,
                         help="Path to model (NVFP4 or any quant). Auto-discovered if omitted.")
-    parser.add_argument("--tokens", type=int, default=200,
-                        help="Number of tokens to generate for comparison (default: 200)")
+    parser.add_argument("--tokens", type=int, default=500,
+                        help="Number of tokens to generate for comparison (default: 500). "
+                             "Must exceed DEN_NVFP4_KV_TAIL_TOKENS (256) to exercise quantized tiles.")
     parser.add_argument("--ngl", type=int, default=99,
                         help="GPU layers to offload. Use 0 for CPU-only (default: 99)")
     parser.add_argument("--threads", type=int, default=6,
@@ -795,6 +920,9 @@ Examples:
                         help="Custom prompt text (default: transformer architecture paragraph)")
     parser.add_argument("--prompt-tokens", type=int, default=0,
                         help="Truncate prompt to N tokens (0 = use all)")
+    parser.add_argument("--tail-tokens", type=int, default=NVFP4_KV_TAIL_TOKENS,
+                        help=f"Precision tail size in tokens (default: {NVFP4_KV_TAIL_TOKENS}). "
+                             "Must match DEN_NVFP4_KV_TAIL env var if overridden at build time.")
 
     args = parser.parse_args()
 
@@ -828,6 +956,7 @@ Examples:
         expert_stage=expert_stage,
         prompt=args.prompt,
         n_prompt_tokens=args.prompt_tokens,
+        tail_tokens=args.tail_tokens,
     )
 
     # Exit code

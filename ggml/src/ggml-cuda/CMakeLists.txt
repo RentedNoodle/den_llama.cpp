@@ -270,6 +270,10 @@ if (CUDAToolkit_FOUND)
     endif()
 
     target_compile_options(ggml-cuda PRIVATE "$<$<COMPILE_LANGUAGE:CUDA>:${CUDA_FLAGS}>" "$<$<COMPILE_LANGUAGE:CUDA>:-diag-suppress=177>")
+    # Enable device linking for OMMA PTX isolation (Rule 7.9):
+    # omma_fp4_device.cu is a standalone PTX-only TU; den_persistent_kernel.cu
+    # calls den_omma_fp4_k64() across TUs. Requires separable compilation.
+    set_property(TARGET ggml-cuda PROPERTY CUDA_SEPARABLE_COMPILATION ON)
 else()
     message(FATAL_ERROR "CUDA Toolkit not found")
 endif()
