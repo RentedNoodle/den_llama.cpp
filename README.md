@@ -18,21 +18,21 @@ What's built, tested, and verified:
 
 | What | Detail |
 |------|--------|
-| **NVFP4 KV cache** | KLD=0, cos=1.0 vs F32 reference through 64K context. 5 models pass. Hybrid K8V8 with 1024-token F32 precision tail. |
-| **OMMA.SF.16864 MoE FFN** | Native Blackwell tensor core path for expert weights. Role-gated: OMMA for MoE FFN only, soft-GEMV for attention/GDN. |
+| **NVFP4 KV cache** | [KLD](https://en.wikipedia.org/wiki/Kullback%E2%80%93Leibler_divergence)=0, [cos](https://en.wikipedia.org/wiki/Cosine_similarity)=1.0 vs F32 reference through 64K context. 5 models pass. Hybrid K8V8 with 1024-token F32 precision tail. |
+| **OMMA.SF.16864 MoE FFN** | Native Blackwell [tensor core](https://en.wikipedia.org/wiki/Tensor_core) path for [MoE](https://en.wikipedia.org/wiki/Mixture_of_experts) expert weights. Role-gated: OMMA for MoE FFN only, soft-GEMV for attention/GDN. |
 | **MoE expert offloading** | ncmoe: active expert set ~4.7 GB on 16 GB card. 3-tier staging (static/selective/deferred). |
-| **Sparse virtual memory** | cuMemAddressReserve + cuMemCreate + cuMemMap. Growth hooks wired. |
+| **Sparse virtual memory** | [cuMemAddressReserve](https://docs.nvidia.com/cuda/cuda-c-programming-guide/index.html#virtual-memory-management) + cuMemCreate + cuMemMap. Growth hooks wired. |
 | **Direct OMMA NULLGLASS path** | 160B tiles load byte-for-byte into OMMA B-fragment registers. Zero GGUF dequant overhead. |
 | **Precision tail** | 1024-token sliding F32 ring buffer. Runtime-configurable via `DEN_NVFP4_KV_TAIL`. |
 | **Accuracy gates** | In-process dual-context KLD/cosine measurement. 9 verification tools. Regression baseline DB. |
-| **Thread Block Clusters** | Confirmed on sm_120a (test_cluster_sm120.cu: 0xDEAD). TMA + mbarrier confirmed. |
+| **Thread Block Clusters** | Confirmed on sm_120a (test_cluster_sm120.cu: 0xDEAD). [TMA](https://docs.nvidia.com/cuda/cuda-c-programming-guide/index.html#tensor-memory-access) + mbarrier confirmed. |
 | **ccache + -j8** | 12 min full rebuild. CUDA_SEPARABLE_COMPILATION ON. |
 
 ## In development
 
 | What | Status |
 |------|--------|
-| **Conditional CUDA graphs for MoE** | Designed (91h estimate). Device-side expert dispatch without stream sync. |
+| **Conditional [CUDA](https://en.wikipedia.org/wiki/CUDA) graphs for MoE** | Designed (91h estimate). Device-side expert dispatch without stream sync. |
 | **Split-K soft-GEMV** | Designed. Target 80+ tok/s on GDN attention from 38.56 baseline. |
 | **128-token attention sink** | KVSink audit found zero sink tokens. Adding 128-token F32 sink buffer + sink bias. |
 | **Direct .den model loading** | Loader exists. Model-loading detection + precision tier dispatch TODO. |
@@ -52,7 +52,7 @@ These are architectural targets, not current capabilities:
 
 ## Silicon exploits
 
-This engine targets **one GPU** as a laboratory: RTX 5070 Ti / GB203 / 70 SMs / 16 GB GDDR7.
+This engine targets **one GPU** as a laboratory: RTX 5070 Ti / [GB203](https://en.wikipedia.org/wiki/Blackwell_(GPU_architecture)) / 70 SMs / 16 GB [GDDR7](https://en.wikipedia.org/wiki/GDDR7_SDRAM).
 
 Exploits that go beyond standard llama.cpp CUDA:
 
@@ -62,8 +62,8 @@ Exploits that go beyond standard llama.cpp CUDA:
 | Dual Copy Engine concurrent DMA | CE0 + CE1 | Infra ready |
 | L2 cache persistence (cuMemAdvise) | 48 MB L2 | Infra ready |
 | RT Core MoE expert routing | RT cores (70) | Tiers 2+3 ported |
-| CPU L3 Claustrum orchestrator | 96 MB AMD V-Cache | Running (0.8B model, 0 VRAM) |
-| PCIe 4.0 atomics (fetch_add/CAS) | PCIe BAR | Moderate |
+| CPU L3 Claustrum orchestrator | 96 MB AMD [3D V-Cache](https://en.wikipedia.org/wiki/3D_V-Cache) | Running (0.8B model, 0 VRAM) |
+| [PCIe 4.0](https://en.wikipedia.org/wiki/PCI_Express) atomics (fetch_add/CAS) | PCIe BAR | Moderate |
 | TMU texture cache weight prefetch | TMUs (280) | Lab |
 | Sparse VMM | GPU page tables | Core wired |
 
@@ -88,7 +88,7 @@ Exploits that go beyond standard llama.cpp CUDA:
 | NVFP4 weight inference (OMMA.SF.16864) | -- | Direct OMMA path, role-gated |
 | NVFP4 KV cache (K8V8 + precision tail) | -- | Matches F32 reference through 64K |
 | MoE expert offloading (ncmoe) | -- | Active set ~4.7 GB on 16 GB |
-| KVarN KV cache (variance-normalized) | -- | 2.72× coherent compression |
+| KVarN KV cache ([Hadamard](https://en.wikipedia.org/wiki/Hadamard_transform) pre-transform) | -- | 2.72× coherent compression |
 | RT Core expert routing | -- | BVH nearest-neighbor, tiers 2+3 |
 | Sparse virtual memory | -- | cuMemAddressReserve + cuMemCreate |
 | MTP K=2 spec decode | -- | Full transformer draft head |
