@@ -256,6 +256,22 @@ Research engine. Active development. Architecture deliberately ahead of implemen
 
 ---
 
+## Acknowledgments
+
+**[llama.cpp](https://github.com/ggerganov/llama.cpp)**: The foundation. ggml, CUDA backend, quantized inference.
+
+**[BeeLlama](https://github.com/Intelligent-Internet-Of-Engineers/beellama.cpp)**: KVarN KV cache, 1M context validation, precision tail research.
+
+**[ik_llama.cpp](https://github.com/ikawrakow/ik_llama.cpp)**: Expert offloading (ncmoe), speculative decode, NVFP4 inference patterns.
+
+**[sass-king](https://github.com/florianmattana/sass-king)**: Blackwell SASS corpus, OMMA instruction verification.
+
+**[quadbit](https://github.com/quadbit-org/quadbit)**: TMA + mbarrier sm_120a validation (BSD-3).
+
+**[BlackweLLM](https://github.com/blackwellm-org/blackwellm)**: CUDA graph research for LLM inference (MIT).
+
+---
+
 ## License
 
 MIT (same as upstream llama.cpp)
