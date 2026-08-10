@@ -1,65 +1,71 @@
-# den_llama.cpp — Neural engine beneath Project Den
+# den_llama.cpp
 
-**Blackwell-native inference and execution engine. NVFP4 OMMA. MoE offloading. Persistent state. The emerging Den Runtime.**
+### The execution substrate for Project Den
 
-This is the computational substrate for [Project Den](https://github.com/RentedNoodle/Project_Den) — an open research project exploring persistent AI cognition on local hardware.
+den_llama.cpp is the neural execution engine behind [Project Den](https://github.com/RentedNoodle/Project_Den), an open research project exploring persistent AI cognition on local hardware.
 
-It started as a llama.cpp fork. It's becoming something else.
+**Project Den is the cognitive architecture. This repo is the machine underneath it.**
 
-The immediate problem is practical: **how much persistent AI cognition fits in one consumer GPU?**
+It started as a llama.cpp fork. It's becoming a heterogeneous neural runtime — one that treats compute, memory, state, and model execution as a single schedulable system on constrained consumer hardware.
 
-The longer problem is bigger: **can one runtime provide the computational body for persistent machine cognition across language, vision, audio, diffusion, and 3D?**
-
-This repo is where that experiment meets silicon.
+The immediate question is practical: **how much persistent AI cognition fits in one consumer GPU?**
 
 ---
 
-## What makes it different
+## Demonstrated
 
-Not a collection of CUDA patches around llama.cpp. A research engine for:
+What's built, tested, and verified:
 
-- Blackwell-native tensor execution (OMMA.SF.16864)
-- NVFP4 inference — weights AND KV cache
-- MoE expert residency and offloading
-- GPU memory orchestration (sparse VMM, L2 persistence)
-- Persistent neural state across sessions
-- Native `.den` object format
-- Deterministic accuracy verification
-- Hardware-aware scheduling
+| What | Detail |
+|------|--------|
+| **NVFP4 KV cache** | KLD=0, cos=1.0 vs F32 reference through 64K context. 5 models pass. Hybrid K8V8 with 1024-token F32 precision tail. |
+| **OMMA.SF.16864 MoE FFN** | Native Blackwell tensor core path for expert weights. Role-gated: OMMA for MoE FFN only, soft-GEMV for attention/GDN. |
+| **MoE expert offloading** | ncmoe: active expert set ~4.7 GB on 16 GB card. 3-tier staging (static/selective/deferred). |
+| **Sparse virtual memory** | cuMemAddressReserve + cuMemCreate + cuMemMap. Growth hooks wired. |
+| **Direct OMMA NULLGLASS path** | 160B tiles load byte-for-byte into OMMA B-fragment registers. Zero GGUF dequant overhead. |
+| **Precision tail** | 1024-token sliding F32 ring buffer. Runtime-configurable via `DEN_NVFP4_KV_TAIL`. |
+| **Accuracy gates** | In-process dual-context KLD/cosine measurement. 9 verification tools. Regression baseline DB. |
+| **Thread Block Clusters** | Confirmed on sm_120a (test_cluster_sm120.cu: 0xDEAD). TMA + mbarrier confirmed. |
+| **ccache + -j8** | 12 min full rebuild. CUDA_SEPARABLE_COMPILATION ON. |
 
-Current implementation is heavily optimized for **RTX 5070 Ti / GB203 / sm_120a / 16 GB GDDR7**. That GPU is the laboratory, not just the deployment target.
+## In development
+
+| What | Status |
+|------|--------|
+| **Conditional CUDA graphs for MoE** | Designed (91h estimate). Device-side expert dispatch without stream sync. |
+| **Split-K soft-GEMV** | Designed. Target 80+ tok/s on GDN attention from 38.56 baseline. |
+| **128-token attention sink** | KVSink audit found zero sink tokens. Adding 128-token F32 sink buffer + sink bias. |
+| **Direct .den model loading** | Loader exists. Model-loading detection + precision tier dispatch TODO. |
+| **128K context validation** | Running. 1K–64K all pass. |
+
+## Deferred
+
+These are architectural targets, not current capabilities:
+
+- Multimodal heads (vision, audio, diffusion, 3D)
+- Full Den Runtime abstraction
+- Universal .den object format (tensors + graphs + state + pipelines)
+- Differential .den model updates
+- GPU System Processor (GSP) offload (no public SDK)
 
 ---
 
-## Architecture
+## Silicon exploits
 
-```
-                       Project Den
-                            │
-                     Cognitive Runtime
-                            │
-                   ┌────────▼────────┐
-                   │  Den Runtime    │
-                   │ tensors / state │
-                   │ memory / graphs │
-                   │ scheduling      │
-                   └────────┬────────┘
-                            │
-                  ┌─────────▼─────────┐
-                  │ den_llama.cpp     │
-                  │ current host      │
-                  └─────────┬─────────┘
-                            │
-             ┌──────────────┼──────────────┐
-             │              │              │
-           LLM             MoE         Future heads
-             │              │        vision/audio/3D...
-             └──────────────┼──────────────┘
-                            │
-                    Blackwell GPU
-```
+This engine targets **one GPU** as a laboratory: RTX 5070 Ti / GB203 / 70 SMs / 16 GB GDDR7.
 
-Long-term: separate reusable execution substrate from modality-specific heads.
+Exploits that go beyond standard llama.cpp CUDA:
+
+| Exploit | Hardware | Status |
+|---------|----------|--------|
+| OMMA.SF.16864 role-gated dispatch | Tensor cores (280) | Running |
+| Dual Copy Engine concurrent DMA | CE0 + CE1 | Infra ready |
+| L2 cache persistence (cuMemAdvise) | 48 MB L2 | Infra ready |
+| RT Core MoE expert routing | RT cores (70) | Tiers 2+3 ported |
+| CPU L3 Claustrum orchestrator | 96 MB AMD V-Cache | Running (0.8B model, 0 VRAM) |
+| PCIe 4.0 atomics (fetch_add/CAS) | PCIe BAR | Moderate |
+| TMU texture cache weight prefetch | TMUs (280) | Lab |
+| Sparse VMM | GPU page tables | Core wired |
 
 ---
 
@@ -67,8 +73,8 @@ Long-term: separate reusable execution substrate from modality-specific heads.
 
 | Vector | Metric | Status |
 |--------|--------|--------|
-| **Accuracy** | NVFP4 KV KLD=0, cos=1.0 vs F32 oracle | 1K–64K all CHECKMARK. 128K test running. |
-| **Speed** | 35B tg64 ≥ 184 tok/s | Golden rule CI guard (bench-guard.yml) |
+| **Accuracy** | NVFP4 KV matches F32 reference | 1K–64K CHECKMARK. 128K test running. |
+| **Speed** | 35B tg64 ≥ 184 tok/s | Golden rule CI guard |
 | **Context** | 256K target | Gated on attention sink + Sparse-VMM KV routing |
 
 **Gate tooling:** `tools/gate_accuracy_kv.py`, `tools/gate_accuracy_context_scaling.py`, `tools/coherence_gate.py`, `tools/regression_baseline.py`, `tools/repro_check.py`.
@@ -77,19 +83,18 @@ Long-term: separate reusable execution substrate from modality-specific heads.
 
 ## Capabilities vs upstream
 
-| Capability | Upstream | den_llama.cpp |
-|------------|:--------:|:-------------:|
-| NVFP4 weight inference (OMMA.SF.16864) | -- | Direct OMMA path, E2M1+UE4M3 |
-| NVFP4 KV cache (K8V8) | -- | KLD=0, cos=1.0 at 64K context |
+| Capability | Upstream | Here |
+|------------|:--------:|:----:|
+| NVFP4 weight inference (OMMA.SF.16864) | -- | Direct OMMA path, role-gated |
+| NVFP4 KV cache (K8V8 + precision tail) | -- | Matches F32 reference through 64K |
+| MoE expert offloading (ncmoe) | -- | Active set ~4.7 GB on 16 GB |
 | KVarN KV cache (variance-normalized) | -- | 2.72× coherent compression |
-| Expert offloading (ncmoe) | -- | Active set ~4.7 GB on 16 GB |
-| Precision tail (1024-token F32 ring) | -- | Accuracy gate at tile region |
-| Data-driven UE4M3 scale LUT | -- | Cap 1.5, measured 104K blocks |
+| RT Core expert routing | -- | BVH nearest-neighbor, tiers 2+3 |
+| Sparse virtual memory | -- | cuMemAddressReserve + cuMemCreate |
 | MTP K=2 spec decode | -- | Full transformer draft head |
-| ccache + -j8 | -- | 12 min full rebuild |
-| Windows native build | -- | pip nvcc 13.3 + Ninja + MSVC |
-| In-process KLD accuracy gate | -- | ctypes, 5 hard metrics |
-| Tri-vector gate | -- | Automated CI guard |
+| Thread Block Clusters + DSMEM | -- | Confirmed sm_120a |
+| In-process KLD accuracy gate | -- | ctypes dual-context, 9 tools |
+| Windows native build (pip nvcc 13.3) | -- | Ninja + MSVC, ccache |
 
 ---
 
@@ -127,39 +132,71 @@ Prerequisites: CUDA 13.3, sm_120a GPU (RTX 5070 Ti / GB203), Ninja, MSVC 2022.
 |----------|-------|
 | **GPU** | RTX 5070 Ti, GB203-300-A1, 70 SMs, 16 GB GDDR7 |
 | **CUDA** | 13.3.33, sm_120a |
-| **Tensor cores** | OMMA.SF.16864.F32.E2M1.E2M1.UE4M3.4X |
+| **Tensor cores** | 280 (70 SM × 4), OMMA.SF.16864.F32.E2M1.E2M1.UE4M3.4X |
 | **SMEM** | 99 KB/block |
-| **Key ISA** | cp.async.bulk.tensor (TMA), Thread Block Clusters (max 8), DSMEM |
-| **Confirmed** | Clusters (test_cluster_sm120.cu: 0xDEAD), TMA+mbarrier (quadbit production use) |
+| **L2 cache** | 48 MB (702 KB/SM) |
+| **Confirmed** | TMA (cp.async.bulk.tensor), Thread Block Clusters (max 8), DSMEM, barrier.cluster |
 
 ---
 
 ## .den Format
 
-`.den` is Den's native object format. Today it's an optimized NVFP4 weight container. The design extends further.
+`.den` is the project's native weight format — a 160B NULLGLASS tile container that maps directly to OMMA register fragments. GGUF stays for compatibility; `.den` is the native path.
 
-**Tile layout (160 bytes):**
-- 128B E2M1 nibbles (256 elements × 4 bits)
-- 16B UE4M3 block scales (one per 16-element group)
-- 4B tile RMS norm (float32)
-- 2B dispatch byte + K-stride
-- 2B holographic parent pointer (differential updates)
-- 8B reserved (CRC-8, generation-ID, precision tier)
+**Current (implemented):**
+- 128B E2M1 nibbles + 16B UE4M3 block scales + metadata
+- Direct OMMA NULLGLASS path: tiles load into registers with zero dequant
+- `.den` file loader with tensor inventory + slot mapping
 
-**Why .den:**
-- **OMMA-native.** Tiles decompress directly into tensor core register fragments. No GGUF block_nvfp4 repack. Zero CPU conversion at runtime.
-- **Per-tile precision tiers.** Each tile carries its own format dispatch byte — F16, BF16, NVFP4, Q8_0, or skip — selected at quantize time per tensor sensitivity.
-- **Differential updates.** Only changed tiles re-download between model versions. Holographic parent pointer chains tiles across versions. 14 GB → 700 MB delta.
-- **Universal object.** Future: compute graphs, KV state, LoRA adapters, modality descriptors in the same container. GGUF for weights; `.den` for everything else.
+**In progress:**
+- Model-loading autodetect (`.den` extension → route to den_loader)
+- Per-tensor precision tier dispatch (F16/Q8_0/NVFP4 per tensor sensitivity)
 
-**Integration:**
-- `DONE` — Direct OMMA NULLGLASS path (loads 160B tiles into OMMA registers)
-- `DONE` — `.den` loader with tensor inventory + slot mapping
-- `TODO` — Model-loading detection (`.den` extension → route to den_loader)
-- `TODO` — Per-tensor precision tier dispatch (F16/Q8_0/NVFP4)
-- `TODO` — Differential tile updates via holographic parent pointer
+**Future (designed, not built):**
+- Differential tile updates via holographic parent pointer
+- Universal object: compute graphs, KV state, adapters, modality descriptors
 
-GGUF stays for compatibility. `.den` is the performance path.
+---
+
+## Architecture
+
+```
+Project Den (cognitive thesis)
+      │
+      ▼
+Den Runtime (execution substrate — emerging)
+      │
+      ▼
+den_llama.cpp (current engine host — YOU ARE HERE)
+      │
+      ▼
+Blackwell GPU (GB203 / sm_120a / 16 GB)
+```
+
+Long-term: llama.cpp becomes a compatibility backend. Den Runtime becomes the host. `.den` becomes the universal object format. Today, den_llama.cpp is where the rubber meets silicon.
+
+---
+
+## Relationship to Project Den
+
+```
+Project_Den
+    │
+    ├── cognition (memory, identity, agency, affect)
+    ├── neural models (Cortex 35B, Claustrum 0.8B, Draft 2B)
+    └── multimodal systems (designed, deferred)
+              │
+              ▼
+       den_llama.cpp  ← YOU ARE HERE
+              │
+              ├── tensor execution (OMMA, soft-GEMV)
+              ├── KV state (NVFP4 cache)
+              ├── MoE residency (expert staging)
+              ├── memory (sparse VMM, L2 persistence)
+              └── GPU scheduling
+```
+
+Project Den asks the cognitive question. This repo builds the body. Eventually the boundary moves — that's intentional.
 
 ---
 
@@ -167,7 +204,7 @@ GGUF stays for compatibility. `.den` is the performance path.
 
 | Document | Purpose |
 |----------|---------|
-| [docs/VERIFICATION.md](docs/VERIFICATION.md) | NVFP4 KV accuracy methodology, context scaling results, regression infra |
+| [docs/VERIFICATION.md](docs/VERIFICATION.md) | NVFP4 KV methodology, context scaling results, regression infra |
 | [AGENTS.md](AGENTS.md) | Contributor guidelines |
 
 ---
@@ -178,11 +215,11 @@ GGUF stays for compatibility. `.den` is the performance path.
 den_llama.cpp
 ├── ggml/src/ggml-cuda/
 │   ├── fattn-nvfp4-kv.cu/cuh          # NVFP4 KV cache: quant kernels + fused attention
-│   ├── mma.cuh                         # OMMA PTX instrinsics (mma.sync.kind::mxf4nvf4.4X)
+│   ├── mma.cuh                         # OMMA PTX intrinsics
 │   ├── mmq.cuh                         # Quantized matmul dispatch (NVFP4 → OMMA)
-│   ├── den-rt-expert-router.cu/cuh     # RT Core expert router
-│   ├── den_expert_stage.cu             # CPU L3-resident expert staging + Markov predictor
-│   ├── sparse-vmm.cu/cuh               # Sparse VMM: cuMemAddressReserve + cuMemCreate + cuMemMap
+│   ├── den-rt-expert-router.cu/cuh     # RT Core expert router (BVH, tiers 2+3)
+│   ├── den_expert_stage.cu             # CPU L3 expert staging + Markov predictor
+│   ├── sparse-vmm.cu/cuh               # cuMemAddressReserve + cuMemCreate + cuMemMap
 │   └── topk-moe.cu                     # Warp-level top-K MoE gating
 ├── src/
 │   ├── llama-context.cpp               # Auto-enable NVFP4, sparse VMM, memory hooks
@@ -196,40 +233,12 @@ den_llama.cpp
 │   ├── repro_check.py                  # One-shot reproducibility check
 │   ├── test_needle_retrieval.py        # Needle-in-haystack functional test
 │   ├── test_negative_gate.py           # Corruption rejection gate
-│   ├── measure_vram_context.py         # VRAM compression metering
-│   └── nsys_profile.bat               # Nsight Systems profiling
+│   └── measure_vram_context.py         # VRAM compression metering
 ├── docs/
 │   └── VERIFICATION.md                 # Full verification methodology
 └── .github/workflows/
     └── bench-guard.yml                 # CI: tg64 < 184 → fail
 ```
-
----
-
-## Relationship to Project Den
-
-```
-Project_Den
-    │
-    ├── cognition
-    ├── memory
-    ├── identity
-    ├── agency
-    ├── relationships
-    └── multimodal systems
-              │
-              ▼
-       den_llama.cpp  ← YOU ARE HERE
-              │
-              ├── tensors
-              ├── kernels
-              ├── KV state
-              ├── MoE
-              ├── memory
-              └── GPU execution
-```
-
-Project Den asks the question. The engine builds the body. Eventually these boundaries move. That's intentional.
 
 ---
 
