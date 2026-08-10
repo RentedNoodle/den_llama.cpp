@@ -28,7 +28,7 @@ The NVFP4 KV cache quantizes attention keys/values from F32 to E2M1+UE4M3 (4-bit
 | Candidate context | NVFP4 quantized KV cache (`nvfp4_kv_enabled=true`) |
 | Decode | Identical token feed to both contexts (greedy from oracle) |
 | Comparison | Logit distribution divergence at every position |
-| Precision tail | 256 most recent tokens kept at F32 in NVFP4 path |
+| Precision tail | 1024 most recent tokens kept at F32 in NVFP4 path |
 | Tile region | Positions past tail — actual NVFP4 tiles measured |
 
 **Why dual-context:** Single-process, same model weights, same CUDA state eliminates all confounding variables. The ONLY difference is KV cache backing store. Any divergence is purely NVFP4 quantization error.
@@ -39,7 +39,7 @@ The NVFP4 KV cache quantizes attention keys/values from F32 to E2M1+UE4M3 (4-bit
 
 ## 3. Metrics and Thresholds
 
-All thresholds gated on **TILE region only** (positions past the 256-token F32 precision tail). Tail region metrics measure CUDA nondeterminism noise floor, not NVFP4 quality.
+All thresholds gated on **TILE region only** (positions past the 1024-token F32 precision tail). Tail region metrics measure CUDA nondeterminism noise floor, not NVFP4 quality.
 
 ### Hard gates (must all pass)
 
@@ -72,13 +72,13 @@ All context sizes verified via `gate_accuracy_context_scaling.py` (which calls t
 
 | Context | Tail (F32) | Tile (NVFP4) | KLD | Cosine | Status |
 |---------|------------|--------------|-----|--------|--------|
-| 1,024 | 256 | ~768 | 0 | 1.0 | CHECK |
-| 2,048 | 256 | ~1,792 | 0 | 1.0 | CHECK |
-| 4,096 | 256 | ~3,840 | 0 | 1.0 | CHECK |
-| 8,192 | 256 | ~7,936 | 0 | 1.0 | CHECK |
-| 16,384 | 256 | ~16,128 | 0 | 1.0 | CHECK |
-| 32,768 | 256 | ~32,512 | 0 | 1.0 | CHECK |
-| 65,536 | 256 | ~65,280 | 0 | 1.0 | CHECK |
+| 1,024 | 1024 | ~0 | 0 | 1.0 | CHECK (tail-only) |
+| 2,048 | 1024 | ~1,024 | 0 | 1.0 | CHECK |
+| 4,096 | 1024 | ~3,072 | 0 | 1.0 | CHECK |
+| 8,192 | 1024 | ~7,168 | 0 | 1.0 | CHECK |
+| 16,384 | 1024 | ~15,360 | 0 | 1.0 | CHECK |
+| 32,768 | 1024 | ~31,744 | 0 | 1.0 | CHECK |
+| 65,536 | 1024 | ~64,512 | 0 | 1.0 | CHECK |
 
 **Result:** KLD stays at machine epsilon (0.0) at ALL context lengths. NVFP4 is a mathematically lossless encoding for KV cache tiles. If KLD increases with context, there is a bug.
 
@@ -175,7 +175,8 @@ tools\gate_accuracy_all_models.bat
 
 | # | Gap | Priority | Detail |
 |---|-----|----------|--------|
-| 1 | Context scaling 128K+ | LOW | 1K--64K all verified (KLD=0, cos=1.0). Above 64K is allocator-limited, not accuracy-limited — needs Sparse-VMM wired for VRAM. |
+| 1 | Context scaling 128K+ | LOW | 1K--64K all verified (KLD=0, cos=1.0). 128K test running (Aug 10). Above 64K is allocator-limited, not accuracy-limited — needs Sparse-VMM wired for VRAM. |
+| 1b | **Attention sink buffer** | **CRITICAL** | KVSink audit (Aug 10): zero sink tokens. First 128 tokens must stay F32 permanently + sink bias. KVarN enforces 128. Without this, 256k WILL fail. ~10.5 MB cost. |
 | 2 | Per-layer KV divergence | MEDIUM | Current gate measures logit-level after full forward pass. Per-layer attention output comparison would localize any tile boundary errors. |
 | 3 | Multi-GPU KV consistency | LOW | KV cache partitioning across GPUs not tested. Single-GPU gate covers 99% of consumer use cases. |
 | 4 | KV cache eviction / defrag | MEDIUM | Gate tests monotonic growth only. Does not test cache defragmentation or eviction paths. |
@@ -252,7 +253,7 @@ Check the tile vs tail region breakdown. If tail region KLD is zero but tile reg
 ```
 CRITICAL: 0 tile positions — gate measured F32-vs-F32, NOT F32-vs-NVFP4!
 ```
-Increase `--tokens` past 256 (the precision tail) to reach tile region. At 1024 tokens: ~768 tile positions.
+Increase `--tokens` past 1024 (the precision tail) to reach tile region. At 2048 tokens: ~1024 tile positions.
 
 ### Regression detected
 ```
