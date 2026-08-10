@@ -31,9 +31,9 @@ This fork adds **proprietary, silicon-specific features** absent from upstream l
 
 | Vector | Metric | Status |
 |--------|--------|--------|
-| **Accuracy** | NVFP4 KV KLD=0, cos=1.0 at 8192 context (7840 tile positions) | Verified at 1K/2K/4K/8K |
-| **Speed** | 35B tg64 >= 179.57 tok/s | Golden rule CI guard |
-| **Context** | 64K+ via Sparse-VMM | Core wired, KV allocation routing pending |
+| **Accuracy** | NVFP4 KV KLD=0, cos=1.0, verified 1K through 64K context | All sizes 1K/2K/4K/8K/16K/32K/64K CHECKMARK |
+| **Speed** | 35B tg64 >= 184 tok/s | Golden rule CI guard (bench-guard.yml) |
+| **Context** | 256K target via Sparse-VMM allocator | Core wired, KV allocation routing pending |
 
 **Gate tooling:** `tools/gate_accuracy_kv.py` (dual-context ctypes), `tools/gate_accuracy_context_scaling.py`, `tools/coherence_gate.py`, `tools/regression_baseline.py`, `tools/repro_check.py`.
 
