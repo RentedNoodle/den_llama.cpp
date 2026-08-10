@@ -376,6 +376,186 @@ __device__ static void kv_dequantize_tile_k8(
     }
 }
 
+// ═══════════════════════════════════════════════════════════
+// K6 tile: uint6 quantize / dequantize (K6V4 Asymmetric KV)
+// 256 elements × 6 bits = 1536 bits = 192 bytes, packed as
+// 4 elem → 3 bytes (4×6bit = 24bit = 3 bytes).
+// Range: unsigned 0-63. Signed during dequant via bias 31.5.
+// V tile: unchanged 4-bit E2M1 (existing K4V4 tile, 160B).
+// ═══════════════════════════════════════════════════════════
+
+// Pack 4 uint6 elements → 3 bytes
+__device__ __forceinline__ void kv_pack_uint6_4to3(
+    const uint8_t e[4], uint8_t packed[3])
+{
+    packed[0] = (e[0] & 0x3F) | ((e[1] & 0x03) << 6);
+    packed[1] = ((e[1] >> 2) & 0x0F) | ((e[2] & 0x0F) << 4);
+    packed[2] = ((e[2] >> 4) & 0x03) | ((e[3] & 0x3F) << 2);
+}
+
+// Unpack 3 bytes → 4 uint6 elements
+__device__ __forceinline__ void kv_unpack_uint6_3to4(
+    const uint8_t packed[3], uint8_t e[4])
+{
+    e[0] = packed[0] & 0x3F;
+    e[1] = ((packed[0] >> 6) & 0x03) | ((packed[1] & 0x0F) << 2);
+    e[2] = ((packed[1] >> 4) & 0x0F) | ((packed[2] & 0x03) << 4);
+    e[3] = (packed[2] >> 2) & 0x3F;
+}
+
+__device__ static void kv_quantize_tile_k6(
+    const float * __restrict__ vec,
+    uint8_t * tile,
+    int head_dim,
+    unsigned int * hist = NULL)
+{
+    (void)hist; // K6 uses unsigned range — E2M1 scale hist not meaningful here
+
+    // Zero tile
+    for (int i = 0; i < DEN_NVFP4_KV_TILE_BYTES_K6; i += 16) {
+        if (i + 16 <= DEN_NVFP4_KV_TILE_BYTES_K6)
+            *(uint4 *)(tile + i) = make_uint4(0, 0, 0, 0);
+    }
+
+    int n_groups = (head_dim + DEN_NVFP4_KV_TILE_GROUP_SZ - 1) / DEN_NVFP4_KV_TILE_GROUP_SZ;
+    if (n_groups > DEN_NVFP4_KV_TILE_GROUPS) n_groups = DEN_NVFP4_KV_TILE_GROUPS;
+
+    double sum_sq = 0.0;
+    for (int i = 0; i < head_dim; i++)
+        sum_sq += (double)vec[i] * (double)vec[i];
+
+    // 6-bit unsigned range: 0-63 (64 levels). Scale = max_abs/63.
+    // Quant: u6 = round((val + 6*scale) / (12*scale) * 63) clamped to [0,63]
+    //        u6 = round((val/scale + 6.0) / 12.0 * 63.0)
+    // Signed val in [-6*scale, +6*scale] → u6 in [0, 63]
+    for (int g = 0; g < n_groups; g++) {
+        int blk_start = g * DEN_NVFP4_KV_TILE_GROUP_SZ;
+        int blk_end = blk_start + DEN_NVFP4_KV_TILE_GROUP_SZ;
+        if (blk_end > head_dim) blk_end = head_dim;
+        int n_in_blk = blk_end - blk_start;
+
+        float max_abs = 0.0f;
+        for (int e = 0; e < n_in_blk; e++) {
+            float av = vec[blk_start + e];
+            if (av < 0.0f) av = -av;
+            if (av > max_abs) max_abs = av;
+        }
+
+        uint8_t scale_code = 0;
+        if (max_abs >= 1e-10f) {
+            float ideal_scale = max_abs / 63.0f;  // K6: unsigned range 0-63
+            float best_err = fabsf(ideal_scale - kv_ue4m3_lut[1]);
+            uint8_t best_code = 1;
+            #pragma unroll
+            for (int c = 2; c < 16; c++) {
+                float err = fabsf(ideal_scale - kv_ue4m3_lut[c]);
+                if (err < best_err) { best_err = err; best_code = (uint8_t)c; }
+            }
+            scale_code = best_code;
+        }
+
+        tile[g] = scale_code;
+        float scale = kv_ue4m3_lut[scale_code];
+
+        // Quantize all 16 elements, then pack as 4×3byte groups
+        uint8_t u6_buf[DEN_NVFP4_KV_TILE_GROUP_SZ];
+        for (int e = 0; e < n_in_blk; e++) {
+            float val = vec[blk_start + e];
+            // Map signed [-6*scale, +6*scale] → unsigned [0, 63]
+            float normed = (scale > 1e-10f) ? (val / (scale * 6.0f)) : 0.0f;
+            if (normed >  1.0f) normed =  1.0f;
+            if (normed < -1.0f) normed = -1.0f;
+            // [-1, +1] → [0, 63]
+            int u6 = (int)((normed + 1.0f) * 31.5f + 0.5f);
+            if (u6 < 0)  u6 = 0;
+            if (u6 > 63) u6 = 63;
+            u6_buf[e] = (uint8_t)u6;
+        }
+
+        // Pad unused elements to zero
+        for (int e = n_in_blk; e < DEN_NVFP4_KV_TILE_GROUP_SZ; e++)
+            u6_buf[e] = 0;
+
+        // Pack 16 elements → 12 bytes (4× 4elem→3byte groups)
+        int byte_base = DEN_NVFP4_KV_TILE_SCALES + g * 12;
+        for (int sg = 0; sg < 4; sg++) {
+            kv_pack_uint6_4to3(&u6_buf[sg * 4], &tile[byte_base + sg * 3]);
+        }
+    }
+
+    float tile_norm = (head_dim > 0) ? (float)sqrt(sum_sq / head_dim) : 1.0f;
+    if (tile_norm < 1e-10f) tile_norm = 1.0f;
+    *(float *)(tile + DEN_NVFP4_KV_TILE_NORM_OFF_K6) = tile_norm;
+    tile[DEN_NVFP4_KV_TILE_DISPATCH_K6] = DEN_NVFP4_KV_META_K6V4;
+    tile[DEN_NVFP4_KV_TILE_KSTRIDE_K6]  = (head_dim + 63) / 64;
+}
+
+// Dequantize single element from K6 tile (inline for attention).
+// Signed output: val = (u6 - 31.5f) / 31.5f * 6.0f * scale
+// Range: [-6*scale, +6*scale]
+__device__ __forceinline__ float kv_dequantize_element_k6(
+    const uint8_t * __restrict__ tile,
+    int elem_idx)
+{
+    int group    = elem_idx / DEN_NVFP4_KV_TILE_GROUP_SZ;
+    int in_group = elem_idx % DEN_NVFP4_KV_TILE_GROUP_SZ;
+
+    float scale = kv_ue4m3_lut[tile[group] & 0x0F];
+
+    // 16 elems per group, 4 sub-groups × 4 elem → 12 bytes
+    int sg       = in_group / 4;           // sub-group 0-3
+    int sg_off   = in_group % 4;           // element 0-3 within sub-group
+    int byte_off = DEN_NVFP4_KV_TILE_SCALES + group * 12 + sg * 3;
+
+    uint8_t packed[3] = { tile[byte_off], tile[byte_off+1], tile[byte_off+2] };
+    uint8_t e[4];
+    kv_unpack_uint6_3to4(packed, e);
+
+    float val = ((float)(int)e[sg_off] - 31.5f) / 31.5f * 6.0f;
+    return val * scale;
+}
+
+// K6 tile: dequantize entire 224-byte tile → float vector
+__device__ static void kv_dequantize_tile_k6(
+    const uint8_t * __restrict__ tile,
+    float * vec,
+    int head_dim)
+{
+    int n_groups = (head_dim + DEN_NVFP4_KV_TILE_GROUP_SZ - 1) / DEN_NVFP4_KV_TILE_GROUP_SZ;
+    if (n_groups > DEN_NVFP4_KV_TILE_GROUPS) n_groups = DEN_NVFP4_KV_TILE_GROUPS;
+
+    for (int g = 0; g < n_groups; g++) {
+        float scale = kv_ue4m3_lut[tile[g] & 0x0F];
+        int blk_start = g * DEN_NVFP4_KV_TILE_GROUP_SZ;
+        int blk_end   = blk_start + DEN_NVFP4_KV_TILE_GROUP_SZ;
+        if (blk_end > head_dim) blk_end = head_dim;
+
+        for (int e = 0; e < blk_end - blk_start; e++) {
+            int sg     = e / 4;
+            int sg_off = e % 4;
+            int byte_off = DEN_NVFP4_KV_TILE_SCALES + g * 12 + sg * 3;
+            uint8_t packed[3] = { tile[byte_off], tile[byte_off+1], tile[byte_off+2] };
+            uint8_t eu[4];
+            kv_unpack_uint6_3to4(packed, eu);
+            float val = ((float)(int)eu[sg_off] - 31.5f) / 31.5f * 6.0f;
+            vec[blk_start + e] = val * scale;
+        }
+    }
+}
+
+// Kernel: dequantize 224-byte K6 tiles → float [n_kv_heads, head_dim]
+__global__ void kv_dequantize_kernel_k6(
+    const uint8_t * __restrict__ d_tiles,
+    float         * __restrict__ d_vec,
+    int n_kv_heads, int head_dim)
+{
+    int h = blockIdx.x * blockDim.x + threadIdx.x;
+    if (h >= n_kv_heads) return;
+    const uint8_t * tile = d_tiles + (size_t)h * DEN_NVFP4_KV_TILE_BYTES_K6;
+    float * vec = d_vec + (size_t)h * head_dim;
+    kv_dequantize_tile_k6(tile, vec, head_dim);
+}
+
 // Kernel: dequantize 288-byte k8 tiles → float [n_kv_heads, head_dim]
 __global__ void kv_dequantize_kernel_k8(
     const uint8_t * __restrict__ d_tiles,
@@ -436,6 +616,8 @@ __global__ void kv_nvfp4_attention_kernel(
     const uint8_t * __restrict__ d_k_tiles,
     const uint8_t * __restrict__ d_v_tiles,
     float * __restrict__ d_output,
+    float * __restrict__ d_hot_scores,
+    int   * __restrict__ d_hot_positions,
     int n_heads, int n_kv_heads, int head_dim,
     int seq_len, int max_seq, int tail_tokens,
     int thrift_attention)
@@ -451,8 +633,17 @@ __global__ void kv_nvfp4_attention_kernel(
     // when n_heads % n_kv_heads == 0, but explicit about the grouping.
     const int gqa_ratio = (n_kv_heads > 0) ? (n_heads / n_kv_heads) : 1;
     int kv_head = (gqa_ratio <= 1) ? head : (head / gqa_ratio);
-    int k_tile_bytes = thrift_attention ? DEN_NVFP4_KV_TILE_BYTES_K8 : DEN_NVFP4_KV_TILE_BYTES;
-    int v_tile_bytes = thrift_attention ? DEN_NVFP4_KV_TILE_BYTES_K8 : DEN_NVFP4_KV_TILE_BYTES;
+    int k_tile_bytes, v_tile_bytes;
+    if (thrift_attention == 2) { // K6V4: K=6-bit packed, V=4-bit E2M1
+        k_tile_bytes = DEN_NVFP4_KV_TILE_BYTES_K6;
+        v_tile_bytes = DEN_NVFP4_KV_TILE_BYTES;
+    } else if (thrift_attention) { // K8V8
+        k_tile_bytes = DEN_NVFP4_KV_TILE_BYTES_K8;
+        v_tile_bytes = DEN_NVFP4_KV_TILE_BYTES_K8;
+    } else { // K4V4
+        k_tile_bytes = DEN_NVFP4_KV_TILE_BYTES;
+        v_tile_bytes = DEN_NVFP4_KV_TILE_BYTES;
+    }
 
     // PRECISION TAIL: the latest `tail_tokens` cache positions live at F32 in
     // d_k_tail/d_v_tail (slot = position % tail_tokens). Positions older than the
@@ -468,6 +659,22 @@ __global__ void kv_nvfp4_attention_kernel(
     float * smem_scores = smem;
     float * warp_sums   = smem + seq_len;
 
+    // ── Register-Resident Hot-Token State ──
+    // Thread 0 loads the previous step's top-4 attention scores + positions
+    // into registers. These are tiny (8 values), no shared memory needed.
+    // Used for: (1) validation that hot tokens are stable across steps,
+    // (2) future priority-read path for K/V register cache.
+    int   prev_hot_pos[4]   = {0, 0, 0, 0};
+    float prev_hot_score[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+    if (tid == 0 && d_hot_positions && seq_len > 1) {
+        int off = head * DEN_NVFP4_KV_REGISTER_HOT_TOKENS;
+        #pragma unroll
+        for (int i = 0; i < DEN_NVFP4_KV_REGISTER_HOT_TOKENS; i++) {
+            prev_hot_pos[i]   = d_hot_positions[off + i];
+            prev_hot_score[i] = d_hot_scores[off + i];
+        }
+    }
+
     // Phase 1: Q @ K^T for all cached tokens
     for (int t = 0; t < seq_len; t++) {
         float k_val;
@@ -479,7 +686,9 @@ __global__ void kv_nvfp4_attention_kernel(
             // Old context: NVFP4 tile at absolute position t.
             const uint8_t * tile = d_k_tiles +
                 ((size_t)t * n_kv_heads + kv_head) * k_tile_bytes;
-            if (thrift_attention) {
+            if (thrift_attention == 2) {
+                k_val = kv_dequantize_element_k6(tile, tid);
+            } else if (thrift_attention) {
                 k_val = kv_dequantize_element_k8(tile, tid);
             } else {
                 k_val = kv_dequantize_element(tile, tid);
@@ -505,7 +714,10 @@ __global__ void kv_nvfp4_attention_kernel(
     }
     __syncthreads();
 
-    // Phase 2: Softmax (single-threaded)
+    // Phase 2: Softmax (single-threaded) + Register-Resident Hot-Token Tracking
+    // Thread 0: compute softmax, then find the 4 tokens with highest
+    // attention mass. These "hot" positions persist to the next decode step
+    // via the d_hot_scores/d_hot_positions GPU buffer (loaded into regs above).
     if (tid == 0) {
         float mx = smem_scores[0];
         for (int t = 1; t < seq_len; t++)
@@ -520,6 +732,41 @@ __global__ void kv_nvfp4_attention_kernel(
         float inv_sum = 1.0f / sum_exp;
         for (int t = 0; t < seq_len; t++)
             smem_scores[t] *= inv_sum;
+
+        // ── Register-Resident Hot-Token Tracking ──
+        // Find top-K attention scores via register-resident insertion sort.
+        // 4 floats + 4 ints = 8 registers on thread 0 (negligible).
+        int   hot_pos[4]   = {0, 0, 0, 0};
+        float hot_score[4] = {0.0f, 0.0f, 0.0f, 0.0f};
+        for (int t = 0; t < seq_len; t++) {
+            float score = smem_scores[t];
+            // Insertion sort into descending top-4 (register only, no smem).
+            #pragma unroll
+            for (int i = 0; i < DEN_NVFP4_KV_REGISTER_HOT_TOKENS; i++) {
+                if (score > hot_score[i]) {
+                    // Shift tail down by 1.
+                    #pragma unroll
+                    for (int j = DEN_NVFP4_KV_REGISTER_HOT_TOKENS - 1; j > i; j--) {
+                        hot_score[j] = hot_score[j - 1];
+                        hot_pos[j]   = hot_pos[j - 1];
+                    }
+                    hot_score[i] = score;
+                    hot_pos[i]   = t;
+                    break;
+                }
+            }
+        }
+
+        // Write hot tokens to global buffer for NEXT decode step.
+        // This is the only global write — everything above was register-only.
+        if (d_hot_positions) {
+            int off = head * DEN_NVFP4_KV_REGISTER_HOT_TOKENS;
+            #pragma unroll
+            for (int i = 0; i < DEN_NVFP4_KV_REGISTER_HOT_TOKENS; i++) {
+                d_hot_positions[off + i] = hot_pos[i];
+                d_hot_scores[off + i]    = hot_score[i];
+            }
+        }
     }
     __syncthreads();
 
@@ -535,7 +782,9 @@ __global__ void kv_nvfp4_attention_kernel(
             // Old context: NVFP4 tile at absolute position t.
             const uint8_t * tile = d_v_tiles +
                 ((size_t)t * n_kv_heads + kv_head) * v_tile_bytes;
-            if (thrift_attention) {
+            if (thrift_attention == 2) {
+                v_val = kv_dequantize_element(tile, tid);  // V is 4-bit E2M1 in K6V4
+            } else if (thrift_attention) {
                 v_val = kv_dequantize_element_k8(tile, tid);
             } else {
                 v_val = kv_dequantize_element(tile, tid);
@@ -567,8 +816,17 @@ __global__ void kv_store_quantize_kernel(
     if (h >= n_kv_heads) return;
     if (tail_tokens < 1) return;
 
-    int k_tile_bytes = thrift_attention ? DEN_NVFP4_KV_TILE_BYTES_K8 : DEN_NVFP4_KV_TILE_BYTES;
-    int v_tile_bytes = thrift_attention ? DEN_NVFP4_KV_TILE_BYTES_K8 : DEN_NVFP4_KV_TILE_BYTES;
+    int k_tile_bytes, v_tile_bytes;
+    if (thrift_attention == 2) { // K6V4: K=6-bit packed, V=4-bit E2M1
+        k_tile_bytes = DEN_NVFP4_KV_TILE_BYTES_K6;
+        v_tile_bytes = DEN_NVFP4_KV_TILE_BYTES;
+    } else if (thrift_attention) { // K8V8
+        k_tile_bytes = DEN_NVFP4_KV_TILE_BYTES_K8;
+        v_tile_bytes = DEN_NVFP4_KV_TILE_BYTES_K8;
+    } else { // K4V4
+        k_tile_bytes = DEN_NVFP4_KV_TILE_BYTES;
+        v_tile_bytes = DEN_NVFP4_KV_TILE_BYTES;
+    }
 
     unsigned int * hist_k = (g_kv_hist_enabled) ? g_kv_hist_k : NULL;
     unsigned int * hist_v = (g_kv_hist_enabled) ? g_kv_hist_v : NULL;
@@ -589,7 +847,9 @@ __global__ void kv_store_quantize_kernel(
             const float * v_src = d_v_tail + ((size_t)slot * n_kv_heads + h) * head_dim;
             if (store_k) {
                 uint8_t * k_tile = d_k_tiles + ((size_t)evict_pos * n_kv_heads + h) * k_tile_bytes;
-                if (thrift_attention) {
+                if (thrift_attention == 2) {
+                    kv_quantize_tile_k6(k_src, k_tile, head_dim, hist_k);
+                } else if (thrift_attention) {
                     kv_quantize_tile_k8(k_src, k_tile, head_dim, hist_k);
                 } else {
                     kv_quantize_tile(k_src, k_tile, head_dim, hist_k);
@@ -597,7 +857,9 @@ __global__ void kv_store_quantize_kernel(
             }
             if (store_v) {
                 uint8_t * v_tile = d_v_tiles + ((size_t)evict_pos * n_kv_heads + h) * v_tile_bytes;
-                if (thrift_attention) {
+                if (thrift_attention == 2) {
+                    kv_quantize_tile(v_src, v_tile, head_dim, hist_v);  // V stays 4-bit in K6V4
+                } else if (thrift_attention) {
                     kv_quantize_tile_k8(v_src, v_tile, head_dim, hist_v);
                 } else {
                     kv_quantize_tile(v_src, v_tile, head_dim, hist_v);
@@ -749,8 +1011,17 @@ int den_nvfp4_kv_init(den_nvfp4_kv_cache * cache,
     // PRECISION TAIL F32 buffers: [tail_tokens * n_kv_heads * head_dim] floats.
     size_t tail_bytes = (size_t)n_kv_heads * head_dim * cache->tail_tokens * sizeof(float);
     // NVFP4 tile buffers: only tokens OLDER than the tail window get quantized.
-    int k_tile_bytes = thrift_attention ? DEN_NVFP4_KV_TILE_BYTES_K8 : DEN_NVFP4_KV_TILE_BYTES;
-    int v_tile_bytes = thrift_attention ? DEN_NVFP4_KV_TILE_BYTES_K8 : DEN_NVFP4_KV_TILE_BYTES; // V follows K (8-bit in thrift/K8V8)
+    int k_tile_bytes, v_tile_bytes;
+    if (thrift_attention == 2) { // K6V4: asymmetric — K at 6-bit (224B), V at 4-bit (160B)
+        k_tile_bytes = DEN_NVFP4_KV_TILE_BYTES_K6;
+        v_tile_bytes = DEN_NVFP4_KV_TILE_BYTES;
+    } else if (thrift_attention) { // K8V8: symmetric 8-bit
+        k_tile_bytes = DEN_NVFP4_KV_TILE_BYTES_K8;
+        v_tile_bytes = DEN_NVFP4_KV_TILE_BYTES_K8;
+    } else { // K4V4: symmetric 4-bit
+        k_tile_bytes = DEN_NVFP4_KV_TILE_BYTES;
+        v_tile_bytes = DEN_NVFP4_KV_TILE_BYTES;
+    }
     int tile_count = cache->max_seq - cache->tail_tokens;
     if (tile_count < 0) tile_count = 0;
     size_t k_tiles_per_layer = (size_t)tile_count * n_kv_heads * k_tile_bytes;
@@ -770,6 +1041,15 @@ int den_nvfp4_kv_init(den_nvfp4_kv_cache * cache,
         }
 
         if (cudaMallocHost(&layer->h_readback, tail_bytes) != cudaSuccess) goto fail;
+
+        // Register-resident hot-token state buffers (tiny: n_kv_heads * 4 ints + 4 floats)
+        {
+            size_t hot_bytes = (size_t)n_kv_heads * DEN_NVFP4_KV_REGISTER_HOT_TOKENS;
+            if (cudaMalloc(&layer->d_hot_scores,    hot_bytes * sizeof(float)) != cudaSuccess) goto fail;
+            if (cudaMalloc(&layer->d_hot_positions, hot_bytes * sizeof(int))   != cudaSuccess) goto fail;
+            cudaMemset(layer->d_hot_scores,    0, hot_bytes * sizeof(float));
+            cudaMemset(layer->d_hot_positions, 0, hot_bytes * sizeof(int));
+        }
 
         cudaMemset(layer->d_k_tail, 0, tail_bytes);
         cudaMemset(layer->d_v_tail, 0, tail_bytes);
@@ -795,7 +1075,9 @@ int den_nvfp4_kv_init(den_nvfp4_kv_cache * cache,
     den_nvfp4_kv_reset_all_seq_len(cache);
 
     {
-        const char * mode_str = thrift_attention ? "K8V8 ThriftAttention" : "K4V4";
+        const char * mode_str = (thrift_attention == 2) ? "K6V4 Asymmetric"
+                              : thrift_attention         ? "K8V8 ThriftAttention"
+                              :                           "K4V4";
         fprintf(stderr,
             "KV NVFP4: ENABLED (%s, %d layers, %d KV heads, head_dim=%d, max_seq=%d, PRECISION TAIL=%d tokens F32)\n"
             "  tiles(%d): K=%.1f MB V=%.1f MB   tail F32(K+V)=%.2f MB   BF16-equiv=%.1f MB\n",
@@ -905,16 +1187,31 @@ int den_nvfp4_kv_load(den_nvfp4_kv_cache * cache, int layer,
                                    per_token_bytes, cudaMemcpyDeviceToDevice, stream));
     } else {
         int tile_idx = seq_pos; // tiles hold absolute positions older than the tail
-        int tb = cache->thrift_attention ? DEN_NVFP4_KV_TILE_BYTES_K8 : DEN_NVFP4_KV_TILE_BYTES;
+        int k_tb, v_tb;
+        if (cache->thrift_attention == 2) {
+            k_tb = DEN_NVFP4_KV_TILE_BYTES_K6;  // K: 224B packed 6-bit
+            v_tb = DEN_NVFP4_KV_TILE_BYTES;     // V: 160B 4-bit E2M1
+        } else if (cache->thrift_attention) {
+            k_tb = DEN_NVFP4_KV_TILE_BYTES_K8;
+            v_tb = DEN_NVFP4_KV_TILE_BYTES_K8;
+        } else {
+            k_tb = DEN_NVFP4_KV_TILE_BYTES;
+            v_tb = DEN_NVFP4_KV_TILE_BYTES;
+        }
         const uint8_t * k_tile_base = kv_layer->d_k_tiles +
-            (size_t)tile_idx * cache->n_kv_heads * tb;
+            (size_t)tile_idx * cache->n_kv_heads * k_tb;
         const uint8_t * v_tile_base = kv_layer->d_v_tiles +
-            (size_t)tile_idx * cache->n_kv_heads * tb;
+            (size_t)tile_idx * cache->n_kv_heads * v_tb;
 
         int block_size = 128;
         int grid_size  = (cache->n_kv_heads + block_size - 1) / block_size;
 
-        if (cache->thrift_attention) {
+        if (cache->thrift_attention == 2) {
+            kv_dequantize_kernel_k6<<<grid_size, block_size, 0, stream>>>(
+                k_tile_base, d_k_out, cache->n_kv_heads, cache->head_dim);
+            kv_dequantize_kernel<<<grid_size, block_size, 0, stream>>>(
+                v_tile_base, d_v_out, cache->n_kv_heads, cache->head_dim);
+        } else if (cache->thrift_attention) {
             kv_dequantize_kernel_k8<<<grid_size, block_size, 0, stream>>>(
                 k_tile_base, d_k_out, cache->n_kv_heads, cache->head_dim);
             kv_dequantize_kernel_k8<<<grid_size, block_size, 0, stream>>>(
@@ -961,6 +1258,7 @@ int den_nvfp4_kv_attention(den_nvfp4_kv_cache * cache, int layer,
         kv_layer->d_k_tail, kv_layer->d_v_tail,
         kv_layer->d_k_tiles, kv_layer->d_v_tiles,
         d_output,
+        kv_layer->d_hot_scores, kv_layer->d_hot_positions,
         n_heads, cache->n_kv_heads, cache->head_dim,
         seq_len, kv_layer->max_seq, kv_layer->tail_tokens,
         cache->thrift_attention);
@@ -999,9 +1297,28 @@ void den_nvfp4_kv_reset_all_seq_len(den_nvfp4_kv_cache * cache) {
             cudaMemset(layer->d_v_tail, 0, tail_bytes);
         }
 
+        // Zero hot-token tracking buffers — stale positions from prior
+        // context would bias the next decode step toward invalid tokens.
+        {
+            size_t hot_bytes = (size_t)layer->n_kv_heads * DEN_NVFP4_KV_REGISTER_HOT_TOKENS;
+            if (hot_bytes > 0 && layer->d_hot_scores && layer->d_hot_positions) {
+                cudaMemset(layer->d_hot_scores,    0, hot_bytes * sizeof(float));
+                cudaMemset(layer->d_hot_positions, 0, hot_bytes * sizeof(int));
+            }
+        }
+
         // Also zero tiles to guarantee zero-score (silent) stale reads.
-        int k_tb = cache->thrift_attention ? DEN_NVFP4_KV_TILE_BYTES_K8 : DEN_NVFP4_KV_TILE_BYTES;
-        int v_tb = cache->thrift_attention ? DEN_NVFP4_KV_TILE_BYTES_K8 : DEN_NVFP4_KV_TILE_BYTES;
+        int k_tb, v_tb;
+        if (cache->thrift_attention == 2) {
+            k_tb = DEN_NVFP4_KV_TILE_BYTES_K6;
+            v_tb = DEN_NVFP4_KV_TILE_BYTES;
+        } else if (cache->thrift_attention) {
+            k_tb = DEN_NVFP4_KV_TILE_BYTES_K8;
+            v_tb = DEN_NVFP4_KV_TILE_BYTES_K8;
+        } else {
+            k_tb = DEN_NVFP4_KV_TILE_BYTES;
+            v_tb = DEN_NVFP4_KV_TILE_BYTES;
+        }
         int tile_count = layer->max_seq - layer->tail_tokens;
         if (tile_count < 0) tile_count = 0;
         if (tile_count > 0) {
@@ -1066,12 +1383,14 @@ void den_nvfp4_kv_free(den_nvfp4_kv_cache * cache) {
 
     for (int l = 0; l < cache->n_attn_layers; l++) {
         den_nvfp4_kv_layer * layer = &cache->layers[l];
-        if (layer->d_k_tail)      cudaFree(layer->d_k_tail);
-        if (layer->d_v_tail)      cudaFree(layer->d_v_tail);
-        if (layer->d_k_tiles)     cudaFree(layer->d_k_tiles);
-        if (layer->d_v_tiles)     cudaFree(layer->d_v_tiles);
-        if (layer->d_scratch_tile)cudaFree(layer->d_scratch_tile);
-        if (layer->h_readback)    cudaFreeHost(layer->h_readback);
+        if (layer->d_k_tail)       cudaFree(layer->d_k_tail);
+        if (layer->d_v_tail)       cudaFree(layer->d_v_tail);
+        if (layer->d_k_tiles)      cudaFree(layer->d_k_tiles);
+        if (layer->d_v_tiles)      cudaFree(layer->d_v_tiles);
+        if (layer->d_scratch_tile) cudaFree(layer->d_scratch_tile);
+        if (layer->h_readback)     cudaFreeHost(layer->h_readback);
+        if (layer->d_hot_scores)   cudaFree(layer->d_hot_scores);
+        if (layer->d_hot_positions)cudaFree(layer->d_hot_positions);
     }
     free(cache->layers);
     cache->layers = nullptr;
@@ -1088,9 +1407,20 @@ double den_nvfp4_kv_compression_ratio(const den_nvfp4_kv_cache * cache) {
                             cache->head_dim * 2;
     int tile_count = cache->max_seq - cache->tail_tokens;
     if (tile_count < 0) tile_count = 0;
-    size_t tb = cache->thrift_attention ? DEN_NVFP4_KV_TILE_BYTES_K8 : DEN_NVFP4_KV_TILE_BYTES;
+    size_t k_tb, v_tb;
+    if (cache->thrift_attention == 2) {
+        k_tb = DEN_NVFP4_KV_TILE_BYTES_K6;  // K: 224B
+        v_tb = DEN_NVFP4_KV_TILE_BYTES;     // V: 160B
+    } else if (cache->thrift_attention) {
+        k_tb = DEN_NVFP4_KV_TILE_BYTES_K8;
+        v_tb = DEN_NVFP4_KV_TILE_BYTES_K8;
+    } else {
+        k_tb = DEN_NVFP4_KV_TILE_BYTES;
+        v_tb = DEN_NVFP4_KV_TILE_BYTES;
+    }
+    size_t avg_tb = (k_tb + v_tb) / 2; // average tile size for K+V pair
     // NVFP4 footprint = tiles for the quantized region + F32 tail (K+V).
-    size_t nvfp4_per_layer = (size_t)tile_count * cache->n_kv_heads * tb +
+    size_t nvfp4_per_layer = (size_t)tile_count * cache->n_kv_heads * avg_tb +
                              (size_t)cache->tail_tokens * cache->n_kv_heads *
                              cache->head_dim * 2 * (size_t)sizeof(float);
     if (nvfp4_per_layer == 0) return 1.0;

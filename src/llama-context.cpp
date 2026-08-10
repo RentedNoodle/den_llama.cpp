@@ -3662,8 +3662,20 @@ llama_context * llama_init_from_model(
             uint32_t il0 = 0;
             while (il0 < model->hparams.n_layer_all && !model->hparams.has_kv(il0)) il0++;
             if (il0 < model->hparams.n_layer_all) {
-                int thrift = (getenv("DEN_THRIFT_ATTENTION") &&
-                              getenv("DEN_THRIFT_ATTENTION")[0] == '1') ? 1 : 0;
+                // thrift_attention: 0=K4V4, 1=K8V8, 2=K6V4 (asymmetric)
+                // DEN_THRIFT_ATTENTION=2 → K6V4; DEN_THRIFT_ATTENTION=1 → K8V8
+                // DEN_KV_BITS=6,4 → K6V4 (alternative env var, takes precedence)
+                int thrift = 0;
+                {
+                    const char *env_bits = getenv("DEN_KV_BITS");
+                    const char *env_thrift = getenv("DEN_THRIFT_ATTENTION");
+                    if (env_bits && env_bits[0] == '6') {
+                        thrift = 2; // K6V4 via DEN_KV_BITS=6,4
+                    } else if (env_thrift) {
+                        if (env_thrift[0] == '2') thrift = 2; // K6V4
+                        else if (env_thrift[0] == '1') thrift = 1; // K8V8
+                    }
+                }
                 ggml_backend_cuda_nvfp4_kv_init(
                     (int)model->hparams.n_layer_kv(),
                     (int)model->hparams.n_head_kv(il0),

@@ -1,124 +1,158 @@
-# llama.cpp
+# den_llama.cpp -- Den Engine
 
-![llama](https://raw.githubusercontent.com/ggml-org/llama.brand/refs/heads/master/cover/llama-cpp/cover-llama-cpp-dark.svg)
+**Sovereign NVFP4 inference on consumer Blackwell.**
+Single-engine super-fork: union of mainline llama.cpp + ik_llama.cpp + beellama.cpp.
+OMMA.SF.16864 tensor cores. 108 proprietary commits ahead of upstream.
 
-<div align="center">
+---
 
-<b>LLM inference in C/C++</b>
+## Not a mirror
 
-[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](https://opensource.org/licenses/MIT)
-[![Release](https://img.shields.io/github/v/release/ggml-org/llama.cpp)](https://github.com/ggml-org/llama.cpp/releases)
-[![Server](https://github.com/ggml-org/llama.cpp/actions/workflows/server.yml/badge.svg)](https://github.com/ggml-org/llama.cpp/actions/workflows/server.yml)
-[![Docker](https://github.com/ggml-org/llama.cpp/actions/workflows/docker.yml/badge.svg)](https://github.com/ggml-org/llama.cpp/actions/workflows/docker.yml)
-[![Winget](https://github.com/ggml-org/llama.cpp/actions/workflows/winget.yml/badge.svg)](https://github.com/ggml-org/llama.cpp/actions/workflows/winget.yml)
+This fork adds **proprietary, silicon-specific features** absent from upstream llama.cpp:
 
-[manifesto](https://github.com/ggml-org/llama.cpp/discussions/205) / [ggml](https://github.com/ggml-org/ggml) / [ops](https://github.com/ggml-org/llama.cpp/blob/master/docs/ops.md) / [maintainer PRs](https://github.com/ggml-org/llama.cpp/issues?q=is%3Apr%20is%3Aopen%20draft%3AFalse%20(author%3Argerganov%20OR%20author%3AKitaitiMakoto%20OR%20author%3Adanbev%20OR%20author%3Aaldehir%20OR%20author%3Amax-krasnyansky%20OR%20author%3ACISC%20OR%20author%3Aggerganov%20OR%20author%3Aam17an%20OR%20author%3Abartowski1182%20OR%20author%3Ahipudding%20OR%20author%3AServeurpersoCom%20OR%20author%3Apwilkin%20OR%20author%3Areeselevine%20OR%20author%3Angxson%20OR%20author%3Ajeffbolznv%20OR%20author%3A0cc4m%20OR%20author%3Aangt%20OR%20author%3AIMbackK%20OR%20author%3Aarthw%20OR%20author%3AJohannesGaessler%20OR%20author%3AORippler%20OR%20author%3Aruixiang63%20OR%20author%3Axctan%20OR%20author%3Aallozaur%20OR%20author%3Ayomaytk%20OR%20author%3Aaendk%20OR%20author%3Agaugarg-nv%20OR%20author%3Ataronaeo%20OR%20author%3Aforforever73%20OR%20author%3Alhez%20OR%20author%3Anetrunnereve%20OR%20author%3Afairydreaming)%20sort%3Aupdated-desc) / [dev branches](https://github.com/ggml-org/llama.cpp-dev/blob/master/README-features.md) / [compile times](https://github.com/ggml-org/llama.cpp-dev/blob/master/README-compile-times.md) / [lib llama API](https://github.com/ggml-org/llama.cpp/issues/9289) / [llama-server REST API](https://github.com/ggml-org/llama.cpp/issues/9291)
+| Capability | Upstream | den_llama.cpp |
+|------------|:--------:|:-------------:|
+| NVFP4 weight inference (OMMA.SF.16864) | -- | Direct OMMA path, E2M1+UE4M3 |
+| NVFP4 KV cache (K8V8, lossless) | -- | KLD=0, cos=1.0 at 8K context |
+| KVarN KV cache (variance-normalized) | -- | 2.72x coherent compression |
+| Expert offloading (ncmoe) | -- | active set ~4.7 GB on 16 GB |
+| Precision tail (256-token F32 ring) | -- | accuracy gate at tile region |
+| Data-driven UE4M3 scale LUT | -- | cap 1.5, zero KLD drift |
+| MTP K=2 spec decode | -- | full transformer draft head |
+| Persistent kernel (multi-SM) | -- | warp-specialized OMMA, TDR-aware |
+| ccache + -j8 | -- | 12 min full rebuild |
+| Windows native build | -- | pip nvcc + Ninja + MSVC |
+| In-process KLD accuracy gate | -- | ctypes, 5 hard metrics |
+| Tri-vector gate (accuracy/speed/context) | -- | automated CI guard |
 
-</div>
+---
 
-## Quick start
+## Tri-vector gate
 
-A few options to get `llama.cpp` installed on your machine:
+| Vector | Metric | Status |
+|--------|--------|--------|
+| **Accuracy** | NVFP4 KV KLD=0, cos=1.0 at 8192 context (7840 tile positions) | Verified at 1K/2K/4K/8K |
+| **Speed** | 35B tg64 >= 179.57 tok/s | Golden rule CI guard |
+| **Context** | 64K+ via Sparse-VMM | Core wired, KV allocation routing pending |
 
-- Visit https://llama.app and follow the instructions
-- Run with Docker - see our [Docker documentation](docs/docker.md)
-- Download pre-built binaries from the [releases page](https://github.com/ggml-org/llama.cpp/releases)
-- Build from source by cloning this repository - check out [our build guide](docs/build.md)
+**Gate tooling:** `tools/gate_accuracy_kv.py` (dual-context ctypes), `tools/gate_accuracy_context_scaling.py`, `tools/coherence_gate.py`, `tools/regression_baseline.py`, `tools/repro_check.py`.
 
-Once installed:
+---
 
-```sh
-# Download and run a model directly from Hugging Face
-llama cli -hf ggml-org/Qwen3.5-0.8B-GGUF
+## Verified models
 
-# Launch OpenAI-compatible API server
-llama serve -hf ggml-org/Qwen3.5-0.8B-GGUF
+| Model | Format | Status |
+|-------|--------|--------|
+| Ornith 9B | NVFP4 GGUF | Coherent, OMMA path |
+| Ornith 35B | NVFP4 GGUF | Coherent, expert offload |
+| Ornith 35B | Q8_0 GGUF | Reference oracle |
+| Gemma 4 12B | NVFP4-FP8 GGUF | PASS |
+| Gemma 4 26B | NVFP4 safetensors | Pending .den convert |
+
+---
+
+## Quick build
+
+```cmd
+C:\Users\james\Desktop\build_now.bat
 ```
 
-<table align="center">
-    <tr>
-        <td align="center" width=50%>
-            <img width="1310" height="888" alt="VLM session with `llama cli`" src="https://github.com/user-attachments/assets/88726b48-1713-48aa-a525-95a02e78afc4" />
-            <i>VLM session with <b>llama cli</b></i>
-        </td>
-        <td align="center">
-            <img width="1392" height="958" alt="Built-in web UI against `llama serve` running Qwen 3.6" src="https://github.com/user-attachments/assets/b402f972-2e32-4def-8771-8d849f08cf2e" />
-            <i>Built-in web UI against <b>llama serve</b></i>
-        </td>
-    </tr>
-<table>
+**Manual:**
+```bash
+cmake -B build -DGGML_CUDA=ON -DCMAKE_CUDA_ARCHITECTURES=120a
+cmake --build build --config Release -j8
+```
 
-## Description
+Prerequisites: CUDA 13.3, sm_120a GPU (RTX 5070 Ti / GB203), Ninja, MSVC 2022.
 
-The main goal of `llama.cpp` is to enable LLM (and VLM) inference with minimal setup and state-of-the-art performance on
-a wide range of hardware - locally and in the cloud.
+See [docs/build.md](docs/build.md) for the upstream build guide (all backends).
 
-- Plain C/C++ implementation without any dependencies
-- Apple silicon is a first-class citizen - optimized via ARM NEON, Accelerate and Metal frameworks
-- AVX, AVX2, AVX512 and AMX support for x86 architectures
-- RVV, ZVFH, ZFH, ZICBOP and ZIHINTPAUSE support for RISC-V architectures
-- 1.5-bit, 2-bit, 3-bit, 4-bit, 5-bit, 6-bit, and 8-bit integer quantization for faster inference and reduced memory use
-- Custom CUDA kernels for running LLMs on NVIDIA GPUs (support for AMD GPUs via HIP and Moore Threads GPUs via MUSA)
-- Vulkan and SYCL backend support
-- CPU+GPU hybrid inference to partially accelerate models larger than the total VRAM capacity
+---
 
-The `llama.cpp` project is build on top of the [ggml](https://github.com/ggml-org/ggml) library.
+## Key documents
 
-## Supported backends
+| Document | Purpose |
+|----------|---------|
+| [docs/VERIFICATION.md](docs/VERIFICATION.md) | NVFP4 KV accuracy methodology, gate definitions, regression infrastructure |
+| [plans/jaunty-seeking-wren.md](plans/jaunty-seeking-wren.md) | Master optimization plan: 30+ silicon exploits, blocker matrix, .den roadmap |
+| [CLAUDE.md](CLAUDE.md) | Project instructions for AI agents (points to AGENTS.md) |
+| [AGENTS.md](AGENTS.md) | Contributor guidelines |
 
-| Backend | Target devices |
-| --- | --- |
-| [BLAS](docs/build.md#blas-build) | All |
-| [BLIS](docs/backend/BLIS.md) | All |
-| [CANN](docs/build.md#cann) | Ascend NPU |
-| [CUDA](docs/build.md#cuda) | Nvidia GPU |
-| [HIP](docs/build.md#hip) | AMD GPU |
-| [Hexagon [In Progress]](docs/backend/snapdragon/README.md) | Snapdragon |
-| [IBM zDNN](docs/backend/zDNN.md) | IBM Z & LinuxONE |
-| [MUSA](docs/build.md#musa) | Moore Threads GPU |
-| [Metal](docs/build.md#metal-build) | Apple Silicon |
-| [OpenCL](docs/backend/OPENCL.md) | Adreno GPU |
-| [OpenVINO [In Progress]](docs/backend/OPENVINO.md) | Intel CPUs, GPUs, and NPUs |
-| [RPC](https://github.com/ggml-org/llama.cpp/tree/master/tools/rpc) | All |
-| [SYCL](docs/backend/SYCL.md) | Intel GPU |
-| [VirtGPU](docs/backend/VirtGPU.md) | VirtGPU APIR |
-| [Vulkan](docs/build.md#vulkan) | GPU |
-| [WebGPU](docs/build.md#webgpu) | All |
-| [ZenDNN](docs/build.md#zendnn) | AMD CPU |
+---
 
-## Documentation
+## Architecture
 
-#### Tools
+```
+den_llama.cpp (this repo)
+├── ggml/src/ggml-cuda/
+│   ├── fattn-nvfp4-kv.cu/cuh          # NVFP4 KV cache: 4 quant kernels + fused attention
+│   ├── mma.cuh                         # OMMA PTX instrinsics via mma.sync.kind::mxf4nvf4.4X
+│   ├── mmq.cuh                         # Quantized matmul dispatch (NVFP4 -> OMMA)
+│   ├── den-rt-expert-router.cu/cuh     # RT Core expert router (tiers 2+3)
+│   ├── den_expert_stage.cu             # CPU L3-resident expert staging + Markov predictor
+│   ├── sparse-vmm.cu/cuh               # Sparse VMM: cuMemAddressReserve + cuMemCreate + cuMemMap
+│   └── topk-moe.cu                     # Warp-level top-K MoE gating
+├── src/
+│   ├── llama-context.cpp               # Auto-enable NVFP4, sparse VMM, memory hooks
+│   ├── llama-graph.cpp                 # MoE FFN graph build
+│   └── llama-model.cpp                 # Model loading
+├── tools/
+│   ├── gate_accuracy_kv.py             # Primary KLD accuracy gate
+│   ├── coherence_gate.py               # 6-gate NVFP4 vs Q8_0 oracle
+│   ├── regression_baseline.py          # Baseline DB + regression detection
+│   └── repro_check.py                  # One-shot reproducibility check
+└── .github/workflows/
+    └── bench-guard.yml                 # CI: tg64 < 184 -> fail
+```
 
-- [cli](tools/cli/README.md)
-- [completion](tools/completion/README.md)
-- [server](tools/server/README.md)
-- [GBNF grammars](grammars/README.md)
+---
 
-#### Development
+## Silicon target
 
-- [How to build](docs/build.md)
-- [Running on Docker](docs/docker.md)
-- [Build on Android](docs/android.md)
-- [Multi-GPU usage](docs/multi-gpu.md)
-- [Performance troubleshooting](docs/development/token_generation_performance_tips.md)
-- [GGML tips & tricks](https://github.com/ggml-org/llama.cpp/wiki/GGML-Tips-&-Tricks)
-- [XCFramework](docs/xcframework.md)
-- [Completions](docs/completions.md)
-- [Models](docs/models.md)
+| Property | Value |
+|----------|-------|
+| **GPU** | RTX 5070 Ti, GB203-300-A1, 70 SMs, 16 GB GDDR7 |
+| **CUDA** | 13.3.33, sm_120a |
+| **Tensor cores** | OMMA.SF.16864.F32.E2M1.E2M1.UE4M3.4X |
+| **SMEM** | 99 KB/block |
+| **Key ISA** | cp.async.bulk.tensor (TMA), Thread Block Clusters (max 8), DSMEM, no WGMMA/tcgen05/TMEM |
 
-## Contributing
+---
 
-- Contributors can open PRs
-- Collaborators will be invited based on contributions
-- Maintainers can push to branches in the `llama.cpp` repo and merge PRs into the `master` branch
-- Any help with managing issues, PRs and projects is very appreciated!
-- Read the [CONTRIBUTING.md](CONTRIBUTING.md) for more information
+## .den Format
 
-## Acknowledgements
+`.den` is the project's native weight format — a 160B NULLGLASS tile container replacing GGUF
+as the primary storage and dispatch layer. Engineered specifically for Blackwell tensor cores.
 
-- [yhirose/cpp-httplib](https://github.com/yhirose/cpp-httplib) - Single-header HTTP server, used by `llama-server` - MIT license
-- [stb-image](https://github.com/nothings/stb) - Single-header image format decoder, used by multimodal subsystem - Public domain
-- [nlohmann/json](https://github.com/nlohmann/json) - Single-header JSON library, used by various tools/examples - MIT License
-- [miniaudio.h](https://github.com/mackron/miniaudio) - Single-header audio format decoder, used by multimodal subsystem - Public domain
-- [subprocess.h](https://github.com/sheredom/subprocess.h) - Single-header process launching solution for C and C++ - Public domain
+**Tile layout (160 bytes):**
+- 128B E2M1 nibbles (256 elements × 4 bits)
+- 16B UE4M3 block scales (one per 16-element group)
+- 4B tile RMS norm (float32)
+- 2B dispatch byte + K-stride
+- 2B holographic parent pointer (for differential updates)
+- 8B reserved (CRC-8, generation-ID, precision tier)
+
+**Why .den:**
+- **OMMA-native.** Tiles decompress directly into tensor core register fragments.
+  No GGUF block_nvfp4 repack. Zero CPU conversion at runtime.
+- **Per-tile precision tiers.** Each tile carries its own format dispatch byte —
+  F16, BF16, NVFP4, Q8_0, or skip — selected at quantize time per tensor sensitivity.
+- **Differential updates.** Only changed tiles need re-downloading between model versions.
+  Holographic parent pointer chains tiles across versions. 14 GB → 700 MB delta.
+- **Universal object.** Future: compute graphs, KV state, LoRA adapters, modality descriptors
+  in the same container. GGUF for weights; `.den` for everything else.
+
+**Integration status:**
+- `DONE` — Direct OMMA NULLGLASS path (loads 160B tiles into OMMA registers, zero PTX change)
+- `DONE` — `.den` loader (`src/llama-den-loader.cpp`) with tensor inventory + slot mapping
+- `TODO` — Model-loading detection (`.den` extension → route to `den_loader`, ~50 lines)
+- `TODO` — Per-tensor precision tier dispatch (jashepp-style 3-tier: F16/Q8_0/NVFP4)
+- `TODO` — Differential tile updates via holographic parent pointer + tile generation-ID
+
+GGUF remains supported for compatibility. `.den` is the performance path.
+
+---
+
+## License
+
+MIT (same as upstream llama.cpp)

@@ -1295,3 +1295,146 @@ void ggml_cuda_op_mul_mat_vec_q(
 
     GGML_UNUSED_VARS(src1, dst, src1_ddf_i, src1_ncols, src1_padded_row_size);
 }
+
+// ============================================================================
+// EXPERIMENTAL: DP4A-Packed FP16×2 Attention GEMV (standalone kernel)
+// ============================================================================
+//
+// This kernel computes a matrix-vector product for FP16 weights using DP4A.
+// Both weights AND activations are converted to INT8 on-the-fly, then DP4A
+// computes 4 INT8 dot products per instruction (vs 2 FP16 for half2).
+//
+// Net throughput: ~2x vs half2 GEMV (4 INT8/DP4A vs 2 FP16/half2 SIMD).
+//
+// ACCURACY CAVEATS:
+//   - FP16→INT8 conversion is FAST APPROXIMATE (mantissa truncation)
+//   - Expected cos vs exact FP16 GEMV: ~0.85-0.95
+//   - Not suitable for production inference — pre-quantize weights to Q8_0
+//     and use the existing vec_dot_q8_0_q8_1 path for exact INT8 accuracy.
+//
+// Production path: convert FP16 attention weights → Q8_0 format offline.
+// Then the existing MMVQ DP4A path handles everything with 4x throughput.
+//
+// Grid: (nrows, ncols_dst) — one block per output element
+// Block: 128 threads (4 warps), covers 32 K-elements per iteration
+//
+// sm_120a (Blackwell GB203): __dp4a = 1 instruction, 4 INT8 MACC.
+
+template <int block_size>
+__launch_bounds__(block_size, 2)
+static __global__ void mul_mat_vec_f16_dp4a_experimental(
+        const half * __restrict__ x,        // FP16 weights [nrows, ncols]
+        const float * __restrict__ y,       // F32 activation [ncols] (will be INT8 quantized)
+        float * __restrict__ dst,           // output [nrows]
+        const int nrows, const int ncols) {
+
+    const int row   = blockIdx.x;
+    const int token = blockIdx.y;  // for batched (future)
+    (void)token;
+
+    if (row >= nrows) return;
+
+    const int tid = threadIdx.x;
+    constexpr int K_per_block = 32;  // QK8_1 = 32 elements per quant block
+    constexpr int int32_per_block = K_per_block / 4;  // 8 INT32 per block
+    const int n_blocks = ncols / K_per_block;
+
+    // Shared memory for quantized activation blocks
+    __shared__ struct {
+        int8_t qs[K_per_block];    // quantized INT8 values
+        float  d;                  // dequant scale = max(|y|)/127
+    } y_blocks[block_size / 32];   // one block per warp
+
+    const int warp_id = tid / 32;
+    const int lane_id = tid % 32;
+
+    float sumf = 0.0f;
+
+    for (int kb = warp_id; kb < n_blocks; kb += (block_size / 32)) {
+        // --- Quantize activation block to INT8 (cooperative within warp) ---
+        const int offset = kb * K_per_block;
+
+        // Find max |value| in this block for scale
+        float max_abs = 0.0f;
+        for (int i = lane_id; i < K_per_block; i += 32) {
+            max_abs = fmaxf(max_abs, fabsf(y[offset + i]));
+        }
+        max_abs = warp_reduce_max<32>(max_abs);
+        if (max_abs < 1e-8f) max_abs = 1e-8f;
+
+        // Quantize: INT8 value = round(y * 127/max_abs)
+        const float scale = max_abs / 127.0f;
+        if (lane_id == 0) y_blocks[warp_id].d = scale;
+
+        for (int i = lane_id; i < K_per_block; i += 32) {
+            float fy = y[offset + i];
+            fy = fminf(fmaxf(fy / scale, -128.0f), 127.0f);
+            y_blocks[warp_id].qs[i] = (int8_t)__float2int_rn(fy);
+        }
+        __syncwarp();
+
+        // --- DP4A dot product: 4 threads × VDR=2 = 8 INT32 per block ---
+        // Each thread processes 2 INT32 groups = 8 INT8 = 8 FP16 weights
+        const float d8 = scale;  // activation dequant scale
+
+        int sumi = 0;
+        // 4 threads cover 8 INT32 positions: thread 0→[0,1], 1→[2,3], 2→[4,5], 3→[6,7]
+        if (lane_id < 4) {
+            const int base_iqs = lane_id * 2;  // 0, 2, 4, 6
+#pragma unroll
+            for (int i = 0; i < 2; ++i) {  // VDR = 2
+                const int iqs = base_iqs + i;
+
+                // 4 FP16 weights → 1 INT32 of INT8
+                int v = fp16x4_to_int8x4_dp4a(
+                    (const uint16_t *)&x[row * ncols + offset + iqs * 4]);
+
+                // 4 INT8 activations
+                int u = ((int*)y_blocks[warp_id].qs)[iqs];
+                sumi = ggml_cuda_dp4a(v, u, sumi);
+            }
+        }
+        // Reduce within warp (4 active threads)
+        sumi = warp_reduce_sum<32>(sumi);
+
+        sumf += d8 * (float)sumi;
+    }
+
+    // Cross-warp reduction (at most 4 warps active)
+    __shared__ float tmp_sum[32];
+    if (lane_id == 0) tmp_sum[warp_id] = sumf;
+    __syncthreads();
+    if (warp_id == 0) {
+        float total = 0.0f;
+        for (int w = 0; w < (block_size / 32); ++w) {
+            total += tmp_sum[w];
+        }
+        if (lane_id == 0) dst[row] = total;
+    }
+}
+
+// Host launch helper for the experimental DP4A F16 attention kernel.
+// Call instead of ggml_cuda_mul_mat_vec_f for F16 attention weights.
+static void ggml_cuda_mul_mat_vec_f16_dp4a_launch(
+        const half * x, const float * y, float * dst,
+        const int nrows, const int ncols, const int ncols_dst,
+        cudaStream_t stream) {
+
+    constexpr int block_size = 128;
+    const dim3 block_nums(nrows, 1, 1);
+    const dim3 block_dims(block_size, 1, 1);
+
+    // ncols must be divisible by 32 (QK8_1)
+    GGML_ASSERT(ncols % 32 == 0);
+
+    const size_t nbytes_shared = (block_size / 32) * sizeof(struct {
+        int8_t qs[32];
+        float d;
+    });
+
+    mul_mat_vec_f16_dp4a_experimental<block_size>
+        <<<block_nums, block_dims, nbytes_shared, stream>>>
+        (x, y, dst, nrows, ncols);
+
+    GGML_UNUSED(ncols_dst);
+}

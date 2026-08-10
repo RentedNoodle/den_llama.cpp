@@ -26,29 +26,58 @@ extern "C" {
 
 #define DEN_NVFP4_KV_TILE_BYTES      160   // K4V4: 16 scales + 128 nibbles + 4 norm + 2 meta + 10 pad
 #define DEN_NVFP4_KV_TILE_BYTES_K8   288   // K8V8: 16 scales + 256 uint8 + 4 norm + 2 meta + 10 pad
+#define DEN_NVFP4_KV_TILE_BYTES_K6   224   // K6V4: 16 scales + 192 packed-6bit + 4 norm + 2 meta + 10 pad
 #define DEN_NVFP4_KV_TILE_ELEMS      256
 #define DEN_NVFP4_KV_TILE_SCALES     16
 #define DEN_NVFP4_KV_TILE_NIBBLES    128
 #define DEN_NVFP4_KV_TILE_UINT8      256   // K8 element data size
+#define DEN_NVFP4_KV_TILE_UINT6_PACKED 192 // K6 element data: 256×6bit packed as 64×3byte
 #define DEN_NVFP4_KV_TILE_GROUPS     16
 #define DEN_NVFP4_KV_TILE_GROUP_SZ   16
-#define DEN_NVFP4_KV_TILE_NORM_OFF   144
-#define DEN_NVFP4_KV_TILE_NORM_OFF_K8 272
-#define DEN_NVFP4_KV_TILE_DISPATCH   148
-#define DEN_NVFP4_KV_TILE_DISPATCH_K8 276
-#define DEN_NVFP4_KV_TILE_KSTRIDE    149
-#define DEN_NVFP4_KV_TILE_KSTRIDE_K8 277
+#define DEN_NVFP4_KV_TILE_NORM_OFF      144
+#define DEN_NVFP4_KV_TILE_NORM_OFF_K8   272
+#define DEN_NVFP4_KV_TILE_NORM_OFF_K6   208
+#define DEN_NVFP4_KV_TILE_DISPATCH      148
+#define DEN_NVFP4_KV_TILE_DISPATCH_K8   276
+#define DEN_NVFP4_KV_TILE_DISPATCH_K6   212
+#define DEN_NVFP4_KV_TILE_KSTRIDE       149
+#define DEN_NVFP4_KV_TILE_KSTRIDE_K8    277
+// CRC-8 ECC: self-healing weight tiles — byte 153 stores CRC-8-ATM over bytes 0-151.
+// Consumer GPUs lack ECC; CRC-8 detects silent GDDR7 bit flips at ~50 cycles per tile.
+// On mismatch: zero out tile, host re-uploads from original data. See den_tile_ecc.cuh.
+#define DEN_NVFP4_KV_TILE_CRC8          153   // CRC-8-ATM over bytes 0-151 (payload + metadata)
+#define DEN_NVFP4_KV_TILE_TAIL_START    152   // 8-byte reserved tail (152-159), excl. CRC byte
+#define DEN_NVFP4_KV_TILE_KSTRIDE_K6    213
 
 #define DEN_NVFP4_KV_META_SW         0x30  // K4V4: both 4-bit E2M1 nibbles
 #define DEN_NVFP4_KV_META_K8V8       0x31  // K8V8: keys 8-bit uint8, values 8-bit uint8
+#define DEN_NVFP4_KV_META_K6V4       0x32  // K6V4: keys 6-bit packed unsigned, values 4-bit E2M1 nibbles
+// ═══════════════════════════════════════════════════════════
+// Register-Resident Hot-Token KV Cache
+// ═══════════════════════════════════════════════════════════
+//
+// GB203: 64K 32-bit regs/SM × 70 SMs = 17.9 MB register file.
+// Attention kernel uses ~100 regs/thread — most registers idle.
+//
+// Track top-4 attention-mass tokens per head across decode steps.
+// Hot positions + scores live in a tiny GPU buffer (~32 bytes/head).
+// Loaded into thread 0's registers at kernel start; updated after softmax.
+// Phase 1 stepping stone: attention-score tracking only.
+// Phase 2 (future): full K/V vectors in warp 7's idle registers (4KB).
+//
+#define DEN_NVFP4_KV_REGISTER_HOT_TOKENS  4
+
 // PRECISION TAIL: the LATEST DEN_NVFP4_KV_TAIL_TOKENS cache positions are kept at
 // F32 (exact); tokens older than the tail window are quantized to NVFP4 tiles.
 // Attention weights recent tokens most, so an exact recent window is near-lossless.
-// Default 256 is testable on 16 GB; override at runtime via env DEN_NVFP4_KV_TAIL.
-// The previous design kept only the first 4 tokens ("KVSink anchors") exact — that
-// was 256x too small AND conceptually inverted (attention barely weights the oldest
-// 4 tokens). This reverses the concept: exact window now slides at the FRONT.
-#define DEN_NVFP4_KV_TAIL_TOKENS    256    // default precision-tail size (F32), runtime-overridable
+//
+// VALUE: 1024. BeeLlama KVarN measured this at +11% KLD improvement over 256-tail
+// at 64k context (their largest single quality lever). 1024 tokens = 1024 × 2 heads
+// × 128 dim × 4 bytes × 2 (K+V) = 2.1 MB per layer × 41 layers = 86 MB total —
+// trivial VRAM cost for a measurable quality gain. Override at runtime via env
+// DEN_NVFP4_KV_TAIL. The previous design kept only the first 4 tokens exact
+// ("KVSink anchors") — 256× too small and conceptually inverted.
+#define DEN_NVFP4_KV_TAIL_TOKENS    1024   // default precision-tail size (F32), runtime-overridable. BeeLlama optimal: +11% KLD at 64k
 #define DEN_NVFP4_KV_TAIL_ENV       "DEN_NVFP4_KV_TAIL"
 #define DEN_NVFP4_KV_MAX_SEQ         4096
 #define DEN_NVFP4_KV_MAX_LAYERS      64
@@ -64,6 +93,13 @@ typedef struct {
     uint8_t * d_v_tiles;     // [(max_seq - tail_tokens) * n_kv_heads * 160] NVFP4 tiles
     uint8_t * d_scratch_tile;// [n_kv_heads * 160]
     float  * h_readback;     // pinned host readback
+    // Register-resident hot-token tracking: per-head top-4 attention scores + positions.
+    // d_hot_scores[head*4 + i] = attention weight of i-th hottest token (prev step).
+    // d_hot_positions[head*4 + i] = absolute cache position of that token.
+    // Buffers are nullptr before first attention call; sized [n_kv_heads * 4].
+    // GPU-resident, survives kernel launches, < 1 KB per layer total.
+    float * d_hot_scores;
+    int   * d_hot_positions;
     int seq_len;
     int max_seq;
     int tail_tokens;         // precision-tail size (latest N tokens kept F32); 0 => cache disabled

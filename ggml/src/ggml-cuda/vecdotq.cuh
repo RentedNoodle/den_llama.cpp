@@ -1361,3 +1361,108 @@ static __device__ __forceinline__ float vec_dot_iq4_xs_q8_1(
     const float d = __half2float(bq4->d) * __low2float(bq8_1[iqs/4].ds);
     return d * sumi;
 }
+
+// ============================================================================
+// DP4A PACKED FP16x2 — EXPERIMENTAL: INT8-quantized FP16 attention GEMV
+// ============================================================================
+//
+// HONEST MECHANISM REPORT (2026-08-09):
+//
+// DP4A (`__dp4a(a,b,c)`) computes: c + sum(int8(a_i) * int8(b_i)) for i=0..3.
+// It CANNOT directly multiply FP16 values — FP16 multiply requires exponent
+// addition + mantissa multiplication + rounding, which cannot be decomposed
+// into byte-wise INT8 multiplies.
+//
+// The "game engine HDR trick" uses `half2` SIMD (__hmul2, __hadd2) which gives
+// 2x FP16 throughput on CUDA FP16 cores. This is STANDARD CUDA, not DP4A, and
+// is ALREADY implemented in mmvf.cu (the `half2 sumh2[ncols_dst]` path at
+// lines 160-228 of mmvf.cu).
+//
+// What ACTUALLY gives 2x+ throughput vs half2:
+//   1. Quantize FP16 weights → INT8 (pre-computed, per-row scale)
+//   2. Quantize FP16 activations → INT8 (runtime, q8_1 format)
+//   3. DP4A computes 4 INT8 multiplies per instruction (vs 2 for half2)
+//   4. => 2x throughput vs half2, 4x vs scalar FP16
+//
+// Production path: convert FP16 attention weights to Q8_0 offline; the existing
+// vec_dot_q8_0_q8_1 path already uses DP4A. No new kernel needed.
+//
+// THIS IMPLEMENTATION: on-the-fly FP16→INT8 conversion using a fast bit-
+// manipulation approximation. Correctness caveats:
+//   - FP16 subnormals clamped to 0
+//   - Values |v| >= 128 saturate to ±127
+//   - Mantissa truncated to ~6-7 bits of precision
+//   - Accumulation order differs from true FP32 dot product
+// Use for experimentation only. For production: pre-quantize to Q8_0.
+//
+// sm_120a (Blackwell GB203): __dp4a is native, 1 instr, 4 INT8 MACC.
+
+// Fast FP16→INT8 conversion via bit manipulation.
+// FP16 layout: [15:sign][14:10:exponent(5)][9:0:mantissa(10)]
+// Value: (-1)^s * 2^(e-15) * (1 + m/1024) for normalized values
+// For INT8 range [-128,127]: exponent ~[7,21] (2^7=128)
+// This maps the FP16 mantissa+exponent to a signed INT8 with ~6-bit precision.
+static __device__ __forceinline__ int8_t fp16_to_int8_fast(const uint16_t h) {
+    const int s = (h >> 15) & 1;
+    const int e = (h >> 10) & 0x1F;
+    const int m = h & 0x3FF;
+
+    if (e == 0) { return 0; }                     // zero/subnormal → 0
+    if (e >= 22) { return s ? (int8_t)-128 : (int8_t)127; }  // |v| >= 128 → saturate
+
+    // shift = e - 8: maps exponent 15 (1.0) → shift 7 (128 as int8 base)
+    // Then we take top 7 mantissa bits for sub-integer precision
+    const int shift = e - 8;
+    int val;
+    if (shift >= 0) {
+        val = ((0x400 | m) << shift) >> 10;        // normalized int part
+    } else {
+        val = (0x400 | m) >> (10 - shift);         // fractional, shifted down
+    }
+    val = s ? -val : val;
+    return (int8_t)__clamp(val, -128, 127);
+}
+
+// Pack 4 FP16 values → int32 of 4 INT8 values for DP4A.
+// Reads 4 consecutive FP16 values, converts each to INT8.
+static __device__ __forceinline__ int fp16x4_to_int8x4_dp4a(const uint16_t * h4) {
+    const int i0 = (int)(fp16_to_int8_fast(h4[0])) & 0xFF;
+    const int i1 = (int)(fp16_to_int8_fast(h4[1])) & 0xFF;
+    const int i2 = (int)(fp16_to_int8_fast(h4[2])) & 0xFF;
+    const int i3 = (int)(fp16_to_int8_fast(h4[3])) & 0xFF;
+    return (i3 << 24) | (i2 << 16) | (i1 << 8) | i0;
+}
+
+#define VDR_F16_Q8_1_MMVQ 2
+#define QI_F16_Q8_1         8   // 8 INT32 positions per 32-element block (matches QK8_1=32: 32 INT8 / 4 = 8 INT32)
+
+// On-the-fly FP16→INT8 vec_dot using DP4A.
+// vbq   = FP16 weight data (raw half values at kbx*32 + iqs*4 offset)
+// bq8_1 = q8_1 activation (INT8 with per-block d-scale)
+// kbx   = block index (each "block" = 32 FP16 elements matching QK8_1)
+// iqs   = quant index within block (0,2,4,6 for 4-thread coverage of 8 INT32s)
+//
+// 4 threads cover 32 elements: thread 0→[0:7], thread 1→[8:15], etc.
+// Each thread processes VDR=2 INT32 groups = 8 FP16 values → 2 DP4A calls.
+static __device__ __forceinline__ float vec_dot_f16_q8_1(
+    const void * __restrict__ vbq, const block_q8_1 * __restrict__ bq8_1,
+    const int & kbx, const int & iqs) {
+
+    const uint16_t * hw = (const uint16_t *) vbq;
+    // weight: block kbx, INT32 offset iqs. Each INT32 = 4 FP16 values.
+    const int weight_base = kbx * QK8_1 + iqs * (QK8_1 / QI_F16_Q8_1);
+
+    int sumi = 0;
+
+#pragma unroll
+    for (int i = 0; i < VDR_F16_Q8_1_MMVQ; ++i) {
+        // Pack 4 FP16 weights → 1 int32 of 4 INT8 for DP4A
+        const int v = fp16x4_to_int8x4_dp4a(&hw[weight_base + i * (QK8_1 / QI_F16_Q8_1)]);
+        // Get 4 INT8 activations from q8_1 (packed INT32 at position iqs+i)
+        const int u = get_int_b4(bq8_1[0].qs, iqs + i);
+        sumi = ggml_cuda_dp4a(v, u, sumi);
+    }
+
+    const float d8 = __low2float(bq8_1[0].ds);  // activation dequant scale (per-block)
+    return d8 * (float)sumi;
+}

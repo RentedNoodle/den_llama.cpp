@@ -3,6 +3,7 @@
 #include "vecdotq.cuh"
 
 #include "mmq.cuh"
+#include "den_tile_ecc.cuh"
 
 template <ggml_type type, int J, bool fallback> static __device__ __forceinline__ void ggml_cuda_mmq_load_tiles_q1_0(
         const char * __restrict__ x, int * __restrict__ x_tile, const int kbx0, const int i_max, const int stride) {
@@ -1720,6 +1721,10 @@ template <ggml_type type, int J, bool fallback> static __device__ __forceinline_
 
 template <ggml_type type, int J, bool fallback> static __device__ __forceinline__ void ggml_cuda_mmq_load_tiles_nvfp4_nvfp4(
         const char * __restrict__ x, int * __restrict__ x_tile, const int kbx0, const int i_max, const int stride) {
+    // NOTE: CRC-8 ECC NOT applied here — GGUF block_nvfp4 structs (36 bytes: 4 scales + 32 nibbles)
+    // have no reserved byte for CRC storage. CRC-8 is only available in NULLGLASS 160B tiles
+    // (load_tiles_nullglass_nvfp4) where tile[153] holds the CRC byte. For GGUF-format NVFP4
+    // weights, bit-flip detection relies on host-side periodic validation of the GPU buffer.
     constexpr int warp_size       = ggml_cuda_get_physical_warp_size();
     constexpr int nwarps          = ggml_cuda_mmq_get_nthreads(type, J, fallback) / warp_size;
     constexpr int I               = ggml_cuda_mmq_get_I(type, J, fallback);
@@ -1809,16 +1814,24 @@ static __device__ __forceinline__ void ggml_cuda_mmq_load_tiles_nullglass_nvfp4(
         const int tile_idx = tile_base + i * tiles_per_row;
         const uint8_t * tile = (const uint8_t *)x + tile_idx * NULLGLASS_TILE_BYTES;
 
+        // CRC-8 ECC: verify tile integrity (bytes 0-151 vs stored CRC at byte 153)
+        // On mismatch: zero out SRAM for this tile (safe fallback — no contribution).
+        // Host monitors d_den_ecc_error_counts and re-uploads tiles exceeding threshold.
+        const int crc_bad = den_ecc_verify_tile(tile);
+        if (crc_bad) {
+            den_ecc_record_error(tile_idx);
+        }
+
         // Nibbles: 32 bytes per sub-block (64 elems * 4 bits = 32 bytes = 8 uint32)
         const uint32_t * src_qs = (const uint32_t *)(tile + sub_block * 32);
 
 #pragma unroll
         for (int sub = 0; sub < QK_NVFP4 / QK_NVFP4_SUB; ++sub) {
-            x_u32[i*sram_stride + 8*kbx + 2*sub + 0] = src_qs[2*sub + 0];
-            x_u32[i*sram_stride + 8*kbx + 2*sub + 1] = src_qs[2*sub + 1];
+            x_u32[i*sram_stride + 8*kbx + 2*sub + 0] = crc_bad ? 0 : src_qs[2*sub + 0];
+            x_u32[i*sram_stride + 8*kbx + 2*sub + 1] = crc_bad ? 0 : src_qs[2*sub + 1];
         }
 
         // Scales: 4 bytes of UE4M3 at tile offset 128 + sub_block*4
-        x_u32_scale[i*sram_stride] = *(const uint32_t *)(tile + 128 + sub_block * 4);
+        x_u32_scale[i*sram_stride] = crc_bad ? 0 : *(const uint32_t *)(tile + 128 + sub_block * 4);
     }
 }

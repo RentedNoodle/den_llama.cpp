@@ -9,9 +9,9 @@ NVFP4 KV accuracy (KLD=0, cos=1.0) holds or degrades with context length.
 The 500-token gate passed at KLD=0 but context was ~600 tokens (105 prompt + 500 gen).
 This tests at 1k/2k/4k/8k/16k to find where KLD starts accumulating.
 
-KEY INSIGHT: At 1k, 256 tail (F32) + ~744 tile (NVFP4). At 16k, still 256 tail
-but 15,744 tile positions. KLD might be zero at small scale but diverge at scale.
-This is the reviewers' #1 concern.
+KEY INSIGHT: At 1k, 1024 tail (F32) = all tokens exact (no tile test). At 2k, still 1024 tail
++ ~976 tile (NVFP4). At 16k, 1024 tail + ~15k tile positions. KLD might be zero
+at small scale but diverge at scale. This is the reviewers' #1 concern.
 
 VRAM WARNING: Two F32 KV caches at large contexts eat VRAM fast.
   - 9B model at 8k: ~12.8 GB KV + ~2.5 GB model = ~15.3 GB (tight)
@@ -224,6 +224,11 @@ Examples:
         help="Write results to CSV file.",
     )
     parser.add_argument(
+        "--stride", type=int, default=1,
+        help="Only evaluate KLD/cos every Nth token (default: 1 = all). "
+             "5-10x speedup for long contexts. Curve is empirically flat.",
+    )
+    parser.add_argument(
         "--tail-tokens", type=int, default=NVFP4_KV_TAIL_TOKENS,
         help=f"Precision tail size (default: {NVFP4_KV_TAIL_TOKENS}). "
              "Must match DEN_NVFP4_KV_TAIL env var.",
@@ -274,6 +279,7 @@ Examples:
     print(f"  GPU layers   : {args.ngl}")
     print(f"  Threads      : {args.threads}")
     print(f"  Expert stage : {expert_stage}")
+    print(f"  Stride       : {args.stride}")
     print(f"  Tail tokens  : {args.tail_tokens}")
     print(f"  Total runs   : {len(context_sizes)}")
     print(f"{'='*70}")
@@ -297,6 +303,7 @@ Examples:
                 expert_stage=expert_stage,
                 prompt=args.prompt,
                 tail_tokens=args.tail_tokens,
+                stride=args.stride,
             )
         except Exception as e:
             import traceback
