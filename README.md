@@ -6,7 +6,7 @@ den_llama.cpp is the neural execution engine behind [Project Den](https://github
 
 **Project Den is the cognitive architecture. This repo is the machine underneath it.**
 
-It started as a llama.cpp fork. It's becoming a heterogeneous neural runtime — one that treats compute, memory, state, and model execution as a single schedulable system on constrained consumer hardware.
+It started as a llama.cpp fork. It's becoming a heterogeneous neural runtime. One that treats compute, memory, state, and model execution as a single schedulable system on constrained consumer hardware.
 
 The immediate question is practical: **how much persistent AI cognition fits in one consumer GPU?**
 
@@ -141,7 +141,7 @@ Prerequisites: CUDA 13.3, sm_120a GPU (RTX 5070 Ti / GB203), Ninja, MSVC 2022.
 
 ## .den Format
 
-`.den` is the project's native weight format — a 160B NULLGLASS tile container that maps directly to OMMA register fragments. GGUF stays for compatibility; `.den` is the native path.
+`.den` is the project's native weight format: a 160B NULLGLASS tile container that maps directly to OMMA register fragments. GGUF stays for compatibility; `.den` is the native path.
 
 **Current (implemented):**
 - 128B E2M1 nibbles + 16B UE4M3 block scales + metadata
@@ -164,10 +164,10 @@ Prerequisites: CUDA 13.3, sm_120a GPU (RTX 5070 Ti / GB203), Ninja, MSVC 2022.
 Project Den (cognitive thesis)
       │
       ▼
-Den Runtime (execution substrate — emerging)
+Den Runtime (execution substrate, emerging)
       │
       ▼
-den_llama.cpp (current engine host — YOU ARE HERE)
+den_llama.cpp (current engine host. YOU ARE HERE)
       │
       ▼
 Blackwell GPU (GB203 / sm_120a / 16 GB)
@@ -196,7 +196,7 @@ Project_Den
               └── GPU scheduling
 ```
 
-Project Den asks the cognitive question. This repo builds the body. Eventually the boundary moves — that's intentional.
+Project Den asks the cognitive question. This repo builds the body. Eventually the boundary moves. That's intentional.
 
 ---
 
@@ -244,13 +244,13 @@ den_llama.cpp
 
 ## Status legend
 
-| Badge | Meaning |
-|-------|---------|
-| 🟢 **VERIFIED** | Implemented, built, tested, gate-passed |
-| 🔵 **IMPLEMENTED** | Code exists, broader validation ongoing |
-| 🟡 **EXPERIMENTAL** | Working research code, not production-stable |
-| 🟣 **DESIGNED** | Architecture/spec exists, implementation pending |
-| ⚪ **DEFERRED** | Not being built yet |
+| Marker | Meaning |
+|--------|---------|
+| **[*]** VERIFIED | Implemented, built, tested, gate-passed |
+| **[+]** IMPLEMENTED | Code exists, broader validation ongoing |
+| **[~]** EXPERIMENTAL | Working research code, not production-stable |
+| **[ ]** DESIGNED | Architecture/spec exists, implementation pending |
+| **[-]** DEFERRED | Not being built yet |
 
 Research engine. Active development. Architecture deliberately ahead of implementation in several areas. Check verification docs before treating planned components as available.
 
