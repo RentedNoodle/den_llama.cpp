@@ -3662,8 +3662,8 @@ llama_context * llama_init_from_model(
             uint32_t il0 = 0;
             while (il0 < model->hparams.n_layer_all && !model->hparams.has_kv(il0)) il0++;
             if (il0 < model->hparams.n_layer_all) {
-                int thrift = (getenv("DEN_THRIFT_ATTENTION") &&
-                              getenv("DEN_THRIFT_ATTENTION")[0] == '1') ? 1 : 0;
+                int thrift = (!getenv("DEN_THRIFT_ATTENTION") ||
+                              getenv("DEN_THRIFT_ATTENTION")[0] != '0') ? 1 : 0;
                 ggml_backend_cuda_nvfp4_kv_init(
                     (int)model->hparams.n_layer_kv(),
                     (int)model->hparams.n_head_kv(il0),
