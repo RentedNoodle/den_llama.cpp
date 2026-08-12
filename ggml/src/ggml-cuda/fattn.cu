@@ -597,7 +597,7 @@ static void ggml_cuda_flash_attn_ext_nvfp4_kv(ggml_backend_cuda_context & ctx, g
     }
     const float * d_Q = (const float *)dst->src[0]->data;
     float * d_output = (float *)dst->data;
-    int n_heads = (int)dst->src[0]->ne[1];
+    int n_heads = (int)dst->src[0]->ne[2];
     int ret = den_nvfp4_kv_attention(&g_nvfp4_kv, il, d_Q, d_output, n_heads, ctx.stream());
     if (ret != 0) {
         ggml_cuda_flash_attn_ext_vec(ctx, dst);
