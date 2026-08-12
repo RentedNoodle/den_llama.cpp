@@ -5,6 +5,7 @@
 #include "den_expert_stage.h"
 
 #include "ggml-cuda/fattn-nvfp4-kv.cuh"
+#include "ggml-cuda/den-l2-persist.cuh"   // Den: L2 persistence (Mech 41/42)
 
 #include "ggml-cuda/allreduce.cuh"
 #include "ggml-cuda/common.cuh"
@@ -130,10 +131,21 @@ void ggml_cuda_set_device(int device) {
     CUDA_CHECK(cudaGetDevice(&current_device));
 
     if (physical_device == current_device) {
+        // Den: device already current — still guarantee L2 persistence init runs once
+        if (den_l2_persist_enabled()) {
+            den_l2_persist_init();
+        }
         return;
     }
 
     CUDA_CHECK(cudaSetDevice(physical_device));
+
+    // Den: L2 persistence init (Mech 41/42) right after cudaSetDevice, gated by
+    // DEN_L2_PERSIST (default ON; DEN_L2_PERSIST=0 disables). Idempotent — only the
+    // first call probes support and reserves the L2 budget. Non-fatal on failure.
+    if (den_l2_persist_enabled()) {
+        den_l2_persist_init();
+    }
 }
 
 int ggml_cuda_get_device() {
@@ -803,6 +815,20 @@ static void ggml_backend_cuda_buffer_set_tensor(ggml_backend_buffer_t buffer, gg
     ggml_cuda_set_device(ctx->device);
     CUDA_CHECK(cudaMemcpyAsync((char *) tensor->data + offset, data, size, cudaMemcpyHostToDevice, cudaStreamPerThread));
     CUDA_CHECK(cudaStreamSynchronize(cudaStreamPerThread));
+
+    // Den: L2 persistence hint on weight tensors during model load (Mech 41/42).
+    // Pins read-mostly weight slabs (incl. MoE gate/up/down expert weights) in L2
+    // via cuMemAdvise SET_READ_MOSTLY + SET_ACCESSED_BY + SET_PREFERRED_LOCATION.
+    // Gated + size-filtered to the largest weight tensors only (offset==0 = full
+    // tensor, >=1 MiB, name ends in ".weight"). Hint itself is non-fatal.
+    // TODO(Den): dedicated expert pinning via den_l2_persist_pin_experts() once the
+    //   gate/up/down device pointers are collected per-expert (needs MoE tensor map).
+    if (offset == 0 && size >= (1 << 20)) {
+        const char * tn = tensor->name;
+        if (tn && strstr(tn, ".weight")) {
+            den_l2_persist_hint(tensor->data, size, 1);
+        }
+    }
 }
 
 static void ggml_backend_cuda_buffer_get_tensor(ggml_backend_buffer_t buffer, const ggml_tensor * tensor, void * data, size_t offset, size_t size) {

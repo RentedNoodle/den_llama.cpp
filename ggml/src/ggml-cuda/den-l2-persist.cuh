@@ -20,7 +20,7 @@
 //   - Default budget: 8 MB (leaves 40 MB for transient expert streams)
 //
 // Environment:
-//   DEN_L2_PERSIST=1  — enable L2 persistence (REQUIRED; default: off)
+//   DEN_L2_PERSIST=0  — disable L2 persistence (default: ON)
 //   DEN_L2_PERSIST_MB — MB to reserve for L2 (default: 8, max: 36)
 //
 // Usage:
@@ -163,13 +163,13 @@ static inline int den_l2_do_mem_advise(CUdeviceptr dptr, size_t bytes,
 // ═════════════════════════════════════════════════════════════════════════════
 
 // ── den_l2_persist_enabled — check DEN_L2_PERSIST env var ──────────────────
-// Returns 1 if the user has opted into L2 persistence.
-// Must be called before any hint/pin calls; init checks this internally.
+// ON by default (GB203: 48MB L2, expert weights are the hot reuse set).
+// DEN_L2_PERSIST=0 disables. Must be called before any hint/pin calls.
 static inline int den_l2_persist_enabled(void) {
     static int checked = 0, enabled = 0;
     if (!checked) {
         const char * env = getenv("DEN_L2_PERSIST");
-        enabled = (env && env[0] == '1');
+        enabled = (!env || env[0] != '0');
         checked = 1;
     }
     return enabled;
@@ -249,7 +249,7 @@ static inline int den_l2_persist_init(void) {
 
     fprintf(stderr, "[L2-PERSIST] init: device=%d L2=%dMB budget=%dMB granted=%zuMB "
             "cuMemAdvise=%s accessPolicy=%s\n",
-            g_den_l2.device_id, l2_total, g_den_l2.budget_mb,
+            g_den_l2.device_id, l2_total / (1024 * 1024), g_den_l2.budget_mb,
             g_den_l2.reserved_bytes / (1024 * 1024),
             g_den_l2.cap_cu_mem_advise ? "OK" : "N/A",
             g_den_l2.cap_access_policy  ? "OK" : "N/A");
