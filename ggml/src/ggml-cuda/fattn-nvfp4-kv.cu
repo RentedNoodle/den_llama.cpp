@@ -426,19 +426,20 @@ __global__ void kv_dequantize_kernel(
 //
 // Each block = one head, blockDim = head_dim (128 or 256 threads).
 // Shared memory: smem[seq_len scores + n_warps warp sums] float.
-// Q@K^T uses on-the-fly tile dequant via kv_dequantize_element.
+// Tile-region K/V come from the B2 FP32 dequant cache (d_k_dequant/d_v_dequant),
+// populated ONCE at store time, so the gqa_ratio query-head blocks sharing a kv_head
+// do not each re-dequantize the identical tile bytes.
 // ═══════════════════════════════════════════════════════════
 
 __global__ void kv_nvfp4_attention_kernel(
     const float * __restrict__ d_Q,
     const float * __restrict__ d_k_tail,
     const float * __restrict__ d_v_tail,
-    const uint8_t * __restrict__ d_k_tiles,
-    const uint8_t * __restrict__ d_v_tiles,
+    const float * __restrict__ d_k_dequant,
+    const float * __restrict__ d_v_dequant,
     float * __restrict__ d_output,
     int n_heads, int n_kv_heads, int head_dim,
-    int seq_len, int max_seq, int tail_tokens,
-    int thrift_attention)
+    int seq_len, int max_seq, int tail_tokens)
 {
     int head = blockIdx.x;
     if (head >= n_heads) return;
@@ -451,8 +452,6 @@ __global__ void kv_nvfp4_attention_kernel(
     // when n_heads % n_kv_heads == 0, but explicit about the grouping.
     const int gqa_ratio = (n_kv_heads > 0) ? (n_heads / n_kv_heads) : 1;
     int kv_head = (gqa_ratio <= 1) ? head : (head / gqa_ratio);
-    int k_tile_bytes = thrift_attention ? DEN_NVFP4_KV_TILE_BYTES_K8 : DEN_NVFP4_KV_TILE_BYTES;
-    int v_tile_bytes = thrift_attention ? DEN_NVFP4_KV_TILE_BYTES_K8 : DEN_NVFP4_KV_TILE_BYTES;
 
     // PRECISION TAIL: the latest `tail_tokens` cache positions live at F32 in
     // d_k_tail/d_v_tail (slot = position % tail_tokens). Positions older than the
@@ -476,14 +475,11 @@ __global__ void kv_nvfp4_attention_kernel(
             int slot = t % tail_tokens;
             k_val = d_k_tail[((size_t)slot * n_kv_heads + kv_head) * head_dim + tid];
         } else {
-            // Old context: NVFP4 tile at absolute position t.
-            const uint8_t * tile = d_k_tiles +
-                ((size_t)t * n_kv_heads + kv_head) * k_tile_bytes;
-            if (thrift_attention) {
-                k_val = kv_dequantize_element_k8(tile, tid);
-            } else {
-                k_val = kv_dequantize_element(tile, tid);
-            }
+            // Old context: NVFP4 tile at absolute position t. The tile bytes were
+            // dequantized ONCE at store time into the B2 GQA dequant cache — read the
+            // FP32 value directly (L2) instead of re-running the per-element dequant
+            // in every one of the gqa_ratio query-head blocks that share this kv_head.
+            k_val = d_k_dequant[((size_t)t * n_kv_heads + kv_head) * head_dim + tid];
         }
 
         float partial = q_val * k_val;
@@ -532,14 +528,9 @@ __global__ void kv_nvfp4_attention_kernel(
             int slot = t % tail_tokens;
             v_val = d_v_tail[((size_t)slot * n_kv_heads + kv_head) * head_dim + tid];
         } else {
-            // Old context: NVFP4 tile at absolute position t.
-            const uint8_t * tile = d_v_tiles +
-                ((size_t)t * n_kv_heads + kv_head) * v_tile_bytes;
-            if (thrift_attention) {
-                v_val = kv_dequantize_element_k8(tile, tid);
-            } else {
-                v_val = kv_dequantize_element(tile, tid);
-            }
+            // Old context: NVFP4 tile at absolute position t. Read the pre-dequantized
+            // FP32 V from the B2 GQA dequant cache (see K path above).
+            v_val = d_v_dequant[((size_t)t * n_kv_heads + kv_head) * head_dim + tid];
         }
         output_val += smem_scores[t] * v_val;
     }
@@ -558,6 +549,8 @@ __global__ void kv_store_quantize_kernel(
     uint8_t     * __restrict__ d_v_tiles,
     float       * __restrict__ d_k_tail,
     float       * __restrict__ d_v_tail,
+    float       * __restrict__ d_k_dequant,
+    float       * __restrict__ d_v_dequant,
     int n_kv_heads, int head_dim,
     int seq_pos, int max_seq, int tail_tokens,
     int store_k, int store_v,
@@ -594,6 +587,16 @@ __global__ void kv_store_quantize_kernel(
                 } else {
                     kv_quantize_tile(k_src, k_tile, head_dim, hist_k);
                 }
+                // B2 GQA dequant cache: dequantize the tile we just wrote and stash
+                // the exact FP32 values so the gqa_ratio query-head blocks read from
+                // here (L2) instead of each re-dequantizing the tile bytes. Uses the
+                // SAME dequant formulas as kv_dequantize_element(_k8) → bit-identical.
+                float * k_deq = d_k_dequant + ((size_t)evict_pos * n_kv_heads + h) * head_dim;
+                if (thrift_attention) {
+                    kv_dequantize_tile_k8(k_tile, k_deq, head_dim);
+                } else {
+                    kv_dequantize_tile(k_tile, k_deq, head_dim);
+                }
             }
             if (store_v) {
                 uint8_t * v_tile = d_v_tiles + ((size_t)evict_pos * n_kv_heads + h) * v_tile_bytes;
@@ -601,6 +604,12 @@ __global__ void kv_store_quantize_kernel(
                     kv_quantize_tile_k8(v_src, v_tile, head_dim, hist_v);
                 } else {
                     kv_quantize_tile(v_src, v_tile, head_dim, hist_v);
+                }
+                float * v_deq = d_v_dequant + ((size_t)evict_pos * n_kv_heads + h) * head_dim;
+                if (thrift_attention) {
+                    kv_dequantize_tile_k8(v_tile, v_deq, head_dim);
+                } else {
+                    kv_dequantize_tile(v_tile, v_deq, head_dim);
                 }
             }
         }
@@ -755,6 +764,8 @@ int den_nvfp4_kv_init(den_nvfp4_kv_cache * cache,
     if (tile_count < 0) tile_count = 0;
     size_t k_tiles_per_layer = (size_t)tile_count * n_kv_heads * k_tile_bytes;
     size_t v_tiles_per_layer = (size_t)tile_count * n_kv_heads * v_tile_bytes;
+    // B2 GQA dequant cache: FP32 mirrors of every quantized K/V tile position.
+    size_t dequant_per_layer = (size_t)tile_count * n_kv_heads * head_dim * sizeof(float);
 
     int l = 0;
     for (l = 0; l < n_attn_layers; l++) {
@@ -767,6 +778,8 @@ int den_nvfp4_kv_init(den_nvfp4_kv_cache * cache,
             if (cudaMalloc(&layer->d_k_tiles, k_tiles_per_layer) != cudaSuccess) goto fail;
             if (cudaMalloc(&layer->d_v_tiles, v_tiles_per_layer) != cudaSuccess) goto fail;
             if (cudaMalloc(&layer->d_scratch_tile, (size_t)n_kv_heads * k_tile_bytes) != cudaSuccess) goto fail;
+            if (cudaMalloc(&layer->d_k_dequant, dequant_per_layer) != cudaSuccess) goto fail;
+            if (cudaMalloc(&layer->d_v_dequant, dequant_per_layer) != cudaSuccess) goto fail;
         }
 
         if (cudaMallocHost(&layer->h_readback, tail_bytes) != cudaSuccess) goto fail;
@@ -780,6 +793,8 @@ int den_nvfp4_kv_init(den_nvfp4_kv_cache * cache,
             cudaMemset(layer->d_k_tiles,      0, k_tiles_per_layer);
             cudaMemset(layer->d_v_tiles,      0, v_tiles_per_layer);
             cudaMemset(layer->d_scratch_tile, 0, (size_t)n_kv_heads * k_tile_bytes);
+            cudaMemset(layer->d_k_dequant,    0, dequant_per_layer);
+            cudaMemset(layer->d_v_dequant,    0, dequant_per_layer);
         }
 
         layer->max_seq     = cache->max_seq;
@@ -857,6 +872,7 @@ int den_nvfp4_kv_store(den_nvfp4_kv_cache * cache, int layer,
         k_ptr, v_ptr,
         kv_layer->d_k_tiles, kv_layer->d_v_tiles,
         kv_layer->d_k_tail, kv_layer->d_v_tail,
+        kv_layer->d_k_dequant, kv_layer->d_v_dequant,
         cache->n_kv_heads, cache->head_dim,
         seq_pos, kv_layer->max_seq, kv_layer->tail_tokens,
         store_k, store_v,
@@ -959,11 +975,10 @@ int den_nvfp4_kv_attention(den_nvfp4_kv_cache * cache, int layer,
     kv_nvfp4_attention_kernel<<<n_heads, cache->head_dim, smem_bytes, stream>>>(
         d_Q,
         kv_layer->d_k_tail, kv_layer->d_v_tail,
-        kv_layer->d_k_tiles, kv_layer->d_v_tiles,
+        kv_layer->d_k_dequant, kv_layer->d_v_dequant,
         d_output,
         n_heads, cache->n_kv_heads, cache->head_dim,
-        seq_len, kv_layer->max_seq, kv_layer->tail_tokens,
-        cache->thrift_attention);
+        seq_len, kv_layer->max_seq, kv_layer->tail_tokens);
 
     CUDA_CHECK(cudaGetLastError());
     return 0;
@@ -1009,6 +1024,10 @@ void den_nvfp4_kv_reset_all_seq_len(den_nvfp4_kv_cache * cache) {
             size_t vt_bytes = (size_t)tile_count * layer->n_kv_heads * v_tb;
             cudaMemset(layer->d_k_tiles, 0, kt_bytes);
             cudaMemset(layer->d_v_tiles, 0, vt_bytes);
+            // B2 dequant cache mirrors the tiles — zero it too for silent zero-score.
+            size_t deq_bytes = (size_t)tile_count * layer->n_kv_heads * layer->head_dim * sizeof(float);
+            if (layer->d_k_dequant) cudaMemset(layer->d_k_dequant, 0, deq_bytes);
+            if (layer->d_v_dequant) cudaMemset(layer->d_v_dequant, 0, deq_bytes);
         }
     }
 }
@@ -1071,6 +1090,8 @@ void den_nvfp4_kv_free(den_nvfp4_kv_cache * cache) {
         if (layer->d_k_tiles)     cudaFree(layer->d_k_tiles);
         if (layer->d_v_tiles)     cudaFree(layer->d_v_tiles);
         if (layer->d_scratch_tile)cudaFree(layer->d_scratch_tile);
+        if (layer->d_k_dequant)   cudaFree(layer->d_k_dequant);
+        if (layer->d_v_dequant)   cudaFree(layer->d_v_dequant);
         if (layer->h_readback)    cudaFreeHost(layer->h_readback);
     }
     free(cache->layers);

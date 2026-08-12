@@ -63,6 +63,13 @@ typedef struct {
     uint8_t * d_k_tiles;     // [(max_seq - tail_tokens) * n_kv_heads * 160] NVFP4 tiles (tokens OLDER than the tail)
     uint8_t * d_v_tiles;     // [(max_seq - tail_tokens) * n_kv_heads * 160] NVFP4 tiles
     uint8_t * d_scratch_tile;// [n_kv_heads * 160]
+    // B2 GQA dequant cache: the SAME K/V tile bytes are dequantized by gqa_ratio
+    // query-head blocks independently (one block per query head). These mirrors
+    // hold the exact FP32 dequantized tile values (populated once at store/evict
+    // time), so all gqa_ratio query-head blocks read FP32 from L2 instead of
+    // re-running the per-element tile dequant. Size: tile_count * n_kv_heads * head_dim.
+    float  * d_k_dequant;    // [(max_seq - tail_tokens) * n_kv_heads * head_dim] F32 — dequantized K mirror
+    float  * d_v_dequant;    // [(max_seq - tail_tokens) * n_kv_heads * head_dim] F32 — dequantized V mirror
     float  * h_readback;     // pinned host readback
     int seq_len;
     int max_seq;
