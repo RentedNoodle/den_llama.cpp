@@ -1,5 +1,12 @@
 cmake_minimum_required(VERSION 3.14...3.28) # for add_link_options and implicit target directories.
 
+# cmake >= 4.1 flags CMP0194 (MSVC not an ASM assembler) when ASM is enabled.
+# NEW breaks MSVC+Ninja (llama.cpp PR #21934 reverted it). OLD restores the
+# working behavior with no warning; x64 uses no ASM sources anyway.
+if(POLICY CMP0194 AND MSVC)
+    cmake_policy(SET CMP0194 OLD)
+endif()
+
 project("ggml" C CXX ASM)
 
 ### GGML Version

@@ -224,23 +224,34 @@ def _load_llama_dll() -> CDLL:
     dll_dir = str(LLAMA_DLL_DIR)
 
     # Add DLL directory to search path (Windows 8+)
-    if hasattr(os, "add_dll_directory"):
-        os.add_dll_directory(dll_dir)
+    # Must add CUDA Toolkit dirs BEFORE any DLL loading for dependency resolution
+    extra_dirs = [
+        dll_dir,
+        r"C:\Program Files\NVIDIA GPU Computing Toolkit\CUDA\v13.3\bin\x64",
+        str(PROJECT_DIR.parent / "den_llama.cpp_legacy" / "build_ninja" / "bin"),
+    ]
+    for ed in extra_dirs:
+        if os.path.isdir(ed):
+            if hasattr(os, "add_dll_directory"):
+                try:
+                    os.add_dll_directory(ed)
+                except Exception:
+                    pass
+            if ed not in os.environ.get("PATH", ""):
+                os.environ["PATH"] = ed + os.pathsep + os.environ.get("PATH", "")
 
-    # Prepend to PATH so runtime dependencies are found
-    if dll_dir not in os.environ.get("PATH", ""):
-        os.environ["PATH"] = dll_dir + os.pathsep + os.environ.get("PATH", "")
-
-    # Load dependent DLLs first
-    for dep in ["ggml.dll", "ggml-cpu.dll", "ggml-base.dll"]:
+    # Load in dependency order (checked with dumpbin /dependents)
+    # ggml.dll -> ggml-cuda.dll -> cublas64_13.dll, cudart64_13.dll
+    # ggml-cuda.dll -> ggml-base.dll
+    # Load order: base -> cpu -> cuda -> ggml -> llama
+    load_order = ["ggml-base.dll", "ggml-cpu.dll", "ggml-cuda.dll", "ggml.dll"]
+    for dep in load_order:
         dep_path = os.path.join(dll_dir, dep)
         if os.path.isfile(dep_path):
-            ctypes.CDLL(dep_path)
-
-    # Load CUDA runtime
-    cuda_path = os.path.join(dll_dir, "cudart64_13.dll")
-    if os.path.isfile(cuda_path):
-        ctypes.CDLL(cuda_path)
+            try:
+                ctypes.CDLL(dep_path)
+            except Exception:
+                pass
 
     # Load llama.dll
     lib_path = os.path.join(dll_dir, "llama.dll")

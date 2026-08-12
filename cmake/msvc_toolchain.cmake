@@ -9,6 +9,17 @@
 # either the standalone nvidia/cuda_cccl package OR the CUDA-13.x wheel layout
 # nvidia/cu13/include/cccl (cub / libcudacxx / thrust nested there).
 
+# cmake's NVIDIA.cmake version table stops at CUDA 12 (maps to C++20) and has no
+# entry for 13.3, so __compiler_check_default_language_standard() fatals with
+# "CMAKE_CUDA_STANDARD_COMPUTED_DEFAULT ... should be set". A fresh configure
+# (no cached CMakeCache) hits this. Pin the defaults so enable_language(CUDA)
+# works on a clean build. The old build only worked because its CMakeCache had
+# these cached from a pre-CUDA-13 configure.
+if(NOT DEFINED CMAKE_CUDA_STANDARD_COMPUTED_DEFAULT)
+    set(CMAKE_CUDA_STANDARD_COMPUTED_DEFAULT "17" CACHE INTERNAL "")
+    set(CMAKE_CUDA_EXTENSIONS_COMPUTED_DEFAULT "OFF" CACHE INTERNAL "")
+endif()
+
 # Find pip CUDA 13.3 nvcc
 set(PIP_CUDA_PATHS
     "C:/Users/james/AppData/Local/Programs/Python/Python314/Lib/site-packages/nvidia/cu13"
