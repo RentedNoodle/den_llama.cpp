@@ -170,6 +170,12 @@ public:
     // Byte size of tensor data in GGML format (destination buffer size for read_tensor_data)
     size_t get_tensor_size(size_t i) const;
 
+    // File offset and size of the tensor's raw data in the .den file
+    // (for registering with llama_tensor_weight offsets)
+    uint64_t get_tensor_data_offset(size_t i) const;
+    uint64_t get_tensor_data_size(size_t i) const;
+    uint64_t get_header_data_offset() const;  // base offset to add to tensor offsets
+
     // Read tensor data into dst, converting from .den format to GGML format.
     // NVFP4: NULLGLASS 160B tiles → GGML block_nvfp4 blocks
     // BF16:  direct memcpy

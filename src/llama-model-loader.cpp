@@ -3,6 +3,7 @@
 #include "ggml-alloc.h"
 #include "ggml.h"
 #include "gguf.h"
+#include "llama-den-loader.h"
 #include "llama-hparams.h"
 #include "llama.h"
 
@@ -545,8 +546,24 @@ llama_model_loader::llama_model_loader(
 
     this->use_mmap      = load_mode == LLAMA_LOAD_MODE_MMAP || load_mode == LLAMA_LOAD_MODE_MMAP_MLOCK;
     this->use_direct_io = load_mode == LLAMA_LOAD_MODE_DIRECT_IO;
+    this->check_tensors = check_tensors;
+    this->no_alloc      = no_alloc;
+    this->load_mtp      = load_mtp;
 
     if (!fname.empty()) {
+        // Check for .den native format
+        const std::string den_ext = fname.size() >= 4 ? fname.substr(fname.size() - 4) : "";
+        bool is_den = (den_ext == ".den");
+        if (is_den) {
+            if (!load_den_model(fname)) {
+                throw std::runtime_error(format("%s: failed to load .den model from %s", __func__, fname.c_str()));
+            }
+            // load_den_model() has opened the file, created metadata,
+            // built weights_map, and set up files[]/contexts[].
+            // It also sets n_kv, n_tensors, fver, so skip GGUF path.
+            return;
+        }
+
         // Load the main GGUF
         struct ggml_context * ctx = NULL;
         struct gguf_init_params params = {
@@ -810,10 +827,6 @@ llama_model_loader::llama_model_loader(
         LLAMA_LOG_WARN("%s: mmap is not supported on this platform\n", __func__);
         this->use_mmap = false;
     }
-
-    this->check_tensors = check_tensors;
-    this->no_alloc = no_alloc;
-    this->load_mtp = load_mtp;
 }
 
 std::string llama_model_loader::get_arch_name() const {
@@ -1303,6 +1316,160 @@ struct ggml_tensor * llama_model_loader::create_tensor(
     }
 
     return tensor;
+}
+
+bool llama_model_loader::load_den_model(const std::string & fname) {
+    llama_den_loader den;
+    if (!den.open(fname.c_str())) {
+        LLAMA_LOG_ERROR("%s: failed to open .den file: %s\n", __func__, den.get_error().c_str());
+        return false;
+    }
+
+    // .den uses direct file reads (not mmap) — disable mmap to avoid
+    // "virtual buffer with null base" assert in memory_breakdown()
+    use_mmap = false;
+    use_direct_io = true;
+
+    const bool den_moe = den.get_n_experts() > 0;
+    llm_kv = LLM_KV(den_moe ? LLM_ARCH_QWEN35MOE : LLM_ARCH_QWEN35);
+    arch_name = den_moe ? "qwen35moe" : "qwen35";
+
+    // ── Build GGUF metadata from .den header ───────────────────────────
+    metadata = gguf_init_empty();
+    metadata_ptr.reset(metadata);
+
+#define DEN_SET_U32(kid, val) gguf_set_val_u32(metadata, llm_kv(kid).c_str(), (uint32_t)(val))
+#define DEN_SET_F32(kid, val) gguf_set_val_f32(metadata, llm_kv(kid).c_str(), (float)(val))
+    gguf_set_val_str(metadata, llm_kv(LLM_KV_GENERAL_ARCHITECTURE).c_str(), arch_name.c_str());
+    DEN_SET_U32(LLM_KV_BLOCK_COUNT,          den.get_n_layers());
+    DEN_SET_U32(LLM_KV_CONTEXT_LENGTH,       262144);
+    DEN_SET_U32(LLM_KV_EMBEDDING_LENGTH,     den.get_hidden_size());
+    DEN_SET_U32(LLM_KV_FEED_FORWARD_LENGTH,  den.get_ffn_size());
+    DEN_SET_U32(LLM_KV_VOCAB_SIZE,           den.get_vocab_size());
+    DEN_SET_U32(LLM_KV_ATTENTION_HEAD_COUNT,     den.get_n_heads());
+    DEN_SET_U32(LLM_KV_ATTENTION_HEAD_COUNT_KV,  den.get_n_kv_heads());
+    DEN_SET_F32(LLM_KV_ATTENTION_LAYERNORM_RMS_EPS, den.get_rms_norm_eps());
+    DEN_SET_U32(LLM_KV_ATTENTION_KEY_LENGTH,  den.get_head_dim());
+    DEN_SET_U32(LLM_KV_ATTENTION_VALUE_LENGTH, den.get_head_dim());
+    {
+        const uint32_t sections[4] = { 11, 11, 10, 0 };
+        gguf_set_arr_data(metadata, llm_kv(LLM_KV_ROPE_DIMENSION_SECTIONS).c_str(), GGUF_TYPE_UINT32, sections, 4);
+    }
+    DEN_SET_U32(LLM_KV_ROPE_DIMENSION_COUNT, den.get_n_rot());
+    DEN_SET_F32(LLM_KV_ROPE_FREQ_BASE,       den.get_rope_theta());
+    DEN_SET_U32(LLM_KV_SSM_CONV_KERNEL,      den.get_ssm_conv_kernel());
+    DEN_SET_U32(LLM_KV_SSM_STATE_SIZE,       den.get_ssm_state_size());
+    DEN_SET_U32(LLM_KV_SSM_GROUP_COUNT,      den.get_head_dim() > 0 ? den.get_head_dim() / 16 : 16);
+    DEN_SET_U32(LLM_KV_SSM_TIME_STEP_RANK,   32);
+    DEN_SET_U32(LLM_KV_SSM_INNER_SIZE,       den.get_ssm_inner_size());
+    DEN_SET_U32(LLM_KV_FULL_ATTENTION_INTERVAL, den.get_full_attn_interval());
+    DEN_SET_U32(LLM_KV_EXPERT_COUNT,         den.get_n_experts());
+    DEN_SET_U32(LLM_KV_EXPERT_USED_COUNT,    den.get_n_experts_used());
+    // MoE hparams
+    if (den_moe) {
+        uint32_t ffn_exp = den.get_ffn_size() > 0 ? den.get_ffn_size() : 512;
+        DEN_SET_U32(LLM_KV_EXPERT_FEED_FORWARD_LENGTH, ffn_exp);
+        DEN_SET_U32(LLM_KV_EXPERT_SHARED_FEED_FORWARD_LENGTH, ffn_exp);
+    }
+    gguf_set_val_u32(metadata, llm_kv(LLM_KV_GENERAL_FILE_TYPE).c_str(), 1);
+    gguf_set_val_u32(metadata, llm_kv(LLM_KV_GENERAL_QUANTIZATION_VERSION).c_str(), 2);
+#undef DEN_SET_U32
+#undef DEN_SET_F32
+
+    // ── Graft tokenizer from companion vocab GGUF ──────────────────────
+    {
+        std::string vocab_path = fname;
+        const size_t dot = vocab_path.find_last_of('.');
+        if (dot != std::string::npos) vocab_path = vocab_path.substr(0, dot);
+        vocab_path += ".vocab.gguf";
+        struct ggml_context * vocab_ctx = NULL;
+        struct gguf_init_params vparams = { /*.no_alloc=*/ true, /*.ctx=*/ &vocab_ctx };
+        struct gguf_context * vocab_meta = gguf_init_from_file(vocab_path.c_str(), vparams);
+        if (vocab_meta) {
+            gguf_set_kv(metadata, vocab_meta);
+            gguf_free(vocab_meta);
+            if (vocab_ctx) ggml_free(vocab_ctx);
+            LLAMA_LOG_INFO("%s: grafted tokenizer KV from %s\n", __func__, vocab_path.c_str());
+        } else {
+            LLAMA_LOG_WARN("%s: no companion vocab GGUF at %s -- tokenizer will be missing\n",
+                    __func__, vocab_path.c_str());
+        }
+    }
+
+    // ── Open .den file and create tensors ──────────────────────────────
+    files.emplace_back(new llama_file(fname.c_str(), "rb"));
+    {
+        struct ggml_init_params den_params = {
+            /*.mem_size   =*/ 2048ULL * 1024 * 1024,
+            /*.mem_buffer =*/ NULL,
+            /*.no_alloc   =*/ true,
+        };
+        ggml_context * ctx_den = ggml_init(den_params);
+        contexts.emplace_back(ctx_den);
+
+        const size_t n_tensors = den.get_tensor_count();
+        const uint64_t data_base = den.get_header_data_offset();
+
+        for (size_t i = 0; i < n_tensors; i++) {
+            std::string name = den.get_tensor_name(i);
+            if (name.empty()) continue;
+            // Skip unknown-slot tensors (MTP head, unnamed slots) — not consumed by arch
+            if (name.find("slot_") == 0) continue;
+
+            const auto ne_vec = den.get_tensor_shape(i);
+            // Convert shape vector to ggml ne[] (reversed order convention)
+            int64_t ne[GGML_MAX_DIMS] = {1, 1, 1, 1};
+            for (size_t d = 0; d < ne_vec.size() && d < GGML_MAX_DIMS; d++) {
+                ne[d] = ne_vec[ne_vec.size() - 1 - d];
+            }
+
+            ggml_type type = den.get_tensor_type(i);
+
+            // Expert tensors: reshape 2D→3D to match arch expectations
+            // .den stores flat, ggml ne[] = [innermost, middle, ..., outermost]
+            // ffn_gate_up_exps: .den [n_exp*out_fused, hidden] → ne=[hidden, out_fused, n_exp]
+            // ffn_down_exps:    .den [n_exp*hidden, ffn_e]   → ne=[ffn_e,   hidden,    n_exp]
+            bool is_expert = (name.find("ffn_gate_up_exps") != std::string::npos) ||
+                             (name.find("ffn_down_exps") != std::string::npos) ||
+                             (name.find("ffn_gate_exps") != std::string::npos) ||
+                             (name.find("ffn_up_exps") != std::string::npos);
+            int ndim = (int)ne_vec.size();
+            if (is_expert && ndim == 2 && den.get_n_experts() > 0) {
+                int64_t n_exp  = den.get_n_experts();
+                // ne[] is already in ggml order after reversal: ne[0]=innermost, ne[1]=outer
+                // .den dims: [n_exp*out, in] or [n_exp*in, out]
+                // ggml ne:   ne[0]=in (or out), ne[1]=n_exp*out (or n_exp*in)
+                // Reshape:   ne[0] stays, ne[1]=ne[1]/n_exp, ne[2]=n_exp
+                int64_t ne0    = ne[0];  // keep innermost (hidden or ffn_e)
+                int64_t ne1    = ne[1] / n_exp; // divide outer dim by n_experts
+                ne[0] = ne0;
+                ne[1] = ne1;
+                ne[2] = n_exp;
+                ndim = 3;
+            }
+
+            ggml_tensor * t = ggml_new_tensor(ctx_den, type, ndim, ne);
+            ggml_set_name(t, name.c_str());
+
+            // Register weight with file offset into .den file
+            uint64_t off = data_base + den.get_tensor_data_offset(i);
+            weights_map.emplace(name, llama_tensor_weight(files.back().get(), 0, (size_t)off, t));
+            n_elements += ggml_nelements(t);
+            n_bytes    += ggml_nbytes(t);
+        }
+    }
+
+    // ── Set constructor-expected fields ────────────────────────────────
+    n_kv      = gguf_get_n_kv(metadata);
+    n_tensors = weights_map.size();
+    fver      = (enum llama_fver) gguf_get_version(metadata);
+
+    // ── Log ────────────────────────────────────────────────────────────
+    LLAMA_LOG_INFO("%s: loaded .den header: layers=%u hidden=%u heads=%u kv=%u ffn=%u vocab=%u experts=%u/%u\n",
+            __func__, den.get_n_layers(), den.get_hidden_size(), den.get_n_heads(),
+            den.get_n_kv_heads(), den.get_ffn_size(), den.get_vocab_size(),
+            den.get_n_experts(), den.get_n_experts_used());
+    return true;
 }
 
 void llama_model_loader::done_getting_tensors(bool partial) const {

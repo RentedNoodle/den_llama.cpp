@@ -357,6 +357,20 @@ size_t llama_den_loader::get_tensor_size(size_t i) const {
     return pimpl_->tensors[i].dst_size;
 }
 
+uint64_t llama_den_loader::get_tensor_data_offset(size_t i) const {
+    if (!pimpl_->is_open || i >= pimpl_->tensors.size()) return 0;
+    return pimpl_->tensors[i].src_offset;
+}
+
+uint64_t llama_den_loader::get_tensor_data_size(size_t i) const {
+    if (!pimpl_->is_open || i >= pimpl_->tensors.size()) return 0;
+    return pimpl_->tensors[i].src_size;
+}
+
+uint64_t llama_den_loader::get_header_data_offset() const {
+    return pimpl_->actual_data_offset;
+}
+
 void llama_den_loader::read_tensor_data(size_t i, void * dst, size_t size) const {
     if (!pimpl_->is_open || i >= pimpl_->tensors.size()) return;
     if (!dst || size == 0) return;
@@ -833,12 +847,12 @@ static const char * den_sub_to_llama_name(int sub) {
     case DEN_SUB_MLP_DOWN:      return "ffn_down";
 
     // MoE expert weights
-    case DEN_SUB_MOE_GATE_UP:   return "ffn_gate_exps";   // fused gate+up per expert
+    case DEN_SUB_MOE_GATE_UP:   return "ffn_gate_up_exps";   // fused gate+up per expert
     case DEN_SUB_MOE_DOWN:      return "ffn_down_exps";
 
     // GDN / SSM (linear attention)
-    case DEN_SUB_GDN_IN_X:      return "ssm_in";
-    case DEN_SUB_GDN_IN_Z:      return "ssm_x";
+    case DEN_SUB_GDN_IN_X:      return "ssm_alpha";    // in_proj_a
+    case DEN_SUB_GDN_IN_Z:      return "attn_gate";    // in_proj_z
     case DEN_SUB_GDN_OUT:       return "ssm_out";
     case DEN_SUB_GDN_A_LOG:     return "ssm_a";
     case DEN_SUB_GDN_DT_BIAS:   return "ssm_dt";
@@ -846,15 +860,15 @@ static const char * den_sub_to_llama_name(int sub) {
     case DEN_SUB_GDN_D_PROJ:    return "ssm_d";
     case DEN_SUB_GDN_NORM:      return "ssm_norm";
 
-    // Shared between GDN_A_NORM (SSM) and INPUT_LAYERNORM (attention)
-    case DEN_SUB_GDN_A_NORM:    return "ssm_a_norm";  // caller may override to "input_layernorm"
+    // Sub-slot 20: input_layernorm (used by both attention and SSM layers as attn_norm)
+    case DEN_SUB_GDN_A_NORM:    return "attn_norm";
 
-    case DEN_SUB_POST_ATTN_NORM:  return "post_attention_layernorm";
+    case DEN_SUB_POST_ATTN_NORM:  return "post_attention_norm";
     case DEN_SUB_PRE_MLP_NORM:    return "pre_mlp_norm";
     case DEN_SUB_POST_MLP_NORM:   return "post_mlp_norm";
 
     // Shared between GDN QKV (SSM) and MOE GATE (MoE)
-    case DEN_SUB_GDN_QKV:       return "ssm_in_qkv";  // caller may override to "ffn_gate_inp_shexp"
+    case DEN_SUB_GDN_QKV:       return "attn_qkv";     // in_proj_qkv for GDN layers
 
     case DEN_SUB_GDN_PROJ_B:    return "ssm_beta";
 
@@ -885,17 +899,13 @@ std::string llama_den_loader::impl::slot_to_llama_name(
         const char * tensor_name = den_sub_to_llama_name(sub);
 
         if (tensor_name) {
-            // Handle shared slots: check context for ambiguous sub-slots.
-            // Sub-slot 20: ssm_a_norm vs input_layernorm
-            //   GDN layers use ssm_a_norm; standard attention layers use input_layernorm.
-            //   Since both map to "weight" tensors, we use "ssm_a_norm" as default
-            //   and let the architecture handler decide. In practice, the llama.cpp
-            //   architecture code handles these via TENSOR_NOT_REQUIRED.
-            //
-            // Sub-slot 24: ssm_in_qkv vs ffn_gate_inp_shexp
-            //   GDN layers use ssm_in_qkv; MoE layers use ffn_gate_inp_shexp.
-            //   Default to ssm_in_qkv.
-
+            // Bias/1D parameters (special suffixes)
+            if (sub == 16) {
+                return "blk." + std::to_string(layer) + "." + tensor_name + ".bias";
+            }
+            if (sub == 15 || sub == 18) {
+                return "blk." + std::to_string(layer) + "." + tensor_name;
+            }
             return "blk." + std::to_string(layer) + "." + tensor_name + ".weight";
         }
 
