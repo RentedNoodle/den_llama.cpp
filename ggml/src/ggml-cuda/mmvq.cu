@@ -1413,6 +1413,11 @@ static __global__ void mul_mat_vec_f16_dp4a_experimental(
     }
 }
 
+struct dp4a_shared_block {
+    int8_t qs[32];
+    float d;
+};
+
 // Host launch helper for the experimental DP4A F16 attention kernel.
 // Call instead of ggml_cuda_mul_mat_vec_f for F16 attention weights.
 static void ggml_cuda_mul_mat_vec_f16_dp4a_launch(
@@ -1427,10 +1432,7 @@ static void ggml_cuda_mul_mat_vec_f16_dp4a_launch(
     // ncols must be divisible by 32 (QK8_1)
     GGML_ASSERT(ncols % 32 == 0);
 
-    const size_t nbytes_shared = (block_size / 32) * sizeof(struct {
-        int8_t qs[32];
-        float d;
-    });
+    const size_t nbytes_shared = (block_size / 32) * sizeof(dp4a_shared_block);
 
     mul_mat_vec_f16_dp4a_experimental<block_size>
         <<<block_nums, block_dims, nbytes_shared, stream>>>

@@ -114,7 +114,7 @@ static __device__ __forceinline__ int den_ecc_verify_tile(
 //   cudaMemset(d_counts, 0, num_tiles * sizeof(int32_t));
 //   cudaMemcpyToSymbol(d_den_ecc_error_counts, &d_counts, sizeof(void*));
 
-__device__ int32_t * d_den_ecc_error_counts = nullptr;
+static __device__ int32_t * d_den_ecc_error_counts = nullptr;
 
 // Record a CRC mismatch for the given tile index.
 // Thread-safe via atomicAdd. Returns the new error count.

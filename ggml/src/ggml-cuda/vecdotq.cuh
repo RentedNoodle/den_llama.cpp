@@ -1420,7 +1420,7 @@ static __device__ __forceinline__ int8_t fp16_to_int8_fast(const uint16_t h) {
         val = (0x400 | m) >> (10 - shift);         // fractional, shifted down
     }
     val = s ? -val : val;
-    return (int8_t)__clamp(val, -128, 127);
+    return (int8_t)(val < -128 ? -128 : (val > 127 ? 127 : val));
 }
 
 // Pack 4 FP16 values → int32 of 4 INT8 values for DP4A.
