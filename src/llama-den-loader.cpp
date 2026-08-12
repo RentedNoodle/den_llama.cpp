@@ -3,16 +3,20 @@
 // Opens .den files (heap-loaded, not mmap), parses the 4096B header + tensor
 // index, and converts .den tensor formats to GGML tensor formats on read.
 //
-// NVFP4 conversion: NULLGLASS 160B tiles (256 elements, E2M1 nibbles + per-
-// sub-block scales) → GGML block_nvfp4 blocks (64 elements, 36 bytes each).
-// 1 NULLGLASS tile = 4 GGML blocks. Nibble data is copied directly (same E2M1
-// packing). Scales are expanded from 4-bit UE4M3 or copied from 8-bit UE8M0/
-// E4M3 depending on tile[148] scale_format bits.
+// NVFP4 conversion (converter v5): nibbles and scales are stored SEPARATELY.
+//   nibble region: N rows × (K/2) bytes of interleaved E2M1 nibbles
+//                  (elem 2i in the low nibble of byte i, elem 2i+1 in high).
+//   scale region:  ceil(N/128) × (4 + 128 × K/16) bytes, per 128-row block:
+//                  [4-byte boost float][128 × K/16 UE8M0 exponent codes].
+// Conversion → GGML block_nvfp4 blocks (64 elements, 36 bytes each): reorder
+// the nibbles from interleaved to the split layout GGML expects, and encode
+// boost × 2^(code−127) as a UE4M3 scale per 16-element sub-block.
 //
 // Ported from dengine/src/den_core.c — Project Den
 
 #include "llama-den-loader.h"
 
+#include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
@@ -122,12 +126,13 @@ struct den_tensor_desc {
     ggml_type   ggml_type;          // GGML type code
     int64_t     ne[4];              // logical dimensions (ne[0..ndim-1])
     uint64_t    numel;              // total logical elements
-    size_t      src_offset;         // byte offset into raw data region (.den format)
-    size_t      src_size;           // byte size in .den format
+    size_t      src_offset;         // byte offset of nibble region (relative to data_region)
+    size_t      src_size;           // byte size of nibble region
+    size_t      scale_offset;       // byte offset of separate scale region (relative to data_region)
+    size_t      scale_size;         // byte size of separate scale region
     size_t      dst_size;           // byte size in GGML format (output buffer)
     uint32_t    hw_target;          // original .den hw_target
     bool        is_wh4;             // true if WH4 WHT-domain tensor
-    int         scale_format;       // scale format from tile[148] bits 7-6
 };
 
 // ═══════════════════════════════════════════════════════════════════════════
@@ -195,11 +200,6 @@ struct llama_den_loader::impl {
 
     // Populate the tensor inventory from the index
     bool build_tensor_inventory();
-
-    // Convert NULLGLASS 160B tile → 4 GGML block_nvfp4 blocks
-    // src_tile: pointer to 160B NULLGLASS tile
-    // dst_blocks: pointer to 4 * 36 = 144 bytes output (4 block_nvfp4)
-    static void convert_nullglass_to_ggml(const uint8_t * src_tile, uint8_t * dst_blocks);
 
     // Read and convert an NVFP4 tensor from .den → GGML format
     void read_nvfp4_tensor(const den_tensor_desc & desc, void * dst, size_t dst_size) const;
@@ -625,101 +625,161 @@ bool llama_den_loader::impl::derive_v1_model_info(uint32_t tensor_count,
 }
 
 // ═══════════════════════════════════════════════════════════════════════════
-// NVFP4 NULLGLASS → GGML conversion
+// NVFP4 (converter v5) → GGML conversion
 // ═══════════════════════════════════════════════════════════════════════════
+//
+// .den v5 stores NVFP4 weights as two separate row-major regions:
+//   nibble region: N rows × (K/2) bytes. Each byte holds two E2M1 nibbles,
+//                  INTERLEAVED — element 2i in the low nibble, 2i+1 in high.
+//   scale region:  ceil(N/128) × (4 + 128 × K/16) bytes. Per 128-row block:
+//                  a 4-byte boost float followed by 128 × K/16 UE8M0 exponent
+//                  codes (value = 2^(code−127)); a partial trailing block is
+//                  padded to the full 128-row stride.
+//
+// GGML block_nvfp4 (64 elements / 36 bytes) expects, per 16-element sub-block s:
+//   d[s]:      UE4M3 scale byte.
+//   qs[s*8..s*8+7]: SPLIT nibbles — byte s*8+j holds elem 16s+j in the low
+//                  nibble and elem 16s+8+j in the high nibble.
+//
+// The nibble VALUES themselves (E2M1, sign bit 3) are identical between the two
+// layouts; only their byte positions differ, hence the interleave→split reorder.
 
-void llama_den_loader::impl::convert_nullglass_to_ggml(
-        const uint8_t * src_tile, uint8_t * dst_blocks) {
+// UE8M0: value = 2^(code − 127)  (matches the converter's _ue8m0_to_f32)
+static inline float den_ue8m0_to_fp32(uint8_t code) {
+    if (code == 0) {
+        return ldexpf(1.0f, -127); // 2^-127 (subnormal)
+    }
+    uint32_t bits = (uint32_t)code << 23;
+    float f;
+    memcpy(&f, &bits, sizeof(f));
+    return f;
+}
 
-    // 1 NULLGLASS 160B tile → 4 GGML block_nvfp4 blocks (4 × 36 = 144 bytes)
-    // Tile layout:
-    //   bytes 0..127:   128 bytes E2M1 nibbles (256 values)
-    //   bytes 128+:     scales (8 or 16 bytes depending on format)
-    //   byte 148:       scale_format (bits 7-6)
-    //
-    // GGML block_nvfp4 layout:
-    //   d[0..3]:   4 scale bytes (1 per 16-element sub-block)
-    //   qs[0..31]: 32 bytes E2M1 nibbles (64 values)
-
-    int scale_fmt = src_tile[DEN_TILE_SCALEFMT] & DEN_TILE_SCALEFMT_MASK;
-    // UE4M3: 4-bit per scale, 2 scales per byte, starts at tile[128]
-    // UE8M0/E4M3: 8-bit per scale, 1 scale per byte, starts at tile[128]
-
-    for (int gb = 0; gb < 4; gb++) {
-        uint8_t * block = dst_blocks + gb * sizeof(block_nvfp4);
-
-        // ── Copy nibble data: 32 bytes per GGML block ────────────────
-        // GGML block gb covers tile elements [gb*64 .. gb*64+63]
-        // = tile bytes [gb*32 .. gb*32+31]
-        memcpy(block + 4,                 // qs[] starts after 4 scale bytes
-               src_tile + gb * 32,        // source nibble data
-               32);
-
-        // ── Copy scales: 4 sub-blocks per GGML block ─────────────────
-        for (int sb = 0; sb < 4; sb++) {
-            int tile_sb = gb * 4 + sb; // which tile sub-block (0..15)
-            uint8_t scale_byte = 0;
-
-            if (scale_fmt == DEN_TILE_SCALE_UE4M3) {
-                // 4-bit packed: 2 scales per byte at tile[128 + tile_sb/2]
-                uint8_t packed = src_tile[128 + tile_sb / 2];
-                if (tile_sb & 1) {
-                    scale_byte = (packed >> 4) & 0x0F;  // high nibble
-                } else {
-                    scale_byte = packed & 0x0F;          // low nibble
-                }
-            } else {
-                // 8-bit scales: 1 per byte at tile[128 + tile_sb]
-                scale_byte = src_tile[128 + tile_sb];
-            }
-
-            block[sb] = scale_byte; // d[sb]
+// FP32 → UE4M3 code (unsigned 4-bit exponent, bias 7; 3-bit mantissa).
+// Mirrors ggml_fp32_to_ue4m3() so that GGML's dequantize_row_nvfp4, which
+// halves the decoded UE4M3 value, recovers the intended scale.
+static inline uint8_t den_fp32_to_ue4m3(float x) {
+    if (!(x > 0.0f)) {
+        return 0;
+    }
+    if (x > 448.0f) {
+        x = 448.0f;
+    }
+    uint32_t bits;
+    memcpy(&bits, &x, 4);
+    int fp32_exp  = ((int)((bits >> 23) & 0xFF)) - 127;
+    int fp32_man  = (int)((bits >> 20) & 0x7);
+    int ue4m3_exp = fp32_exp + 7;
+    if (ue4m3_exp <= 0) {
+        // subnormal: value = man * 2^-9
+        int man = (int)(x * 512.0f + 0.5f);
+        if (man > 7) man = 7;
+        if (man < 1) return 0;
+        return (uint8_t) man;
+    }
+    if (ue4m3_exp >= 15) {
+        return 0x7E;
+    }
+    int round_bit = (int)((bits >> 19) & 1);
+    int ue4m3_man = fp32_man + round_bit;
+    if (ue4m3_man > 7) {
+        ue4m3_man = 0;
+        ue4m3_exp++;
+        if (ue4m3_exp >= 15) {
+            return 0x7E;
         }
     }
+    return (uint8_t) ((ue4m3_exp << 3) | ue4m3_man);
+}
+
+// Convert one 16-element sub-block: reorder .den INTERLEAVED nibbles to GGML
+// SPLIT layout and encode the sub-block scale as UE4M3.
+//   src_nibbles: 8 bytes of .den nibble data for this sub-block
+//   scale_f32:   effective scale = boost * 2^(UE8M0 code − 127)
+//   dst_d:       1 byte output (block_nvfp4.d[sub])
+//   dst_qs:      8 bytes output (block_nvfp4.qs[sub*8 .. sub*8+7])
+static void convert_nvfp4_subblock(const uint8_t * src_nibbles, float scale_f32,
+                                   uint8_t * dst_d, uint8_t * dst_qs) {
+    for (int j = 0; j < 8; j++) {
+        // GGML byte j: low nibble = elem 16s+j, high nibble = elem 16s+8+j.
+        // Source elem e lives in byte e/2 (interleaved), low if e even, high if odd.
+        const uint8_t lo_byte = src_nibbles[j / 2];
+        const uint8_t hi_byte = src_nibbles[4 + j / 2];
+        const uint8_t lo = (j & 1) ? (uint8_t)(lo_byte >> 4) : (uint8_t)(lo_byte & 0x0F);
+        const uint8_t hi = (j & 1) ? (uint8_t)(hi_byte >> 4) : (uint8_t)(hi_byte & 0x0F);
+        dst_qs[j] = (uint8_t) (lo | (hi << 4));
+    }
+    *dst_d = den_fp32_to_ue4m3(scale_f32);
 }
 
 void llama_den_loader::impl::read_nvfp4_tensor(
         const den_tensor_desc & desc, void * dst, size_t dst_size) const {
 
-    // Source layout: M rows × (K/256) NULLGLASS tiles
-    // Each tile: 160 bytes
-    // Destination layout: M rows × (K/64) block_nvfp4 blocks
-    // Each block: 36 bytes
+    // Source: two separate row-major regions (see section comment above).
+    //   nibble region: N rows × (K/2) bytes
+    //   scale region:  ceil(N/128) × (4 + 128 × K/16) bytes (per-128-row-block)
+    // Destination: N rows × (K/64) GGML block_nvfp4 blocks (36 bytes each).
 
     const uint8_t * src = data_region + desc.src_offset;
+    const uint8_t * scl = data_region + desc.scale_offset;
     uint8_t * d = (uint8_t *)dst;
 
-    int64_t K = desc.ne[0]; // columns (inner dimension)
+    const int64_t K = desc.ne[1]; // columns (inner dimension)
 
-    // Total rows = ne[1] * ne[2] * ne[3] (flat row-major layout for multi-dim tensors)
-    int64_t total_rows = desc.ne[1];
+    // Total rows = ne[0] * ne[2] * ne[3] (flat row-major layout for multi-dim tensors)
+    int64_t total_rows = desc.ne[0];
     if (desc.ne[2] > 0) total_rows *= desc.ne[2];
     if (desc.ne[3] > 0) total_rows *= desc.ne[3];
     if (total_rows <= 0) total_rows = 1;
 
-    if (K == 0) {
+    if (K <= 0) {
         memset(dst, 0, dst_size);
         return;
     }
 
-    // number of tiles per row and blocks per row
-    // Use ceiling division — .den always pads to full tiles, but be safe
-    int64_t tiles_per_row  = (K + DEN_NVFP4_TILE_ELEMS - 1) / DEN_NVFP4_TILE_ELEMS;
-    int64_t blocks_per_row = (K + QK_NVFP4 - 1) / QK_NVFP4;
-    size_t dst_row_stride = (size_t)blocks_per_row * sizeof(block_nvfp4);
+    const int64_t blocks_per_row = (K + QK_NVFP4 - 1) / QK_NVFP4;
+    const int64_t sub_per_row    = K / QK_NVFP4_SUB;        // K/16
+    const int64_t sub_per_block  = QK_NVFP4 / QK_NVFP4_SUB; // 4
+    const size_t  dst_row_stride = (size_t)blocks_per_row * sizeof(block_nvfp4);
+    const int64_t ROWS_PER_BLK   = 128;
+    const int64_t n_blk          = (total_rows + ROWS_PER_BLK - 1) / ROWS_PER_BLK;
+
+    // Guard against malformed entries (nibble and/or scale regions too small)
+    if ((size_t)(total_rows * (K / 2)) > desc.src_size ||
+        desc.scale_size < (size_t)(n_blk * (4 + ROWS_PER_BLK * sub_per_row))) {
+        memset(dst, 0, dst_size);
+        return;
+    }
 
     for (int64_t row = 0; row < total_rows; row++) {
-        for (int64_t ti = 0; ti < tiles_per_row; ti++) {
-            int64_t src_tile_offset = row * tiles_per_row * DEN_NVFP4_TILE_SIZE
-                                      + ti * DEN_NVFP4_TILE_SIZE;
-            int64_t dst_block_offset = row * dst_row_stride
-                                       + ti * 4 * sizeof(block_nvfp4);
+        const uint8_t * src_row = src + row * (K / 2);
 
-            if (src_tile_offset + DEN_NVFP4_TILE_SIZE > (int64_t)desc.src_size) break;
-            if (dst_block_offset + 4 * (int64_t)sizeof(block_nvfp4) > (int64_t)dst_size) break;
+        // Per-128-row-block scale region: [4B boost][128 rows × SP codes].
+        const int64_t blk     = row / ROWS_PER_BLK;
+        const int64_t in_blk  = row % ROWS_PER_BLK;
+        const uint8_t * blk_start = scl + blk * (4 + ROWS_PER_BLK * sub_per_row);
+        float boost = 1.0f;
+        memcpy(&boost, blk_start, sizeof(boost));
+        const uint8_t * codes = blk_start + 4 + in_blk * sub_per_row;   // SP codes for this row
 
-            convert_nullglass_to_ggml(src + src_tile_offset,
-                                      d + dst_block_offset);
+        uint8_t * dst_row = d + row * dst_row_stride;
+
+        // Zero the (possibly partial) last block so padding sub-blocks read as 0
+        memset(dst_row + (blocks_per_row - 1) * sizeof(block_nvfp4),
+               0, sizeof(block_nvfp4));
+
+        for (int64_t g = 0; g < sub_per_row; g++) {
+            const int64_t block = g / sub_per_block;
+            const int64_t sub   = g % sub_per_block;
+            uint8_t * blk = dst_row + block * sizeof(block_nvfp4);
+
+            // effective scale = boost * 2^(code − 127)
+            const float scale_f32 = den_ue8m0_to_fp32(codes[g]) * boost;
+
+            convert_nvfp4_subblock(src_row + g * (QK_NVFP4_SUB / 2),
+                                   scale_f32,
+                                   blk + sub,
+                                   blk + (QK_NVFP4 / QK_NVFP4_SUB) + sub * (QK_NVFP4_SUB / 2));
         }
     }
 }
@@ -751,16 +811,20 @@ bool llama_den_loader::impl::build_tensor_inventory() {
         desc.src_size   = (size_t)te.data_size;
         desc.hw_target  = te.hw_target;
         desc.is_wh4     = false;
-        desc.scale_format = 0;
 
         // ── Determine GGML type and destination size ─────────────────
         switch (te.hw_target) {
         case DEN_TARGET_NVFP4: {
             desc.ggml_type = GGML_TYPE_NVFP4;
 
-            // Check for WH4: tile[149] == 8 means WHT-domain
-            // We peek at the first tile to check
-            if (desc.src_size >= DEN_NVFP4_TILE_SIZE) {
+            // Converter v5 stores nibbles and scales in separate regions — there
+            // are no inline 160B NULLGLASS tiles. WH4 tile detection only applies
+            // to legacy .den files that carry no separate scale region.
+            desc.scale_offset = (size_t)(te.data_offset + te.scale_offset);
+            desc.scale_size   = (size_t)te.scale_size;
+
+            if (desc.scale_size == 0 && desc.src_size >= DEN_NVFP4_TILE_SIZE) {
+                // Check for WH4: tile[149] == 8 means WHT-domain
                 const uint8_t * first_tile = data_region + desc.src_offset;
                 uint8_t kstride = first_tile[DEN_TILE_KSTRIDE];
                 if (kstride == DEN_KSTRIDE_WH4) {
@@ -768,11 +832,10 @@ bool llama_den_loader::impl::build_tensor_inventory() {
                     // WH4: keep raw tiles, use NVFP4 type for dispatch
                     desc.dst_size = desc.src_size;
                 }
-                desc.scale_format = first_tile[DEN_TILE_SCALEFMT] & DEN_TILE_SCALEFMT_MASK;
             }
 
             if (!desc.is_wh4) {
-                // Standard NULLGLASS → GGML conversion
+                // Standard v5 → GGML conversion
                 // Elements per block: QK_NVFP4 = 64
                 // Bytes per block:   sizeof(block_nvfp4) = 36
                 // Total rows = ne[1] * ne[2] * ne[3] (flat row-major layout)
