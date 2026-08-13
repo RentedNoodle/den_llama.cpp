@@ -5442,6 +5442,14 @@ static int64_t get_op_batch_size(const ggml_tensor * op) {
 static bool ggml_backend_cuda_device_offload_op(ggml_backend_dev_t dev, const ggml_tensor * op) {
     ggml_backend_cuda_device_context * dev_ctx = (ggml_backend_cuda_device_context *) dev->context;
 
+    // Den: MUL_MAT_ID (MoE) is always offload-eligible. ggml-backend.cpp copies only
+    // the active experts from host (ggml-backend.cpp expert staging path), so expert
+    // offload works at single-token decode where get_op_batch_size(MUL_MAT_ID) returns
+    // ne[2] = n_expert (e.g. 8) which is < op_offload_min_batch_size (default 32).
+    if (op->op == GGML_OP_MUL_MAT_ID) {
+        return true;
+    }
+
     return get_op_batch_size(op) >= dev_ctx->op_offload_min_batch_size;
 }
 
