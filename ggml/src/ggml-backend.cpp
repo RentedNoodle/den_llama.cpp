@@ -820,6 +820,9 @@ struct ggml_backend_sched {
 
     bool op_offload;
 
+    // copy only the active experts to the device for MoE weights that are on a host buffer
+    bool only_active_experts;
+
     int debug;
 
     // used for debugging graph reallocations [GGML_SCHED_DEBUG_REALLOC]
@@ -828,6 +831,11 @@ struct ggml_backend_sched {
     int debug_graph_size;
     int debug_prev_graph_size;
 };
+
+void ggml_backend_sched_set_only_active_experts(ggml_backend_sched_t sched, bool on_or_off) {
+    if (!sched) return;
+    sched->only_active_experts = on_or_off;
+}
 
 #define hash_id(tensor) ggml_hash_find_or_insert(&sched->hash_set, tensor)
 #define tensor_backend_id(tensor) sched->hv_tensor_backend_ids[hash_id(tensor)]
@@ -1628,7 +1636,8 @@ static enum ggml_status ggml_backend_sched_compute_splits(ggml_backend_sched_t s
 
                 // when offloading MoE weights, we can reduce the amount of data copied by copying only the experts that are used
                 ggml_tensor * node = split->graph.nodes[0];
-                if (split->graph.n_nodes > 0 &&
+                if (sched->only_active_experts &&
+                    split->graph.n_nodes > 0 &&
                     ggml_backend_buffer_get_usage(input->buffer) == GGML_BACKEND_BUFFER_USAGE_WEIGHTS &&
                     ggml_backend_buffer_is_host(input->buffer) && (
                     (node->src[0] == input_cpy && node->op == GGML_OP_MUL_MAT_ID)
@@ -1843,6 +1852,7 @@ ggml_backend_sched_t ggml_backend_sched_new(
 
     sched->galloc = ggml_gallocr_new_n(sched->bufts, n_backends);
     sched->op_offload = op_offload;
+    sched->only_active_experts = true; // enabled by default, can be disabled with ggml_backend_sched_set_only_active_experts
 
     ggml_backend_sched_reset(sched);
 

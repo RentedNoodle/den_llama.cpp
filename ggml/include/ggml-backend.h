@@ -336,6 +336,9 @@ extern "C" {
     GGML_API void                 ggml_backend_sched_set_tensor_backend(ggml_backend_sched_t sched, struct ggml_tensor * node, ggml_backend_t backend);
     GGML_API ggml_backend_t       ggml_backend_sched_get_tensor_backend(ggml_backend_sched_t sched, struct ggml_tensor * node);
 
+    // enable or disable copying only the active experts to the device for MoE weights that are on a host buffer
+    GGML_API void                 ggml_backend_sched_set_only_active_experts(ggml_backend_sched_t sched, bool on_or_off);
+
     // Split graph without allocating it
     GGML_API void                 ggml_backend_sched_split_graph(ggml_backend_sched_t sched, struct ggml_cgraph * graph);
 
