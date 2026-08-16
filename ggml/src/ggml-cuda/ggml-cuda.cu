@@ -25,6 +25,8 @@
 #include "ggml-cuda/diagmask.cuh"
 #include "ggml-cuda/diag.cuh"
 #include "ggml-cuda/fattn.cuh"
+#include "ggml-cuda/fattn-nvfp4-kv.cuh"
+#include "ggml-cuda/den-l2-persist.cuh"   // Den: L2 persistence (Mech 41/42)
 #include "ggml-cuda/fwht.cuh"
 #include "ggml-cuda/getrows.cuh"
 #include "ggml-cuda/im2col.cuh"
@@ -68,6 +70,13 @@
 #include "ggml-cuda/fill.cuh"
 #include "ggml-cuda/lightning-indexer.cuh"
 #include "ggml.h"
+
+// Set true for the duration of cudaStreamBeginCapture..cudaStreamEndCapture so that
+// den_nvfp4_kv_store (which normally uses a dedicated cross-stream path) can instead
+// launch on the capturing stream. A cross-stream event-wait during capture produces
+// "capturing stream has unjoined work" and fails the capture on sm_120a (GB203).
+// External linkage so fattn-nvfp4-kv.cu can read it.
+bool g_den_cuda_graph_capturing = false;
 
 #include <algorithm>
 #include <array>
@@ -123,10 +132,21 @@ void ggml_cuda_set_device(int device) {
     CUDA_CHECK(cudaGetDevice(&current_device));
 
     if (physical_device == current_device) {
+        // Den: device already current — still guarantee L2 persistence init runs once
+        if (den_l2_persist_enabled()) {
+            den_l2_persist_init();
+        }
         return;
     }
 
     CUDA_CHECK(cudaSetDevice(physical_device));
+
+    // Den: L2 persistence init (Mech 41/42) right after cudaSetDevice, gated by
+    // DEN_L2_PERSIST (default ON; DEN_L2_PERSIST=0 disables). Idempotent — only the
+    // first call probes support and reserves the L2 budget. Non-fatal on failure.
+    if (den_l2_persist_enabled()) {
+        den_l2_persist_init();
+    }
 }
 
 int ggml_cuda_get_device() {
@@ -785,6 +805,20 @@ static void ggml_backend_cuda_buffer_set_tensor(ggml_backend_buffer_t buffer, gg
     ggml_cuda_set_device(ctx->device);
     CUDA_CHECK(cudaMemcpyAsync((char *) tensor->data + offset, data, size, cudaMemcpyHostToDevice, cudaStreamPerThread));
     CUDA_CHECK(cudaStreamSynchronize(cudaStreamPerThread));
+
+    // Den: L2 persistence hint on weight tensors during model load (Mech 41/42).
+    // Pins read-mostly weight slabs (incl. MoE gate/up/down expert weights) in L2
+    // via cuMemAdvise SET_READ_MOSTLY + SET_ACCESSED_BY + SET_PREFERRED_LOCATION.
+    // Gated + size-filtered to the largest weight tensors only (offset==0 = full
+    // tensor, >=1 MiB, name ends in ".weight"). Hint itself is non-fatal.
+    // TODO(Den): dedicated expert pinning via den_l2_persist_pin_experts() once the
+    //   gate/up/down device pointers are collected per-expert (needs MoE tensor map).
+    if (offset == 0 && size >= (1 << 20)) {
+        const char * tn = tensor->name;
+        if (tn && strstr(tn, ".weight")) {
+            den_l2_persist_hint(tensor->data, size, 1);
+        }
+    }
 }
 
 static void ggml_backend_cuda_buffer_get_tensor(ggml_backend_buffer_t buffer, const ggml_tensor * tensor, void * data, size_t offset, size_t size) {
@@ -2075,6 +2109,39 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
             break;
         case GGML_OP_SET_ROWS:
             ggml_cuda_op_set_rows(ctx, dst);
+            // NVFP4 KV cache hook
+            if (dst->data && den_nvfp4_kv_is_active()) {
+                const char * name = ggml_get_name(dst);
+                if (name) {
+                    int is_k = (strncmp(name, "cache_k_l", 9) == 0) ? 1 : 0;
+                    int is_v = (!is_k && strncmp(name, "cache_v_l", 9) == 0) ? 1 : 0;
+                    if (is_k || is_v) {
+                        int layer = atoi(name + 9);
+                        const ggml_tensor * src0 = dst->src[0];
+                        const ggml_tensor * src1 = dst->src[1];
+                        // n_tokens from indices tensor shape (reliable for both 2D/3D)
+                        int n_tokens = src1 ? (int)src1->ne[0] : 1;
+                        int base_seq = den_nvfp4_kv_seq_len(&g_nvfp4_kv, layer);
+                        // Per-token elements = total / n_tokens (handles 2D and 3D)
+                        size_t per_token = ggml_nelements(src0) / n_tokens;
+                        const float * base_data = (const float *)src0->data;
+                        if (base_data && base_seq >= 0 && n_tokens > 0 && n_tokens < 65536) {
+                            for (int t = 0; t < n_tokens; t++) {
+                                int seq_pos = base_seq + t;
+                                const float * tok_data = base_data + t * per_token;
+                                if (is_k) {
+                                    den_nvfp4_kv_store(&g_nvfp4_kv, layer, seq_pos, tok_data, nullptr, ctx.stream());
+                                } else {
+                                    den_nvfp4_kv_store(&g_nvfp4_kv, layer, seq_pos, nullptr, tok_data, ctx.stream());
+                                }
+                            }
+                            if (!is_k) {
+                                den_nvfp4_kv_set_seq_len(&g_nvfp4_kv, layer, base_seq + n_tokens);
+                            }
+                        }
+                    }
+                }
+            }
             break;
         case GGML_OP_SET:
             ggml_cuda_op_set(ctx, dst);
@@ -4283,9 +4350,12 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
         }
 
         CUDA_CHECK(cudaStreamBeginCapture(cuda_ctx->stream(), cudaStreamCaptureModeRelaxed));
+        g_den_cuda_graph_capturing = true; // den_nvfp4_kv_store must join the capture (no cross-stream wait)
     }
 
     ggml_cuda_graph_evaluate_and_capture(cuda_ctx, cgraph, use_cuda_graph, cuda_graph_update_required, graph_key);
+
+    g_den_cuda_graph_capturing = false; // capture bracketed; node evaluation / store done
 
     return GGML_STATUS_SUCCESS;
 }

@@ -12,6 +12,8 @@
 #   define NOMINMAX
 #endif
 #include <windows.h>
+#include <mmsystem.h>
+#pragma comment(lib, "winmm.lib")
 #endif
 
 #if defined (__unix__) || (defined (__APPLE__) && defined (__MACH__)) || defined (_WIN32)
@@ -34,6 +36,16 @@ int llama_cli(int argc, char ** argv) {
     common_params params;
 
     params.verbosity = LOG_LEVEL_ERROR; // by default, less verbose logs
+
+#if defined(_WIN32)
+    // Den: reduce host scheduling jitter + raise process priority. timeBeginPeriod(1) drops the
+    // Windows timer granularity from ~15.6ms to 1ms. SetPriorityClass keeps the inference thread
+    // above background tasks. Gate: DEN_HIGH_PRIORITY=0 disables (default ON). Host-side only.
+    if (getenv("DEN_HIGH_PRIORITY") == NULL || getenv("DEN_HIGH_PRIORITY")[0] != '0') {
+        timeBeginPeriod(1);
+        SetPriorityClass(GetCurrentProcess(), HIGH_PRIORITY_CLASS);
+    }
+#endif
 
     common_init();
 

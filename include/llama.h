@@ -399,6 +399,7 @@ extern "C" {
                           // try to disable when n_seq_max > 1 for improved performance when the sequences do not share a large prefix
                           // ref: https://github.com/ggml-org/llama.cpp/pull/14363
         bool only_active_experts; // copy only the active experts to the device for MoE weights that are on a host buffer
+        bool nvfp4_kv_enabled; // Den: enable NVFP4 KV cache quantization
 
         // [EXPERIMENTAL]
         // backend sampler chain configuration (make sure the caller keeps the sampler chains alive)
