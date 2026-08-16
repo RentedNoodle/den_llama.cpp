@@ -695,9 +695,11 @@ static __device__ void kvarn_quantize_tile(
     half * scale_axis = (half *) (record + payload_bytes);
     half * zp_axis = scale_axis + KVAR_N_DIM;
     half * other_axis = zp_axis + KVAR_N_DIM;
-    scale_axis[row] = __float2half_rn(best_row[row] * scale);
-    zp_axis[row] = __float2half_rn(best_row[row] * lo);
-    other_axis[row] = __float2half_rn(best_col[row]);
+    // streaming stores: KV cache bytes are write-once, read much later during
+    // attention — bypass L2 so the hot decode path keeps its cache lines.
+    __stcs(&scale_axis[row], __float2half_rn(best_row[row] * scale));
+    __stcs(&zp_axis[row], __float2half_rn(best_row[row] * lo));
+    __stcs(&other_axis[row], __float2half_rn(best_col[row]));
     __syncthreads();
 }
 
@@ -917,9 +919,11 @@ static __device__ void kvarn_quantize_stage_lowshmem(
     half * scale_axis = (half *) (record + payload_bytes);
     half * zp_axis = scale_axis + KVAR_N_DIM;
     half * other_axis = zp_axis + KVAR_N_DIM;
-    scale_axis[row] = __float2half_rn(best_row[row] * scale);
-    zp_axis[row] = __float2half_rn(best_row[row] * lo);
-    other_axis[row] = __float2half_rn(best_col[row]);
+    // streaming stores: KV cache bytes are write-once, read much later during
+    // attention — bypass L2 so the hot decode path keeps its cache lines.
+    __stcs(&scale_axis[row], __float2half_rn(best_row[row] * scale));
+    __stcs(&zp_axis[row], __float2half_rn(best_row[row] * lo));
+    __stcs(&other_axis[row], __float2half_rn(best_col[row]));
     __syncthreads();
 }
 
