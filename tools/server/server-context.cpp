@@ -1,4 +1,5 @@
 #include "server-context.h"
+#include "server-adaptive-dm.h"
 #include "server-chat.h"
 #include "server-common.h"
 #include "server-http.h"
@@ -207,6 +208,10 @@ struct server_slot {
 
     // speculative decoding
     common_speculative * spec;
+
+    // adaptive draft-max controller (profit EWMA) -- beellama port
+    server_adaptive_dm_state adaptive_dm;
+    int64_t adaptive_cycle_start_us = 0;
 
     llama_tokens spec_draft;
     llama_tokens spec_prompt;
@@ -2909,6 +2914,26 @@ private:
 
                 const int n_draft_max = slot.get_n_draft_max();
 
+                // adaptive draft-max: clamp the slot's depth to the controller's
+                // current recommendation (holds base until profit observations arrive).
+                int adaptive_n_max = n_draft_max;
+                if (slot.adaptive_dm.dm_adaptive && slot.adaptive_dm.adaptive_n_max >= 0) {
+                    adaptive_n_max = std::min(adaptive_n_max, slot.adaptive_dm.adaptive_n_max);
+                }
+
+                // (re)decide the depth from accumulated profit observations; resets
+                // only when the speculative config actually changed. No per-round
+                // reset_request_state -- that would wipe the profit accumulation.
+                if (spec) {
+                    slot.adaptive_dm.configure(params_base.speculative);
+                    slot.adaptive_dm.reset_profit_if_config_changed(params_base.speculative, adaptive_n_max, 0, nullptr);
+                    if (slot.adaptive_dm.dm_adaptive) {
+                        slot.adaptive_dm.apply_profit_recommendation(
+                            slot.adaptive_dm.decide_profit_n_max(adaptive_n_max));
+                    }
+                    slot.adaptive_cycle_start_us = llama_time_us();
+                }
+
                 if (n_draft_max > 0) {
                     GGML_ASSERT(slot.can_speculate());
 
@@ -2933,7 +2958,7 @@ private:
 
                         common_speculative_get_draft_params(spec.get(), slot.id) = {
                             /* .drafting = */ true,
-                            /* .n_max    = */ n_draft_max,
+                            /* .n_max    = */ adaptive_n_max,
                             /* .n_past   = */ slot.prompt.n_tokens(),
                             /* .id_last  = */ slot.sampled,
                             /* .prompt   = */ &slot.spec_prompt,
@@ -3870,6 +3895,20 @@ private:
             // update how many tokens out of those tested were accepted
             slot.stats.n_draft_accepted += n_accepted;
             slot.stats.n_draft_verif_steps += 1;
+
+            // adaptive draft-max: feed the controller this cycle's acceptance + timing
+            if (slot.adaptive_dm.dm_adaptive) {
+                slot.adaptive_dm.observe_profit_acceptance((int) n_draft, (int) n_accepted);
+                if (slot.adaptive_cycle_start_us > 0) {
+                    const float cycle_ms = (float) (llama_time_us() - slot.adaptive_cycle_start_us) / 1000.0f;
+                    slot.adaptive_dm.observe_profit_timing(
+                            slot.adaptive_dm.adaptive_n_max,   // requested n_max
+                            (int) n_draft,                     // actual draft tokens
+                            (int) n_accepted,                  // accepted tokens
+                            cycle_ms, 0.0f, 0.0f, cycle_ms);   // draft/verify/accept/cycle ms
+                    slot.adaptive_cycle_start_us = 0;
+                }
+            }
 
             auto & n_accepted_per_pos = slot.n_accepted_per_pos;
             if (n_accepted_per_pos.empty()) {

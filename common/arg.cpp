@@ -4272,6 +4272,96 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             params.speculative.draft.n_max = value;
         }
     ).set_spec().set_examples({LLAMA_EXAMPLE_SPECULATIVE, LLAMA_EXAMPLE_LOOKUP, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_SPEC_DRAFT_N_MAX"));
+    // adaptive draft-max controller (profit EWMA) -- ported from beellama
+    add_opt(common_arg(
+        {"--spec-dm-controller"}, "MODE",
+        string_format("adaptive draft-max controller: off or profit (default: %s)",
+            common_speculative_dm_controller_name(params.speculative.dm_controller)),
+        [](common_params & params, const std::string & value) {
+            params.speculative.dm_controller = common_speculative_dm_controller_from_name(value);
+        }
+    ).set_spec().set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_SPEC_DM_CONTROLLER"));
+    add_opt(common_arg(
+        {"--spec-dm-profit-min"}, "F",
+        string_format("minimum profit margin over the no-spec baseline before disabling dwell clears (default: %.4f)",
+            (double) params.speculative.dm_profit_min),
+        [](common_params & params, const std::string & value) {
+            const float f = std::stof(value);
+            if (f < 0.0f || f > 0.50f) {
+                throw std::invalid_argument("spec-dm-profit-min must be in [0.0, 0.50]");
+            }
+            params.speculative.dm_profit_min = f;
+        }
+    ).set_spec().set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_SPEC_DM_PROFIT_MIN"));
+    add_opt(common_arg(
+        {"--spec-dm-profit-raise-margin"}, "F",
+        string_format("relative profit margin required to raise adaptive draft depth (default: %.4f)",
+            (double) params.speculative.dm_profit_raise_margin),
+        [](common_params & params, const std::string & value) {
+            const float f = std::stof(value);
+            if (f < 0.0f || f > 1.0f) {
+                throw std::invalid_argument("spec-dm-profit-raise-margin must be in [0.0, 1.0]");
+            }
+            params.speculative.dm_profit_raise_margin = f;
+        }
+    ).set_spec().set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_SPEC_DM_PROFIT_RAISE_MARGIN"));
+    add_opt(common_arg(
+        {"--spec-dm-profit-lower-margin"}, "F",
+        string_format("relative profit margin required to lower adaptive draft depth (default: %.4f)",
+            (double) params.speculative.dm_profit_lower_margin),
+        [](common_params & params, const std::string & value) {
+            const float f = std::stof(value);
+            if (f < 0.0f || f > 1.0f) {
+                throw std::invalid_argument("spec-dm-profit-lower-margin must be in [0.0, 1.0]");
+            }
+            params.speculative.dm_profit_lower_margin = f;
+        }
+    ).set_spec().set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_SPEC_DM_PROFIT_LOWER_MARGIN"));
+    add_opt(common_arg(
+        {"--spec-dm-profit-ewma-alpha"}, "F",
+        string_format("EWMA alpha for adaptive draft-max profit statistics (default: %.4f)",
+            (double) params.speculative.dm_profit_ewma_alpha),
+        [](common_params & params, const std::string & value) {
+            const float f = std::stof(value);
+            if (f < 0.01f || f > 1.0f) {
+                throw std::invalid_argument("spec-dm-profit-ewma-alpha must be in [0.01, 1.0]");
+            }
+            params.speculative.dm_profit_ewma_alpha = f;
+        }
+    ).set_spec().set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_SPEC_DM_PROFIT_EWMA_ALPHA"));
+    add_opt(common_arg(
+        {"--spec-dm-profit-min-samples"}, "N",
+        string_format("minimum samples before a depth's profit estimate is trusted (default: %d)",
+            params.speculative.dm_profit_min_samples),
+        [](common_params & params, int value) {
+            if (value < 1 || value > 64) {
+                throw std::invalid_argument("spec-dm-profit-min-samples must be in [1, 64]");
+            }
+            params.speculative.dm_profit_min_samples = value;
+        }
+    ).set_spec().set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_SPEC_DM_PROFIT_MIN_SAMPLES"));
+    add_opt(common_arg(
+        {"--spec-dm-profit-warmup"}, "N",
+        string_format("samples to collect before acting on any depth (default: %d)",
+            params.speculative.dm_profit_warmup),
+        [](common_params & params, int value) {
+            if (value < 0 || value > 64) {
+                throw std::invalid_argument("spec-dm-profit-warmup must be in [0, 64]");
+            }
+            params.speculative.dm_profit_warmup = value;
+        }
+    ).set_spec().set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_SPEC_DM_PROFIT_WARMUP"));
+    add_opt(common_arg(
+        {"--spec-dm-profit-baseline-interval"}, "N",
+        string_format("cycles between no-spec baseline re-probes (default: %d)",
+            params.speculative.dm_profit_baseline_interval),
+        [](common_params & params, int value) {
+            if (value < 0 || value > 4096) {
+                throw std::invalid_argument("spec-dm-profit-baseline-interval must be in [0, 4096]");
+            }
+            params.speculative.dm_profit_baseline_interval = value;
+        }
+    ).set_spec().set_examples({LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_SPEC_DM_PROFIT_BASELINE_INTERVAL"));
     add_opt(common_arg(
         {"--spec-draft-n-min"}, "N",
         string_format("minimum number of draft tokens to use for speculative decoding (default: %d)", params.speculative.draft.n_min),

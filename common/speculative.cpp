@@ -1307,6 +1307,15 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
     std::vector<int>                i_last;
     std::vector<std::vector<float>> chain_h;
 
+    // MTP skip-streak (LLAMA_MTP_SKIP_STREAK_THRESHOLD): after a sequence posts
+    // N consecutive fully-rejected drafts, skip MTP drafting for one round so the
+    // target's own sampling re-seeds the nextn hidden state. Rejects collapse
+    // when the draft head drifts from the target's distribution (e.g. high n_max
+    // on a hard prompt); a verify-only round lets acceptance recover instead of
+    // wasting decode on drafts the target never takes.
+    std::vector<int> zero_accept_streak;
+    int32_t          skip_streak_threshold = 0;
+
     common_speculative_impl_draft_mtp(const common_params_speculative & params, uint32_t n_seq)
         : common_speculative_impl(COMMON_SPECULATIVE_TYPE_DRAFT_MTP, n_seq)
         , params(params.draft)
@@ -1384,6 +1393,13 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
 
         verify_h.assign(n_seq, {});
         verify_h_rows.assign(n_seq, 0);
+
+        // LLAMA_MTP_SKIP_STREAK_THRESHOLD=N: skip MTP drafting for one round
+        // after N consecutive fully-rejected drafts (0 = disabled, default).
+        zero_accept_streak.assign(n_seq, 0);
+        if (const char * e = getenv("LLAMA_MTP_SKIP_STREAK_THRESHOLD"); e && *e) {
+            skip_streak_threshold = std::max(0, atoi(e));
+        }
     }
 
     ~common_speculative_impl_draft_mtp() override {
@@ -1560,6 +1576,15 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                 continue;
             }
 
+            // skip-streak gate: past the threshold, give the target a verify-only
+            // round so its own sampling re-seeds the nextn hidden state, then
+            // resume drafting (streak was reset in accept()).
+            if (skip_streak_threshold > 0 && zero_accept_streak[seq_id] >= skip_streak_threshold) {
+                zero_accept_streak[seq_id] = 0;
+                dp.drafting = false;
+                continue;
+            }
+
             n_drafting++;
             drafting[seq_id] = true;
             common_sampler_reset(smpls[seq_id].get());
@@ -1706,6 +1731,13 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         const int32_t i_h = std::min<int32_t>(n_accepted, n_rows - 1);
         const size_t row_bytes = (size_t) n_embd * sizeof(float);
         std::memcpy(pending_h[seq_id].data(), verify_h[seq_id].data() + (size_t) i_h * n_embd, row_bytes);
+
+        // track the zero-accept streak for the skip-streak gate
+        if (n_accepted == 0) {
+            zero_accept_streak[seq_id]++;
+        } else {
+            zero_accept_streak[seq_id] = 0;
+        }
     }
 };
 

@@ -366,11 +366,43 @@ struct common_params_speculative_ngram_cache {
     std::string lookup_cache_dynamic; // path of dynamic ngram cache file for lookup decoding
 };
 
+// Adaptive draft-max controller: picks the speculative depth (n_max) per-slot
+// from measured profit (output tokens / cycle ms) instead of a fixed value.
+enum common_speculative_dm_controller {
+    COMMON_SPECULATIVE_DM_CONTROLLER_OFF,
+    COMMON_SPECULATIVE_DM_CONTROLLER_PROFIT,
+};
+
+static inline const char * common_speculative_dm_controller_name(common_speculative_dm_controller controller) {
+    switch (controller) {
+        case COMMON_SPECULATIVE_DM_CONTROLLER_OFF:    return "off";
+        case COMMON_SPECULATIVE_DM_CONTROLLER_PROFIT: return "profit";
+    }
+    return "unknown";
+}
+
+static inline common_speculative_dm_controller common_speculative_dm_controller_from_name(const std::string & name) {
+    if (name == "profit") {
+        return COMMON_SPECULATIVE_DM_CONTROLLER_PROFIT;
+    }
+    return COMMON_SPECULATIVE_DM_CONTROLLER_OFF;
+}
+
 struct common_params_speculative {
     std::vector<enum common_speculative_type> types = { COMMON_SPECULATIVE_TYPE_NONE };
 
     // used by Simple, MTP, Eagle3, etc. - all methods that require some kind of draft model
     common_params_speculative_draft draft;
+
+    // adaptive draft-max controller (profit EWMA) -- ported from beellama server-adaptive-dm.h
+    common_speculative_dm_controller dm_controller = COMMON_SPECULATIVE_DM_CONTROLLER_PROFIT;
+    float   dm_profit_min               = 0.05f;
+    float   dm_profit_raise_margin      = 0.05f;
+    float   dm_profit_lower_margin      = 0.05f;
+    float   dm_profit_ewma_alpha        = 0.15f;
+    int32_t dm_profit_min_samples       = 3;
+    int32_t dm_profit_warmup            = 0;
+    int32_t dm_profit_baseline_interval = 1024;
 
     common_params_speculative_ngram_mod ngram_mod;
     common_params_speculative_ngram_map ngram_simple;
