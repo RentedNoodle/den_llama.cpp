@@ -678,8 +678,9 @@ static __device__ void kvarn_quantize_tile(
     const float scale = fmaxf((hi - lo) / qmax, 1e-10f);
     const int row_bytes = KVAR_N_DIM * bits / 8;
     uint8_t * row_payload = record + row * row_bytes;
+    uint8_t packed[KVAR_N_DIM];
     for (int i = 0; i < row_bytes; ++i) {
-        row_payload[i] = 0;
+        packed[i] = 0;
     }
     for (int col = 0; col < KVAR_N_DIM; ++col) {
         const float x = tile[row * KVAR_N_DIM + col] / (best_col[col] * best_row[row]);
@@ -687,8 +688,11 @@ static __device__ void kvarn_quantize_tile(
         const int bit_offset = col * bits;
         for (int bit = 0; bit < bits; ++bit) {
             const int dst_bit = bit_offset + bit;
-            row_payload[dst_bit / 8] |= ((q >> bit) & 1u) << (dst_bit % 8);
+            packed[dst_bit / 8] |= ((q >> bit) & 1u) << (dst_bit % 8);
         }
+    }
+    for (int i = 0; i < row_bytes; ++i) {
+        __stcs(&row_payload[i], packed[i]);
     }
 
     const int payload_bytes = KVAR_N_TILE_VALUES * bits / 8;
@@ -900,8 +904,9 @@ static __device__ void kvarn_quantize_stage_lowshmem(
     const float scale = fmaxf((hi - lo) / qmax, 1e-10f);
     const int row_bytes = KVAR_N_DIM * bits / 8;
     uint8_t * row_payload = record + row * row_bytes;
+    uint8_t packed[KVAR_N_DIM];
     for (int i = 0; i < row_bytes; ++i) {
-        row_payload[i] = 0;
+        packed[i] = 0;
     }
     for (int col = 0; col < KVAR_N_DIM; ++col) {
         const float raw = kvarn_stage_rotated_value(
@@ -911,8 +916,11 @@ static __device__ void kvarn_quantize_stage_lowshmem(
         const int bit_offset = col * bits;
         for (int bit = 0; bit < bits; ++bit) {
             const int dst_bit = bit_offset + bit;
-            row_payload[dst_bit / 8] |= ((q >> bit) & 1u) << (dst_bit % 8);
+            packed[dst_bit / 8] |= ((q >> bit) & 1u) << (dst_bit % 8);
         }
+    }
+    for (int i = 0; i < row_bytes; ++i) {
+        __stcs(&row_payload[i], packed[i]);
     }
 
     const int payload_bytes = KVAR_N_TILE_VALUES * bits / 8;
