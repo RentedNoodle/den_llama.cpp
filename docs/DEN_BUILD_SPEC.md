@@ -6,8 +6,9 @@
 
 ## Proven baseline (raw engine)
 - **191.55 tg64** @ build `e7ba620ea` (per NEXT_BLOCKERS_2026-08-16; engine 180 baseline RESTORED 08/16, ref 08/09's 184.4)
-- Current HEAD `d0bb6edf7` (Milestone A checkpoint) = same performance class. Repo clean (0 dirty).
-- Server (llama-server) ≈ 140-165 t/s — **serving overhead gap is Blocker 1, NOT the engine** (CPU-serialized target sampling, per-token tokenize/SSE emit, per-step batch rebuild).
+- **CONFIRMED 2026-08-17 09:58 by Noodle's own bench: `tg64 = 190.79 ± 0.30` @ build d0bb6edf7** (llama-bench -m Ornith-1.0-35B-Heretic-MTP-APEX-I-Mini.gguf -ngl 99 -n 64; pp512 1300.06). Engine NOT regressed; the perceived regression = server-vs-engine gap (Blocker 1).
+- KV NVFP4 ENABLED in this build (K8V8 ThriftAttention, 41 layers, F32 tail 256), L2-PERSIST 8MB budget.
+- **Model baseline decision:** engine work is measured against the PRE-QUANTIZED proven pair (35B Heretic Q3_K + 9B Q4 worker) as-is. Our own quant = only when the .den/Den2P4 lane opens (SSM-firewall re-convert first), gated by cos>0.9999 + sentinels.
 
 ## Exact build recipe (audited 2026-08-17, live in I:\den_llama.cpp\build_ninja\CMakeCache.txt)
 | Setting | Value |
