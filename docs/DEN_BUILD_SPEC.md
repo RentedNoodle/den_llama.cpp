@@ -44,3 +44,10 @@ Expected: tg64 ≈ 191 (raw engine). `--cpu-moe` = pathological, never baseline.
 ## Companion facts
 - Bench model: `Ornith-1.0-35B-Heretic-MTP-APEX-I-Mini.gguf` (13.29 GB, hero).
 - Q8 KV, batch/ubatch 64, `-ngl 99 -ncmoe 0` for the matrix (Milestone A: c256/Q8 164.08, c4096/Q8 159.44, c4096/KVarN6 162.23).
+
+
+## TODO (2026-08-18) — context dump `--unbounded-cache-safe`
+Add upstream `--unbounded-cache-safe` flag (ggml-org/llama.cpp commit cd5e3b5, issue #17459) to this fork.
+It removes the server's "slot context (%d) exceeds the training context of the model (%d) - capping" check,
+so `--ctx-size` can exceed `n_ctx_train` directly with RoPE (currently must use `--override-kv qwen35.context_length=int:<target>` workaround).
+This build (fd4bfc463) LACKS it. Ref: den_harness LOCAL_INFERENCE_ROUTER_2026-08-18.md.
