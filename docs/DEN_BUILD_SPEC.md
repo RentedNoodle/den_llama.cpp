@@ -51,3 +51,9 @@ Add upstream `--unbounded-cache-safe` flag (ggml-org/llama.cpp commit cd5e3b5, i
 It removes the server's "slot context (%d) exceeds the training context of the model (%d) - capping" check,
 so `--ctx-size` can exceed `n_ctx_train` directly with RoPE (currently must use `--override-kv qwen35.context_length=int:<target>` workaround).
 This build (fd4bfc463) LACKS it. Ref: den_harness LOCAL_INFERENCE_ROUTER_2026-08-18.md.
+
+
+## 2026-08-18 follow-up — 512K needs NVFP4 KV, not just the cap flag
+Testing showed 512K ctx LOADS fine (slot reports 524288) but prefill is pathologically slow: 1.2K tokens/min, ~1 CPU core, 0 decoded after 3min -> not usable as-is.
+--unbounded-cache-safe only lifts the n_ctx_train cap check; it does NOT fix the prefill cost at 512K shape.
+REAL PATH FORWARD: compressed KV cache = NVFP4/KVarN. Baseline already proves it: c4096/KVarN6 = 162.23 t/s. A compressed KV doubles/triples effective context for the same memory+prefill budget. Push KVarN/Den2P4 KV lane and re-test 512K+ ctx on the 9B (rope-scale 4 toward 1M) with KV compressed.
