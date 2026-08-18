@@ -1761,8 +1761,17 @@ static bool router_validate_model(std::string & name, server_models & models, bo
     }
     auto meta = models.get_meta(name);
     if (!meta.has_value()) {
-        res_err(res, format_error_response(string_format("model '%s' not found", name.c_str()), ERROR_TYPE_INVALID_REQUEST));
-        return false;
+        // If model not found but there's exactly one model loaded, accept any model name
+        // (single-model mode: the loaded model handles all requests regardless of requested name)
+        auto all_meta = models.get_all_meta();
+        if (all_meta.size() == 1) {
+            name = all_meta[0].name;
+            meta = all_meta[0];
+            SRV_INF("router: model '%s' not found, falling back to single loaded model '%s'\n", name.c_str(), meta->name.c_str());
+        } else {
+            res_err(res, format_error_response(string_format("model '%s' not found", name.c_str()), ERROR_TYPE_INVALID_REQUEST));
+            return false;
+        }
     }
     // resolve alias to canonical model name
     name = meta->name;
