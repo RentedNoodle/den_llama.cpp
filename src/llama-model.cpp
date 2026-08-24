@@ -1698,7 +1698,19 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
 }
 
 ggml_tensor * llama_model_base::create_tensor(llama_model_loader & ml, const LLM_TN_IMPL & tn, const std::initializer_list<int64_t> & ne, int flags) {
-    const buft_list_t * buft_list_layer = tn.bid == -1 ? nullptr : pimpl->dev_layer.at(tn.bid).buft_list;
+    const buft_list_t * buft_list_layer = &pimpl->cpu_buft_list;
+    if (tn.bid >= 0) {
+        if ((size_t) tn.bid < pimpl->dev_layer.size()) {
+            buft_list_layer = pimpl->dev_layer.at(tn.bid).buft_list;
+        } else {
+            // Draft/grafted GGUFs can declare per-layer tensors whose layer index
+            // exceeds the engine's computed dev_layer count (e.g. dflash target
+            // layer ids). Fall back to CPU rather than aborting the load.
+            LLAMA_LOG_WARN("%s: %s bid=%d >= dev_layer.size()=%zu (n_layer_all=%d); using CPU buft\n",
+                    __func__, tn.str().c_str(), tn.bid, pimpl->dev_layer.size(),
+                    (int) hparams.n_layer_all);
+        }
+    }
     return ml.create_tensor(
         hparams, &pimpl->cpu_buft_list, pimpl->dev_input.buft_list, pimpl->dev_output.buft_list, buft_list_layer,
         tn, ne, flags);
