@@ -2149,7 +2149,7 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
                             }
                             if (!is_k) {
                                 den_nvfp4_kv_set_seq_len(&g_nvfp4_kv, layer, base_seq + n_tokens);
-                                if (layer == 0) {
+                                if (layer == 0 && getenv("DEN_TRACE")) {
                                     fprintf(stderr, "DEN_KV_DEBUG storeV layer=%d base=%d n=%d seq=%d\n", layer, base_seq, n_tokens, base_seq + n_tokens);
                                     fflush(stderr);
                                 }

@@ -3631,10 +3631,11 @@ private:
             }
             const auto t1 = std::chrono::steady_clock::now();
             const double ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
-            fprintf(stderr, "DEN_DECODE_MS %.2f n_tokens=%d\n", ms, batch_view.n_tokens);
-            fflush(stderr);
+            if (getenv("DEN_TRACE")) {
+                fprintf(stderr, "DEN_DECODE_MS %.2f n_tokens=%d\n", ms, batch_view.n_tokens);
+                fflush(stderr);
+            }
         });
-
         if (ret != 0) {
             {
                 std::string err;
