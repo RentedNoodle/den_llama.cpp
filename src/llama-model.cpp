@@ -2982,6 +2982,12 @@ void llama_model_base::create_tensor_qkv(llama_layer & layer, int bid,
     // q/k/v instead of failing the load.
     const ggml_tensor * qkv_meta = ml->get_tensor_meta(tn(LLM_TENSOR_ATTN_QKV, "weight", bid).str().c_str());
     if (qkv_meta && (qkv_meta->ne[0] != n_embd_ || qkv_meta->ne[1] != n_embd_qkv)) {
+        // Qwen3.5 recurrent blocks preload fused linear-attn QKV with a
+        // different geometry. A later generic attention probe must not erase
+        // that additive recurrent path when its attention-shaped probe misses.
+        if (layer.wqkv && (arch == LLM_ARCH_QWEN35 || arch == LLM_ARCH_QWEN35MOE)) {
+            return;
+        }
         qkv_meta = nullptr;
     }
     layer.wqkv = qkv_meta
