@@ -5225,6 +5225,7 @@ class LlamaFileType(IntEnum):
     MOSTLY_TQ2_0         = 37  # except 1d tensors
     MOSTLY_MXFP4_MOE     = 38  # except 1d tensors
     MOSTLY_NVFP4         = 39  # except 1d tensors
+    MOSTLY_MXFP4         = 42  # fork-slot: standard E2M1 mxfp4 (dense), 39 taken by NVFP4
     MOSTLY_Q1_0          = 40  # except 1d tensors
     MOSTLY_Q2_0          = 41  # except 1d tensors
 

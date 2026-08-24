@@ -15,6 +15,17 @@ struct ggml_cuda_fattn_kvarn_decode_geometry {
     int  n_waves;
 };
 
+// Cluster gate (shared with the dispatch-side partial allocation).
+// Returns the number of 8-block cluster groups, or 0 when the cluster path is off
+// (DEN_KVARN_CLUSTER unset, multi-stream, or no splits to combine).
+static inline int ggml_cuda_fattn_kvarn_cluster_groups(int n_splits, int n_stream) {
+    static const bool cluster_enabled = [] {
+        const char * e = getenv("DEN_KVARN_CLUSTER");
+        return e != nullptr && e[0] == '1';
+    }();
+    return cluster_enabled && n_stream == 1 && n_splits > 1 ? (n_splits + 7) / 8 : 0;
+}
+
 struct ggml_cuda_fattn_kvarn_decode_args {
     const char * Q;
     const ggml_cuda_fattn_kvarn_desc * k_descs;

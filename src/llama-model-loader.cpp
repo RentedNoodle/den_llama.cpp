@@ -919,6 +919,15 @@ static bool weight_buft_supported(const llama_hparams & hparams, ggml_tensor * w
         return true;
     }
 
+    // Keep malformed scaled-I8 probes recoverable.  In particular, a Qwen3.5
+    // F16 weight_scale must never reach the I8 op constructor as src0: return
+    // false so placement falls through to the normal loader error path instead
+    // of firing a debug CRT assertion dialog.
+    if ((op == GGML_OP_GET_ROWS_SCALED_I8 || op == GGML_OP_MUL_MAT_SCALED_I8) &&
+            w->type != GGML_TYPE_I8) {
+        return false;
+    }
+
     ggml_init_params params = {
         /*.mem_size   =*/ ggml_tensor_overhead()*8,
         /*.mem_buffer =*/ NULL,
@@ -938,10 +947,26 @@ static bool weight_buft_supported(const llama_hparams & hparams, ggml_tensor * w
                 ggml_tensor * b = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, 512);
                 op_tensor = ggml_get_rows(ctx, w, b);
             } break;
+        case GGML_OP_GET_ROWS_SCALED_I8:
+            {
+                ggml_tensor * rows = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, 512);
+                ggml_tensor * scales = ggml_new_tensor_1d(ctx, GGML_TYPE_F16, w->ne[1]);
+                ggml_set_name(rows, "ids");
+                ggml_set_name(scales, "token_embd.weight_scale");
+                op_tensor = ggml_get_rows_scaled_i8(ctx, w, rows, scales);
+            } break;
         case GGML_OP_MUL_MAT:
             {
                 ggml_tensor * b = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, w->ne[0], 512, w->ne[2], w->ne[3]);
                 op_tensor = ggml_mul_mat(ctx, w, b);
+            } break;
+        case GGML_OP_MUL_MAT_SCALED_I8:
+            {
+                ggml_tensor * b = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, w->ne[0], 512, w->ne[2], w->ne[3]);
+                ggml_tensor * scales = ggml_new_tensor_1d(ctx, GGML_TYPE_F16, w->ne[1]);
+                ggml_set_name(b, "activation");
+                ggml_set_name(scales, "output.weight_scale");
+                op_tensor = ggml_mul_mat_scaled_i8(ctx, w, b, scales);
             } break;
         case GGML_OP_MUL_MAT_ID:
             {
@@ -1032,6 +1057,12 @@ static bool weight_buft_supported(const llama_hparams & hparams, ggml_tensor * w
                 const int n_embd_inp = hparams.n_embd_inp();
                 ggml_tensor * b = ggml_new_tensor_4d(ctx, GGML_TYPE_F32, n_embd_inp, w->ne[1], 1, 1);
                 op_tensor = ggml_im2col(ctx, w, b, 1, 0, 0, 0, 1, 0, false, GGML_TYPE_F16);
+            } break;
+        case GGML_OP_ESCHA_LINEAR:
+        case GGML_OP_ESCHA_MOE:
+            {
+                // escha tensors are plain I16/F16/F32 - the generic buffer fits
+                op_tensor = w;
             } break;
         case GGML_OP_SCALE:
             {
@@ -1155,6 +1186,26 @@ struct ggml_tensor * llama_model_loader::create_tensor(
             }
         }
 
+        // Scaled-I8 Qwen3.5 companions share the placement of their primary I8
+        // weight. Probe the primary tensor; probing the F16 scale as the op's
+        // weight input makes supports_op reject the otherwise valid placement.
+        ggml_tensor * buft_probe = t_meta;
+        const bool qwen35_weight_scale =
+            (tn.tensor == LLM_TENSOR_QWEN35_TOKEN_EMBD_SCALED ||
+             tn.tensor == LLM_TENSOR_QWEN35_OUTPUT_SCALED) &&
+            tn.suffix != nullptr && strcmp(tn.suffix, "weight_scale") == 0;
+        if (qwen35_weight_scale) {
+            const llm_tensor primary_tensor = tn.tensor == LLM_TENSOR_QWEN35_TOKEN_EMBD_SCALED
+                ? LLM_TENSOR_TOKEN_EMBD
+                : LLM_TENSOR_OUTPUT;
+            const std::string primary_name = LLM_TN(tn.arch)(primary_tensor, "weight", tn.bid, tn.xid).str();
+            buft_probe = get_tensor_meta(primary_name.c_str());
+            if (buft_probe == nullptr) {
+                throw std::runtime_error(format("missing primary tensor '%s' for companion '%s'",
+                            primary_name.c_str(), tn.str().c_str()));
+            }
+        }
+
         // select the buffer type for this tensor
         const buft_list_t * buft_list;
         switch (info.layer) {
@@ -1182,7 +1233,7 @@ struct ggml_tensor * llama_model_loader::create_tensor(
                 if (std::regex_search(tensor_name, pattern)) {
                     if (overrides->buft == ggml_backend_cpu_buffer_type()) {
                         // when overriding to a CPU buffer, consider the extra buffer types
-                        buft = select_weight_buft(hparams, t_meta, op, buft_list_cpu);
+                        buft = select_weight_buft(hparams, buft_probe, op, buft_list_cpu);
                         if (use_mmap) {
                             static std::once_flag once;
                             std::call_once(once, [] {
@@ -1203,7 +1254,7 @@ struct ggml_tensor * llama_model_loader::create_tensor(
         }
 
         if (!buft) {
-            buft = select_weight_buft(hparams, t_meta, op, buft_list);
+            buft = select_weight_buft(hparams, buft_probe, op, buft_list);
             if (!buft) {
                 throw std::runtime_error(format("failed to find a compatible buffer type for tensor %s", tn.str().c_str()));
             }
@@ -1238,8 +1289,12 @@ struct ggml_tensor * llama_model_loader::create_tensor(
         }
         ggml_type type = GGML_TYPE_F32;
         const int64_t tid = gguf_find_tensor(metadata, tn.str().c_str());
+        if (strstr(tn.str().c_str(), "escha_dep") != nullptr) {
+        }
         if (tid != -1) {
             type = gguf_get_tensor_type(metadata, tid);
+        }
+        if (strstr(tn.str().c_str(), "escha_dep") != nullptr) {
         }
 
         // for tensors that are not required some of the dimensions can be invalid:

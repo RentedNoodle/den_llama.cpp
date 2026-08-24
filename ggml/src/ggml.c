@@ -1102,9 +1102,18 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "OPT_STEP_SGD",
 
     "GLU",
+    "ESCHA_MOE",
+    "ESCHA_LINEAR",
+    "GET_ROWS_SCALED_I8",
+    "MUL_MAT_SCALED_I8",
 };
 
-static_assert(GGML_OP_COUNT == 105, "GGML_OP_COUNT != 105");
+static_assert(GGML_OP_COUNT == 109, "GGML_OP_COUNT changed - update op tables");
+static_assert(GGML_OP_ESCHA_MOE == GGML_OP_GLU + 1 &&
+              GGML_OP_ESCHA_LINEAR == GGML_OP_GLU + 2 &&
+              GGML_OP_GET_ROWS_SCALED_I8 == GGML_OP_GLU + 3 &&
+              GGML_OP_MUL_MAT_SCALED_I8 == GGML_OP_GLU + 4,
+              "scaled-I8/ESCHA op order changed - update op tables");
 
 static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "none",
@@ -1221,9 +1230,13 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "sgd(x)",
 
     "glu(x)",
+    "escha_moe(code, x, ids)",
+    "escha_linear(code, rin, rout, dep, x)",
+    "get_rows_scaled_i8(x, rows, scales)",
+    "mul_mat_scaled_i8(w, x, scales)",
 };
 
-static_assert(GGML_OP_COUNT == 105, "GGML_OP_COUNT != 105");
+static_assert(GGML_OP_COUNT == 109, "GGML_OP_COUNT changed - update op tables");
 
 static_assert(GGML_OP_POOL_COUNT == 2, "GGML_OP_POOL_COUNT != 2");
 
@@ -3283,6 +3296,119 @@ static inline bool ggml_can_mul_mat(const struct ggml_tensor * t0, const struct 
            (t1->ne[3]%t0->ne[3] == 0);
 }
 
+struct ggml_tensor * ggml_escha_moe(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * code,
+        struct ggml_tensor  * rin,
+        struct ggml_tensor  * rout,
+        struct ggml_tensor  * lut,
+        struct ggml_tensor  * dep,
+        struct ggml_tensor  * x,
+        struct ggml_tensor  * ids) {
+    GGML_ASSERT(code->type == GGML_TYPE_I16);
+    GGML_ASSERT(rin ->type == GGML_TYPE_F16);
+    GGML_ASSERT(rout->type == GGML_TYPE_F16);
+    GGML_ASSERT(lut ->type == GGML_TYPE_F16);
+    GGML_ASSERT(dep ->type == GGML_TYPE_I16 || dep ->type == GGML_TYPE_I32); // the dep3 can load as I32
+    GGML_ASSERT(x   ->type == GGML_TYPE_F32);
+    GGML_ASSERT(ids ->type == GGML_TYPE_I32);
+
+    GGML_ASSERT(ggml_is_contiguous(code));
+    GGML_ASSERT(ggml_is_contiguous(rin));
+    GGML_ASSERT(ggml_is_contiguous(rout));
+    GGML_ASSERT(ggml_is_contiguous(lut));
+    GGML_ASSERT(ggml_is_contiguous(dep));
+    GGML_ASSERT(ggml_is_contiguous_rows(x));
+
+    GGML_ASSERT(code->ne[0] == 32 || code->ne[0] == 48); // 16*K, K = 2 or 3
+
+    const int64_t OC = code->ne[1]*16;
+    const int64_t IC = code->ne[2]*16;
+    const int64_t E  = code->ne[3];
+
+    // the rotations are applied per 128-block, so both axes must be a multiple of 128
+    GGML_ASSERT(IC % 128 == 0);
+    GGML_ASSERT(OC % 128 == 0);
+
+    GGML_ASSERT(rin ->ne[0] == IC && rin ->ne[1] == E);
+    GGML_ASSERT(rout->ne[0] == OC && rout->ne[1] == E);
+    GGML_ASSERT(lut ->ne[0] == 65536 && ggml_nelements(lut) == 65536);
+    GGML_ASSERT(dep ->ne[0] == 16 && dep->ne[1] == 256);
+
+    GGML_ASSERT(x  ->ne[0] == IC);
+    GGML_ASSERT(x  ->ne[3] == 1);
+    GGML_ASSERT(ids->ne[2] == 1 && ids->ne[3] == 1);
+    GGML_ASSERT(ids->ne[1] == x->ne[2]);        // one expert list per x row
+    GGML_ASSERT(ids->ne[0] % x->ne[1] == 0);    // can broadcast
+
+    const int64_t ne[4] = { OC, ids->ne[0], x->ne[2], 1 };
+    struct ggml_tensor * result = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, ne);
+
+    result->op     = GGML_OP_ESCHA_MOE;
+    result->src[0] = code;
+    result->src[1] = rin;
+    result->src[2] = rout;
+    result->src[3] = lut;
+    result->src[4] = dep;
+    result->src[5] = x;
+    result->src[6] = ids;
+
+    return result;
+}
+
+
+struct ggml_tensor * ggml_escha_linear(
+        struct ggml_context * ctx,
+        struct ggml_tensor * code,
+        struct ggml_tensor * rin,
+        struct ggml_tensor * rout,
+        struct ggml_tensor * s_in,
+        struct ggml_tensor * s_out,
+        struct ggml_tensor * dep,
+        struct ggml_tensor * x) {
+    GGML_ASSERT(code->type == GGML_TYPE_I16);
+    GGML_ASSERT(rin->type == GGML_TYPE_F16 && rout->type == GGML_TYPE_F16);
+    GGML_ASSERT(s_in->type == GGML_TYPE_F32 && s_out->type == GGML_TYPE_F32);
+    GGML_ASSERT(dep->type == GGML_TYPE_I16 || dep->type == GGML_TYPE_I32);
+    GGML_ASSERT(x->type == GGML_TYPE_F32);
+    GGML_ASSERT(ggml_is_contiguous(code) && ggml_is_contiguous(rin) && ggml_is_contiguous(rout));
+    GGML_ASSERT(ggml_is_contiguous(dep) && ggml_is_contiguous_rows(x));
+    GGML_ASSERT(code->ne[0] == 32 || code->ne[0] == 48);
+    GGML_ASSERT(code->ne[3] == 1);
+    GGML_ASSERT(code->ne[1] * 16 == rout->ne[0] && rin->ne[0] == x->ne[0]);
+    GGML_ASSERT(s_in->ne[0] == rin->ne[0] && s_out->ne[0] == rout->ne[0]);
+    GGML_ASSERT(code->ne[2] * 16 == x->ne[0]);
+    GGML_ASSERT(rout->ne[0] == code->ne[1]*16);
+    GGML_ASSERT(dep->ne[0] == 16 && dep->ne[1] == 256);
+
+    const int64_t ne[4] = { rout->ne[0], x->ne[1], x->ne[2], x->ne[3] };
+    struct ggml_tensor * result = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, ne);
+    result->op = GGML_OP_ESCHA_LINEAR;
+    result->src[0] = code;
+    result->src[1] = rin;
+    result->src[2] = rout;
+    result->src[3] = s_in;
+    result->src[4] = s_out;
+    result->src[5] = dep;
+    result->src[6] = x;
+    return result;
+}
+
+struct ggml_tensor * ggml_escha_linear_qwen38_w2(
+        struct ggml_context * ctx,
+        struct ggml_tensor * code,
+        struct ggml_tensor * rin,
+        struct ggml_tensor * rout,
+        struct ggml_tensor * s_in,
+        struct ggml_tensor * s_out,
+        struct ggml_tensor * dep,
+        struct ggml_tensor * x) {
+    struct ggml_tensor * result = ggml_escha_linear(ctx, code, rin, rout, s_in, s_out, dep, x);
+    const int32_t capability = 1;
+    ggml_set_op_params(result, &capability, sizeof(capability));
+    return result;
+}
+
 struct ggml_tensor * ggml_mul_mat(
         struct ggml_context * ctx,
         struct ggml_tensor  * a,
@@ -3297,6 +3423,28 @@ struct ggml_tensor * ggml_mul_mat(
     result->src[0] = a;
     result->src[1] = b;
 
+    return result;
+}
+
+struct ggml_tensor * ggml_mul_mat_scaled_i8(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * weights_i8,
+        struct ggml_tensor  * activations_f32,
+        struct ggml_tensor  * row_scales_f16) {
+    GGML_ASSERT(weights_i8->type == GGML_TYPE_I8);
+    GGML_ASSERT(activations_f32->type == GGML_TYPE_F32);
+    GGML_ASSERT(row_scales_f16->type == GGML_TYPE_F16);
+    GGML_ASSERT(weights_i8->ne[0] == activations_f32->ne[0]);
+    GGML_ASSERT(weights_i8->ne[1] == row_scales_f16->ne[0]);
+    // A graph may deliberately request no logits for an evaluation batch.
+    // Keep that zero-row result representable; CUDA treats it as a no-op.
+
+    const int64_t ne[4] = { weights_i8->ne[1], activations_f32->ne[1], activations_f32->ne[2], activations_f32->ne[3] };
+    struct ggml_tensor * result = ggml_new_tensor(ctx, GGML_TYPE_F32, 4, ne);
+    result->op = GGML_OP_MUL_MAT_SCALED_I8;
+    result->src[0] = weights_i8;
+    result->src[1] = activations_f32;
+    result->src[2] = row_scales_f16;
     return result;
 }
 
@@ -3916,6 +4064,26 @@ struct ggml_tensor * ggml_get_rows(
     result->src[0] = a;
     result->src[1] = b;
 
+    return result;
+}
+
+struct ggml_tensor * ggml_get_rows_scaled_i8(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * values_i8,
+        struct ggml_tensor  * rows_i32,
+        struct ggml_tensor  * row_scales_f16) {
+    GGML_ASSERT(values_i8->type == GGML_TYPE_I8);
+    GGML_ASSERT(row_scales_f16->type == GGML_TYPE_F16);
+    GGML_ASSERT(rows_i32->type == GGML_TYPE_I32);
+    GGML_ASSERT(values_i8->ne[1] == row_scales_f16->ne[0]);
+    GGML_ASSERT(rows_i32->ne[0] >= 1);
+
+    struct ggml_tensor * result = ggml_new_tensor_4d(ctx, GGML_TYPE_F32,
+        values_i8->ne[0], rows_i32->ne[0], rows_i32->ne[1], rows_i32->ne[2]);
+    result->op = GGML_OP_GET_ROWS_SCALED_I8;
+    result->src[0] = values_i8;
+    result->src[1] = rows_i32;
+    result->src[2] = row_scales_f16;
     return result;
 }
 

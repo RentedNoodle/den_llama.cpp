@@ -4,6 +4,13 @@
 #include "fattn-common.cuh"
 #include "fattn-mma-kvarn-load.cuh"
 #include "mma.cuh"
+#if defined(GGML_CUDA_KVARN_CLUSTER)
+// Cluster-cooperative kvarn decode (DEN_KVARN_CLUSTER=1 at build time).
+// Blocked by the CUDA 13.3 ptxas lacking the cluster rank/barrier/map ISA;
+// gated off until the toolchain supports it. See dflash2/cluster notes.
+#include <cuda/cluster.h>
+#endif
+#include <cuda/cluster.h>
 
 using namespace ggml_cuda_mma;
 
@@ -115,7 +122,10 @@ static __device__ __forceinline__ int ggml_cuda_fattn_kvarn_decode_unpack(
     return (packed >> shift) & ((1 << bits) - 1);
 }
 
-template<int D, int MAX_GQA, int SPLIT_TOKENS, int NWARPS, int K_BITS, int V_BITS>
+template<int D, int MAX_GQA, int SPLIT_TOKENS, int NWARPS, int K_BITS, int V_BITS, bool CLUSTER = false, int CLUSTER_DIMS = 1, int MAX_Q = 1>
+// 4-block clusters only: sm_120a DSMEM exchange is broken for 8-block clusters
+// (mapped reads return 0); 4-block clusters verified working.
+__cluster_dims__(4, 1, 1)
 static __global__ void ggml_cuda_fattn_kvarn_decode_mma_kernel(
         const char * Q,
         const ggml_cuda_fattn_kvarn_desc * k_descs,
@@ -123,6 +133,8 @@ static __global__ void ggml_cuda_fattn_kvarn_decode_mma_kernel(
         const char * mask,
         float * partial,
         float2 * partial_meta,
+        float * dst,
+        float2 * dst_meta,
         float scale,
         float logit_softcap,
         int64_t nb01,
@@ -139,10 +151,17 @@ static __global__ void ggml_cuda_fattn_kvarn_decode_mma_kernel(
         int gqa_ratio,
         int n_gqa_blocks,
         int n_splits) {
-    const int split = blockIdx.x;
-    const int q_index = blockIdx.y % n_q;
-    const int gqa_block = (blockIdx.y / n_q) % n_gqa_blocks;
-    const int kv_head = blockIdx.y / (n_q * n_gqa_blocks);
+    // CLUSTER: blocks of one cluster own consecutive splits; the grid's cluster id is
+    // blockIdx.x/4 (cluster 0 owns splits 0..3, cluster 1 owns 4..7, ...). Phantom
+    // blocks of a partial tail group (split >= n_splits) idle-sync below and are
+    // never mapped by their cluster's rank 0.
+    const int split = CLUSTER
+        ? (int) (blockIdx.x / 4) * 4 + (int) cuda::cluster::block_rank_in_cluster()
+        : blockIdx.x;
+    // Batched queries: the block handles ALL n_q rows for its (kv_head,
+    // gqa_block, split) — the K/V tile is decoded once and applied to every row.
+    const int gqa_block = blockIdx.y % n_gqa_blocks;
+    const int kv_head = blockIdx.y / n_gqa_blocks;
     const int stream = blockIdx.z;
     const int lane = threadIdx.x;
     const int warp = threadIdx.y;
@@ -173,22 +192,27 @@ static __global__ void ggml_cuda_fattn_kvarn_decode_mma_kernel(
     static_assert(PHYSICAL_WAVE_SIZE == 32 || PHYSICAL_WAVE_SIZE == 64,
         "KVarN decode MMA requires a physical wave size of 32 or 64");
 
-    __shared__ __align__(16) half2 q_sh[MAX_GQA][Q_STRIDE2];
-    __shared__ __align__(16) float score_partial_sh[NWARPS][MAX_GQA * TOKENS_PER_CHUNK];
-    __shared__ __align__(16) float score_sh[MAX_GQA][SPLIT_TOKENS];
-    __shared__ __align__(16) half2 p_sh[MAX_GQA][P_STRIDE2];
+    __shared__ __align__(16) half2 q_sh[MAX_Q][MAX_GQA][Q_STRIDE2];
+    __shared__ __align__(16) float score_partial_sh[NWARPS][MAX_GQA * TOKENS_PER_CHUNK]; // reused per q row
+    __shared__ __align__(16) float score_sh[MAX_Q][MAX_GQA][SPLIT_TOKENS];
+    __shared__ __align__(16) half2 p_sh[MAX_Q][MAX_GQA][P_STRIDE2];
     __shared__ float scale_axis_sh[SLICES][GGML_CUDA_FATTN_KVARN_DIM];
     __shared__ float zp_axis_sh[SLICES][GGML_CUDA_FATTN_KVARN_DIM];
     __shared__ float other_axis_sh[SLICES][GGML_CUDA_FATTN_KVARN_DIM];
-    __shared__ float zq_sh[SLICES][MAX_GQA];
-    __shared__ float m_sh[MAX_GQA];
-    __shared__ float denom_sh[MAX_GQA];
+    __shared__ float zq_sh[MAX_Q][SLICES][MAX_GQA];
+    __shared__ float m_sh[MAX_Q][MAX_GQA];
+    __shared__ float denom_sh[MAX_Q][MAX_GQA];
+    extern __shared__ float s_exchange[]; // CLUSTER: DSMEM partial exchange (unused when CLUSTER=false)
 
     const ggml_cuda_fattn_kvarn_desc & k_desc = k_descs[stream * n_kv_heads + kv_head];
     const ggml_cuda_fattn_kvarn_desc & v_desc = v_descs[stream * n_kv_heads + kv_head];
     const int q_head0 = kv_head * gqa_ratio + gqa_block * MAX_GQA;
     const int gqa_head_count = min(MAX_GQA, gqa_ratio - gqa_block * MAX_GQA);
-    const int token_begin = split * SPLIT_TOKENS;
+    // Phantom tail blocks clamp to the last KV position: their 1-token range is
+    // computed (indices/records stay in bounds) but their DSMEM is never combined.
+    const int token_begin = CLUSTER && split >= n_splits && n_kv > 0
+        ? n_kv - 1
+        : split * SPLIT_TOKENS;
     const int token_end = min(n_kv, token_begin + SPLIT_TOKENS);
     const int group = token_begin / GGML_CUDA_FATTN_KVARN_DIM;
     const int group_pos_begin = token_begin - group * GGML_CUDA_FATTN_KVARN_DIM;
@@ -219,15 +243,17 @@ static __global__ void ggml_cuda_fattn_kvarn_decode_mma_kernel(
     }
 
     half * q_h = (half *) q_sh;
-    for (int i = tid; i < MAX_GQA * D; i += NWARPS * PHYSICAL_WAVE_SIZE) {
-        const int h = i / D;
-        const int dim = i % D;
-        float value = 0.0f;
-        if (h < gqa_head_count && q_head0 + h < n_q_heads) {
-            const float * q = (const float *) (Q + nb03 * stream + nb02 * (q_head0 + h) + nb01 * q_index);
-            value = q[dim] * scale;
+    for (int qi = 0; qi < n_q; ++qi) {
+        for (int i = tid; i < MAX_GQA * D; i += NWARPS * PHYSICAL_WAVE_SIZE) {
+            const int h = i / D;
+            const int dim = i % D;
+            float value = 0.0f;
+            if (h < gqa_head_count && q_head0 + h < n_q_heads) {
+                const float * q = (const float *) (Q + nb03 * stream + nb02 * (q_head0 + h) + nb01 * qi);
+                value = q[dim] * scale;
+            }
+            q_h[qi * MAX_GQA * (2 * Q_STRIDE2) + h * (2 * Q_STRIDE2) + dim] = __float2half(value);
         }
-        q_h[h * (2 * Q_STRIDE2) + dim] = __float2half(value);
     }
 
     if (k_split_in_group) {
@@ -246,19 +272,22 @@ static __global__ void ggml_cuda_fattn_kvarn_decode_mma_kernel(
 
     if (k_split_in_group) {
         const int n_targets = SLICES * gqa_head_count;
-        for (int target = tid; target < n_targets; target += NWARPS * PHYSICAL_WAVE_SIZE) {
-            const int slice = target / gqa_head_count;
-            const int h = target % gqa_head_count;
-            const half * q_row = (const half *) q_sh + h * (2 * Q_STRIDE2) + slice * GGML_CUDA_FATTN_KVARN_DIM;
-            float zq = 0.0f;
-            for (int dim = 0; dim < GGML_CUDA_FATTN_KVARN_DIM; ++dim) {
-                const float q_val = __half2float(q_row[dim]);
-                zq += zp_axis_sh[slice][dim] * q_val;
-                const float q_prime = scale_axis_sh[slice][dim] * q_val;
-                ((half *) q_sh)[h * (2 * Q_STRIDE2) + slice * GGML_CUDA_FATTN_KVARN_DIM + dim] =
-                    __float2half(q_prime);
+        for (int qi = 0; qi < n_q; ++qi) {
+            for (int target = tid; target < n_targets; target += NWARPS * PHYSICAL_WAVE_SIZE) {
+                const int slice = target / gqa_head_count;
+                const int h = target % gqa_head_count;
+                const half * q_row = (const half *) q_sh + qi * MAX_GQA * (2 * Q_STRIDE2)
+                    + h * (2 * Q_STRIDE2) + slice * GGML_CUDA_FATTN_KVARN_DIM;
+                float zq = 0.0f;
+                for (int dim = 0; dim < GGML_CUDA_FATTN_KVARN_DIM; ++dim) {
+                    const float q_val = __half2float(q_row[dim]);
+                    zq += zp_axis_sh[slice][dim] * q_val;
+                    const float q_prime = scale_axis_sh[slice][dim] * q_val;
+                    ((half *) q_sh)[qi * MAX_GQA * (2 * Q_STRIDE2) + h * (2 * Q_STRIDE2)
+                        + slice * GGML_CUDA_FATTN_KVARN_DIM + dim] = __float2half(q_prime);
+                }
+                zq_sh[qi][slice][h] = zq;
             }
-            zq_sh[slice][h] = zq;
         }
     }
     __syncthreads();
@@ -272,10 +301,13 @@ static __global__ void ggml_cuda_fattn_kvarn_decode_mma_kernel(
         const int chunk = chunk_base + local_chunk;
         const bool chunk_active = chunk < TOKEN_CHUNKS;
         const int token0 = token_begin + chunk * TOKENS_PER_CHUNK;
-        T_C scores;
+        T_C scores[MAX_Q];
 #pragma unroll
-        for (int l = 0; l < T_C::ne; ++l) {
-            scores.x[l] = 0.0f;
+        for (int qi = 0; qi < MAX_Q; ++qi) {
+#pragma unroll
+            for (int l = 0; l < T_C::ne; ++l) {
+                scores[qi].x[l] = 0.0f;
+            }
         }
 
         if (chunk_active) {
@@ -308,116 +340,127 @@ static __global__ void ggml_cuda_fattn_kvarn_decode_mma_kernel(
                     }
                     k_a.x[l] = make_half2(x0, x1);
                 }
-                load_ldmatrix(q_b, q_sh[0] + dim0 / 2, Q_STRIDE2);
-                mma(scores, k_a, q_b);
-            }
-
-#pragma unroll
-            for (int l = 0; l < T_C::ne; ++l) {
-                const int j = T_C::get_i(l);
-                const int h = T_C::get_j(l);
-                if (h < MAX_GQA) {
-                    float v = scores.x[l];
-                    if (k_split_in_group && h < gqa_head_count) {
-                        const int pos = k_tile.pos_begin + chunk * TOKENS_PER_CHUNK + j;
-                        v = other_axis_sh[warp_in_chunk][pos] * (v + zq_sh[warp_in_chunk][h]);
-                    }
-                    score_partial_sh[warp][h * TOKENS_PER_CHUNK + j] = v;
+                for (int qi = 0; qi < n_q; ++qi) {
+                    T_B q_b;
+                    load_ldmatrix(q_b, q_sh[qi][0] + dim0 / 2, Q_STRIDE2);
+                    mma(scores[qi], k_a, q_b);
                 }
             }
         }
-        __syncthreads();
 
-#pragma unroll
-        for (int stride = WARPS_PER_CHUNK / 2; stride > 0; stride >>= 1) {
-            if (chunk_active && warp_in_chunk < stride) {
+        // per q row: publish the partial, cross-warp reduce, fill score_sh[qi]
+        for (int qi = 0; qi < n_q; ++qi) {
+            if (chunk_active) {
 #pragma unroll
                 for (int l = 0; l < T_C::ne; ++l) {
                     const int j = T_C::get_i(l);
                     const int h = T_C::get_j(l);
                     if (h < MAX_GQA) {
-                        score_partial_sh[warp][h * TOKENS_PER_CHUNK + j] +=
-                            score_partial_sh[warp + stride][h * TOKENS_PER_CHUNK + j];
+                        float v = scores[qi].x[l];
+                        if (k_split_in_group && h < gqa_head_count) {
+                            const int pos = k_tile.pos_begin + chunk * TOKENS_PER_CHUNK + j;
+                            v = other_axis_sh[warp_in_chunk][pos] * (v + zq_sh[qi][warp_in_chunk][h]);
+                        }
+                        score_partial_sh[warp][h * TOKENS_PER_CHUNK + j] = v;
+                    }
+                }
+            }
+            __syncthreads();
+
+#pragma unroll
+            for (int stride = WARPS_PER_CHUNK / 2; stride > 0; stride >>= 1) {
+                if (chunk_active && warp_in_chunk < stride) {
+#pragma unroll
+                    for (int l = 0; l < T_C::ne; ++l) {
+                        const int j = T_C::get_i(l);
+                        const int h = T_C::get_j(l);
+                        if (h < MAX_GQA) {
+                            score_partial_sh[warp][h * TOKENS_PER_CHUNK + j] +=
+                                score_partial_sh[warp + stride][h * TOKENS_PER_CHUNK + j];
+                        }
+                    }
+                }
+                __syncthreads();
+            }
+
+            if (chunk_active && warp_in_chunk == 0) {
+#pragma unroll
+                for (int l = 0; l < T_C::ne; ++l) {
+                    const int j = T_C::get_i(l);
+                    const int h = T_C::get_j(l);
+                    const int token = token0 + j;
+                    float score = -FLT_MAX / 2.0f;
+                    if (h < gqa_head_count && q_head0 + h < n_q_heads && token < token_end) {
+                        score = score_partial_sh[warp][h * TOKENS_PER_CHUNK + j];
+                        if (logit_softcap != 0.0f) {
+                            score = logit_softcap * tanhf(score);
+                        }
+                        if (mask_h != nullptr) {
+                            score += __half2float(*(const half *) ((const char *) mask_h + nb30 * token + nb31 * qi));
+                        }
+                    }
+                    if (h < MAX_GQA) {
+                        score_sh[qi][h][chunk * TOKENS_PER_CHUNK + j] = score;
                     }
                 }
             }
             __syncthreads();
         }
-
-        if (chunk_active && warp_in_chunk == 0) {
-#pragma unroll
-            for (int l = 0; l < T_C::ne; ++l) {
-                const int j = T_C::get_i(l);
-                const int h = T_C::get_j(l);
-                const int token = token0 + j;
-                float score = -FLT_MAX / 2.0f;
-                if (h < gqa_head_count && q_head0 + h < n_q_heads && token < token_end) {
-                    score = score_partial_sh[warp][h * TOKENS_PER_CHUNK + j];
-                    if (logit_softcap != 0.0f) {
-                        score = logit_softcap * tanhf(score);
-                    }
-                    if (mask_h != nullptr) {
-                        score += __half2float(*(const half *) ((const char *) mask_h + nb30 * token + nb31 * q_index));
-                    }
-                }
-                if (h < MAX_GQA) {
-                    score_sh[h][chunk * TOKENS_PER_CHUNK + j] = score;
-                }
-            }
-        }
-        __syncthreads();
     }
 
     half * p_h = (half *) p_sh;
+    for (int qi = 0; qi < n_q; ++qi) {
 #if defined(GGML_USE_HIP) && defined(CDNA)
-    if (tid < MAX_GQA) {
-        const int h = tid;
-        float m = -FLT_MAX / 2.0f;
-        for (int token = 0; token < SPLIT_TOKENS; ++token) {
-            m = fmaxf(m, score_sh[h][token] + FATTN_KQ_MAX_OFFSET);
+        if (tid < MAX_GQA) {
+            const int h = tid;
+            float m = -FLT_MAX / 2.0f;
+            for (int token = 0; token < SPLIT_TOKENS; ++token) {
+                m = fmaxf(m, score_sh[qi][h][token] + FATTN_KQ_MAX_OFFSET);
+            }
+            float denom = 0.0f;
+            for (int token = 0; token < SPLIT_TOKENS; ++token) {
+                const float diff = score_sh[qi][h][token] - m;
+                const float weight = diff >= SOFTMAX_FTZ_THRESHOLD ? expf(diff) : 0.0f;
+                denom += weight;
+                p_h[qi * MAX_GQA * (2 * P_STRIDE2) + h * (2 * P_STRIDE2) + token] = __float2half(weight);
+            }
+            m_sh[qi][h] = m;
+            denom_sh[qi][h] = denom;
         }
-        float denom = 0.0f;
-        for (int token = 0; token < SPLIT_TOKENS; ++token) {
-            const float diff = score_sh[h][token] - m;
-            const float weight = diff >= SOFTMAX_FTZ_THRESHOLD ? expf(diff) : 0.0f;
-            denom += weight;
-            p_h[h * (2 * P_STRIDE2) + token] = __float2half(weight);
-        }
-        m_sh[h] = m;
-        denom_sh[h] = denom;
-    }
 #else
-    const int h = tid / 16;
-    const int lane_h = tid % 16;
-    float m = -FLT_MAX / 2.0f;
-    if (h < MAX_GQA) {
-        for (int token = lane_h; token < SPLIT_TOKENS; token += 16) {
-            m = fmaxf(m, score_sh[h][token] + FATTN_KQ_MAX_OFFSET);
+        const int h = tid / 16;
+        const int lane_h = tid % 16;
+        float m = -FLT_MAX / 2.0f;
+        if (h < MAX_GQA) {
+            for (int token = lane_h; token < SPLIT_TOKENS; token += 16) {
+                m = fmaxf(m, score_sh[qi][h][token] + FATTN_KQ_MAX_OFFSET);
+            }
         }
-    }
 #pragma unroll
-    for (int offset = 8; offset > 0; offset >>= 1) {
-        m = fmaxf(m, __shfl_xor_sync(0xFFFFFFFFu, m, offset, 16));
-    }
+        for (int offset = 8; offset > 0; offset >>= 1) {
+            m = fmaxf(m, __shfl_xor_sync(0xFFFFFFFFu, m, offset, 16));
+        }
 
-    float denom = 0.0f;
-    if (h < MAX_GQA) {
-        for (int token = lane_h; token < SPLIT_TOKENS; token += 16) {
-            const float diff = score_sh[h][token] - m;
-            const float weight = diff >= SOFTMAX_FTZ_THRESHOLD ? expf(diff) : 0.0f;
-            denom += weight;
-            p_h[h * (2 * P_STRIDE2) + token] = __float2half(weight);
+        float denom = 0.0f;
+        if (h < MAX_GQA) {
+            for (int token = lane_h; token < SPLIT_TOKENS; token += 16) {
+                const float diff = score_sh[qi][h][token] - m;
+                const float weight = diff >= SOFTMAX_FTZ_THRESHOLD ? expf(diff) : 0.0f;
+                denom += weight;
+                p_h[qi * MAX_GQA * (2 * P_STRIDE2) + h * (2 * P_STRIDE2) + token] = __float2half(weight);
+            }
         }
-    }
 #pragma unroll
-    for (int offset = 8; offset > 0; offset >>= 1) {
-        denom += __shfl_xor_sync(0xFFFFFFFFu, denom, offset, 16);
-    }
-    if (h < MAX_GQA && lane_h == 0) {
-        m_sh[h] = m;
-        denom_sh[h] = denom;
-    }
+        for (int offset = 8; offset > 0; offset >>= 1) {
+            denom += __shfl_xor_sync(0xFFFFFFFFu, denom, offset, 16);
+        }
+        if (h < MAX_GQA && lane_h == 0) {
+            m_sh[qi][h] = m;
+            denom_sh[qi][h] = denom;
+        }
 #endif
+        __syncthreads();
+    }
     __syncthreads();
 
     if (v_from_record) {
@@ -438,10 +481,13 @@ static __global__ void ggml_cuda_fattn_kvarn_decode_mma_kernel(
     for (int dim0 = warp * TOKENS_PER_CHUNK; dim0 < D; dim0 += NWARPS * TOKENS_PER_CHUNK) {
         const int slice = dim0 / GGML_CUDA_FATTN_KVARN_DIM;
         const int local_dim0 = dim0 % GGML_CUDA_FATTN_KVARN_DIM;
-        T_C out;
+        T_C out[MAX_Q];
 #pragma unroll
-        for (int l = 0; l < T_C::ne; ++l) {
-            out.x[l] = 0.0f;
+        for (int qi = 0; qi < MAX_Q; ++qi) {
+#pragma unroll
+            for (int l = 0; l < T_C::ne; ++l) {
+                out[qi].x[l] = 0.0f;
+            }
         }
 
 #pragma unroll 1
@@ -476,8 +522,11 @@ static __global__ void ggml_cuda_fattn_kvarn_decode_mma_kernel(
                 }
                 v_a.x[l] = make_half2(x0, x1);
             }
-            load_ldmatrix(p_b, p_sh[0] + chunk * (TOKENS_PER_CHUNK / 2), P_STRIDE2);
-            mma(out, v_a, p_b);
+            for (int qi = 0; qi < n_q; ++qi) {
+                T_B p_b;
+                load_ldmatrix(p_b, p_sh[qi][0] + chunk * (TOKENS_PER_CHUNK / 2), P_STRIDE2);
+                mma(out[qi], v_a, p_b);
+            }
         }
 
 #pragma unroll
@@ -486,8 +535,15 @@ static __global__ void ggml_cuda_fattn_kvarn_decode_mma_kernel(
             const int head = T_C::get_j(l);
             const int q_head = q_head0 + head;
             if (head < gqa_head_count && q_head < n_q_heads) {
-                const size_t base = (((size_t) stream * n_q + q_index) * n_q_heads + q_head) * n_splits + split;
-                partial[base * D + dim] = out.x[l];
+                for (int qi = 0; qi < n_q; ++qi) {
+                    if (CLUSTER && qi == 0) {
+                        // DSMEM exchange is laid out per local GQA head (MAX_GQA rows)
+                        s_exchange[head * D + dim] = out[0].x[l];
+                    } else {
+                        const size_t base = (((size_t) stream * n_q + qi) * n_q_heads + q_head) * n_splits + split;
+                        partial[base * D + dim] = out[qi].x[l];
+                    }
+                }
             }
         }
         __syncwarp();
@@ -496,8 +552,76 @@ static __global__ void ggml_cuda_fattn_kvarn_decode_mma_kernel(
 
     if (tid < gqa_head_count && q_head0 + tid < n_q_heads) {
         const int q_head = q_head0 + tid;
-        const size_t base = (((size_t) stream * n_q + q_index) * n_q_heads + q_head) * n_splits + split;
-        partial_meta[base] = make_float2(m_sh[tid], denom_sh[tid]);
+        for (int qi = 0; qi < n_q; ++qi) {
+            if (CLUSTER && qi == 0) {
+                ((float2 *) (s_exchange + MAX_GQA * D))[tid] = make_float2(m_sh[0][tid], denom_sh[0][tid]);
+            } else {
+                const size_t base = (((size_t) stream * n_q + qi) * n_q_heads + q_head) * n_splits + split;
+                partial_meta[base] = make_float2(m_sh[qi][tid], denom_sh[qi][tid]);
+            }
+        }
+    }
+
+    if (CLUSTER) {
+        // In-cluster deferred-normalize combine: rank 0 reduces its group's splits'
+        // DSMEM. n_splits <= 8: writes the final output (one launch, zero global
+        // partial traffic). n_splits > 8: writes one group partial to global memory;
+        // the caller's combine pass reduces the n_groups entries.
+        cuda::cluster::sync();
+        const int rank = (int) cuda::cluster::block_rank_in_cluster();
+        if (rank == 0) {
+            const int group_id = (int) (blockIdx.x / 4);
+            const int group_size = n_splits - group_id * 4;
+            const int n_cluster = group_size < 4 ? group_size : 4;
+            const bool grouped = n_splits > 4;
+            const size_t exchange_bytes = (size_t) (MAX_GQA * (D + 2)) * sizeof(float);
+            // Pre-map every cluster rank's DSMEM once.
+            const float * part_r[8];
+            const float2 * meta_r[8];
+#pragma unroll
+            for (int r = 0; r < 8; ++r) {
+                if (r < n_cluster) {
+                    part_r[r] = (const float *) cuda::cluster::map_shared_rank(r, exchange_bytes, s_exchange);
+                    meta_r[r] = (const float2 *) (part_r[r] + MAX_GQA * D);
+                }
+            }
+            const size_t output_row = ((size_t) stream * n_q + 0) * n_q_heads + q_head0;
+            for (int h = 0; h < gqa_head_count; ++h) {
+                const int q_head = q_head0 + h;
+                if (q_head >= n_q_heads) continue;
+                // split-local max over the group's ranks (deferred normalize)
+                float m = meta_r[0][h].x;
+                for (int r = 1; r < n_cluster; ++r) m = fmaxf(m, meta_r[r][h].x);
+                float denom = 0.0f;
+                for (int r = 0; r < n_cluster; ++r) denom += __expf(meta_r[r][h].x - m) * meta_r[r][h].y;
+                if (denom > 0.0f) {
+                    if (grouped) {
+                        const size_t group_base =
+                            (((size_t) stream * n_q + 0) * n_q_heads + q_head) * ((n_splits + 7) / 8) + group_id;
+                        for (int dim = tid; dim < D; dim += blockDim.x * blockDim.y) {
+                            float out = 0.0f;
+                            for (int r = 0; r < n_cluster; ++r) out += __expf(meta_r[r][h].x - m) * part_r[r][h * D + dim];
+                            partial[group_base * D + dim] = out;
+                        }
+                        if (tid == 0) partial_meta[group_base] = make_float2(m, denom);
+                    } else {
+                        for (int dim = tid; dim < D; dim += blockDim.x * blockDim.y) {
+                            float out = 0.0f;
+                            for (int r = 0; r < n_cluster; ++r) out += __expf(meta_r[r][h].x - m) * part_r[r][h * D + dim];
+                            dst[(output_row + h) * D + dim] = out / denom;
+                        }
+                        if (tid == 0 && dst_meta != nullptr) dst_meta[output_row + h] = make_float2(m, denom);
+                    }
+                } else {
+                    if (tid == 0) {
+                        if (!grouped) {
+                            for (int dim = 0; dim < D; ++dim) dst[(output_row + h) * D + dim] = 0.0f;
+                            if (dst_meta != nullptr) dst_meta[output_row + h] = make_float2(0.0f, 0.0f);
+                        }
+                    }
+                }
+            }
+        }
     }
 }
 
@@ -724,13 +848,100 @@ template<int D, int MAX_GQA, int SPLIT_TOKENS, int NWARPS, int K_BITS, int V_BIT
 static void ggml_cuda_fattn_kvarn_decode_launch_geometry(
         const ggml_cuda_fattn_kvarn_decode_args & args,
         const dim3 blocks_split) {
-    ggml_cuda_fattn_kvarn_decode_mma_kernel<D, MAX_GQA, SPLIT_TOKENS, NWARPS, K_BITS, V_BITS>
-        <<<blocks_split, dim3(args.wave_size, NWARPS, 1), 0, args.stream>>>(
-            args.Q, args.k_descs, args.v_descs, args.mask, args.partial, args.partial_meta,
-            args.scale, args.logit_softcap, args.nb01, args.nb02, args.nb03,
-            args.nb30, args.nb31, args.nb33, args.ne33, args.n_kv, args.n_q,
-            args.n_q_heads, args.n_kv_heads, args.gqa_ratio, args.n_gqa_blocks, args.n_splits);
+    // n_q <= 1 keeps the classic single-row kernel; n_q > 1 uses the batched
+    // kernel where each block decodes its K/V tile once and applies every row.
+    // MAX_Q=4: the DFlash2 verification batch (n_q = n_draft+1 <= 4) fits the
+    // 101KB static-smem limit (8 would exceed it at D=512/16-warp).
+    constexpr int MAX_Q = 4;
+    const auto launch = [&](auto mq) {
+        constexpr int MQ = decltype(mq)::value;
+        ggml_cuda_fattn_kvarn_decode_mma_kernel<D, MAX_GQA, SPLIT_TOKENS, NWARPS, K_BITS, V_BITS, false, 1, MQ>
+            <<<blocks_split, dim3(args.wave_size, NWARPS, 1), 0, args.stream>>>(
+                args.Q, args.k_descs, args.v_descs, args.mask, args.partial, args.partial_meta,
+                args.dst, args.dst_meta,
+                args.scale, args.logit_softcap, args.nb01, args.nb02, args.nb03,
+                args.nb30, args.nb31, args.nb33, args.ne33, args.n_kv, args.n_q,
+                args.n_q_heads, args.n_kv_heads, args.gqa_ratio, args.n_gqa_blocks, args.n_splits);
+    };
+    if (args.n_q <= 1) {
+        launch(std::integral_constant<int, 1> {});
+    } else {
+        launch(std::integral_constant<int, MAX_Q> {});
+    }
 }
+
+#if defined(GGML_CUDA_KVARN_CLUSTER)
+// Cluster-cooperative decode launch: n_splits blocks run as 8-block clusters,
+// exchange partials via DSMEM, and each cluster's rank 0 combines its group.
+// n_splits <= 8: one cluster, rank 0 writes the final output (one launch, zero
+//   global partial traffic).
+// n_splits >  8: grid.x = ceil(n_splits/8) clusters; each rank 0 writes one group
+//   partial to global (8x less traffic than the plain split path) and the caller
+//   finishes with a small combine over the group entries.
+// Gate: DEN_KVARN_CLUSTER=1 + n_splits>1 (cluster size always 8; phantom blocks
+//   in a partial tail group idle-sync and are never mapped by rank 0).
+template<int D, int MAX_GQA, int SPLIT_TOKENS, int NWARPS, int K_BITS, int V_BITS>
+static void ggml_cuda_fattn_kvarn_decode_launch_geometry_cluster(
+        const ggml_cuda_fattn_kvarn_decode_args & args,
+        const dim3 blocks_split) {
+    const int n_groups = (args.n_splits + 3) / 4;
+    // __cluster_dims__(4,1,1): sm_120a DSMEM exchange is broken for 8-block clusters
+    // (mapped reads return 0), 4-block clusters verified. The grid is in BLOCKS and
+    // the driver forms 4-block clusters. n_splits <= 4 -> one cluster (phantom
+    // blocks idle-sync); n_splits > 4 -> ceil(n_splits/4) padded clusters.
+    const int cluster_dims = 4;
+    const int cluster_blocks = args.n_splits <= 4 ? 4 : n_groups * 4;
+    const dim3 grid_cluster((uint32_t) cluster_blocks, blocks_split.y, blocks_split.z);
+    const size_t exchange_bytes = (size_t) (MAX_GQA * (D + 2)) * sizeof(float);
+    const auto launch = [&](auto tag, auto mq) {
+        constexpr int CD = decltype(tag)::value;
+        constexpr int MQ = decltype(mq)::value;
+        ggml_cuda_fattn_kvarn_decode_mma_kernel<D, MAX_GQA, SPLIT_TOKENS, NWARPS, K_BITS, V_BITS, true, CD, MQ>
+            <<<grid_cluster, dim3(args.wave_size, NWARPS, 1), exchange_bytes, args.stream>>>(
+                args.Q, args.k_descs, args.v_descs, args.mask, args.partial, args.partial_meta,
+                args.dst, args.dst_meta,
+                args.scale, args.logit_softcap, args.nb01, args.nb02, args.nb03,
+                args.nb30, args.nb31, args.nb33, args.ne33, args.n_kv, args.n_q,
+                args.n_q_heads, args.n_kv_heads, args.gqa_ratio, args.n_gqa_blocks, args.n_splits);
+    };
+    // compile-time MQ dispatch (a runtime ternary would collapse the tag type)
+    const auto mq1 = std::integral_constant<int, 1> {};
+    const auto mq8 = std::integral_constant<int, 4> {};
+    const bool batched = args.n_q > 1;
+    if (cluster_dims == 4) {
+        batched ? launch(std::integral_constant<int, 4> {}, mq8)
+                : launch(std::integral_constant<int, 4> {}, mq1);
+    } else if (cluster_dims == 8) {
+        batched ? launch(std::integral_constant<int, 8> {}, mq8)
+                : launch(std::integral_constant<int, 8> {}, mq1);
+    } else if (cluster_dims == 2) {
+        batched ? launch(std::integral_constant<int, 2> {}, mq8)
+                : launch(std::integral_constant<int, 2> {}, mq1);
+    } else if (cluster_dims == 3) {
+        batched ? launch(std::integral_constant<int, 3> {}, mq8)
+                : launch(std::integral_constant<int, 3> {}, mq1);
+    } else if (cluster_dims == 5) {
+        batched ? launch(std::integral_constant<int, 5> {}, mq8)
+                : launch(std::integral_constant<int, 5> {}, mq1);
+    } else if (cluster_dims == 6) {
+        batched ? launch(std::integral_constant<int, 6> {}, mq8)
+                : launch(std::integral_constant<int, 6> {}, mq1);
+    } else if (cluster_dims == 7) {
+        batched ? launch(std::integral_constant<int, 7> {}, mq8)
+                : launch(std::integral_constant<int, 7> {}, mq1);
+    } else {
+        batched ? launch(std::integral_constant<int, 8> {}, mq8)
+                : launch(std::integral_constant<int, 8> {}, mq1);
+    }
+    CUDA_CHECK(cudaGetLastError());
+    // NOTE: the cluster path is not yet usable on sm_120a — the full decode kernel
+    // fails to launch in a cluster ("unspecified launch failure") even though the
+    // 4-block cluster ISA (rank/barrier/mapa + DSMEM deref) is verified working
+    // standalone. Kept behind DEN_KVARN_CLUSTER=1 for future work; the plain
+    // split path (global partials + combine) is the default and is unaffected.
+    (void) cluster_dims;
+}
+#endif // GGML_CUDA_KVARN_CLUSTER
 
 template<int D, int MAX_GQA, int K_BITS, int V_BITS>
 static void ggml_cuda_fattn_kvarn_decode_launch_gqa(
@@ -760,12 +971,66 @@ static void ggml_cuda_fattn_kvarn_decode_launch_gqa(
         D, args.split_tokens, args.nwarps, MAX_GQA);
 }
 
+template<int D, int MAX_GQA, int K_BITS, int V_BITS>
+static void ggml_cuda_fattn_kvarn_decode_launch_gqa_cluster(
+        const ggml_cuda_fattn_kvarn_decode_args & args,
+        const dim3 blocks_split) {
+    if constexpr (D == 512) {
+        if (args.split_tokens == 64 && args.nwarps == 8) {
+            ggml_cuda_fattn_kvarn_decode_launch_geometry_cluster<D, MAX_GQA, 64, 8, K_BITS, V_BITS>(args, blocks_split);
+            return;
+        }
+    } else if constexpr (D == 256) {
+        if (args.split_tokens == 64 && args.nwarps == 8) {
+            ggml_cuda_fattn_kvarn_decode_launch_geometry_cluster<D, MAX_GQA, 64, 8, K_BITS, V_BITS>(args, blocks_split);
+            return;
+        }
+    } else if constexpr (D == 128) {
+        if (args.split_tokens == 64 && args.nwarps == 4) {
+            ggml_cuda_fattn_kvarn_decode_launch_geometry_cluster<D, MAX_GQA, 64, 4, K_BITS, V_BITS>(args, blocks_split);
+            return;
+        }
+    }
+    GGML_ABORT("unsupported KVarN cluster geometry D=%d split=%d nwarps=%d max_gqa=%d",
+        D, args.split_tokens, args.nwarps, MAX_GQA);
+}
+
 template<int D, int K_BITS, int V_BITS>
 void ggml_cuda_fattn_kvarn_decode_launch(const ggml_cuda_fattn_kvarn_decode_args & args) {
     const dim3 blocks_split(
         (uint32_t) args.n_splits,
-        (uint32_t) (args.n_kv_heads * args.n_gqa_blocks * args.n_q),
+        (uint32_t) (args.n_kv_heads * args.n_gqa_blocks), // batched kernel: q rows live inside the block
         (uint32_t) args.n_stream);
+
+    // Cluster-cooperative decode: splits share DSMEM, combine in-cluster.
+    // n_splits <= 8: one cluster, rank 0 writes the final output (one launch).
+    // n_splits >  8: grouped mode — grid.x = ceil(n_splits/8) clusters, each rank 0
+    //   reduces its 8 splits to one group partial in global memory, then a lightweight
+    //   combine pass over the n_groups entries finishes (8x less global partial traffic
+    //   and an 8x smaller combine launch vs the plain split path).
+    const int n_groups = ggml_cuda_fattn_kvarn_cluster_groups(args.n_splits, args.n_stream);
+    const bool use_cluster = n_groups > 0;
+
+    if (use_cluster) {
+        if (args.gqa_per_block == 6) {
+            ggml_cuda_fattn_kvarn_decode_launch_gqa_cluster<D, 6, K_BITS, V_BITS>(args, blocks_split);
+        } else if (args.gqa_per_block == 8) {
+            ggml_cuda_fattn_kvarn_decode_launch_gqa_cluster<D, 8, K_BITS, V_BITS>(args, blocks_split);
+        } else {
+            GGML_ABORT("unsupported KVarN cluster GQA block size %d", args.gqa_per_block);
+        }
+        CUDA_CHECK(cudaGetLastError());
+        if (args.n_splits > 8) {
+            // grouped mode: finish the cross-group reduction (over n_groups entries)
+            const dim3 blocks_combine((uint32_t) args.n_q_heads, (uint32_t) args.n_q, (uint32_t) args.n_stream);
+            ggml_cuda_fattn_kvarn_decode_combine_kernel<D>
+                <<<blocks_combine, GGML_CUDA_FATTN_KVARN_DECODE_THREADS, n_groups * sizeof(float), args.stream>>>(
+                    args.partial, args.partial_meta, args.dst, args.dst_meta,
+                    n_groups, args.n_q, args.n_q_heads);
+            CUDA_CHECK(cudaGetLastError());
+        }
+        return; // n_splits <= 8: in-cluster combine already wrote dst/dst_meta
+    }
 
     if (args.gqa_per_block == 6) {
         ggml_cuda_fattn_kvarn_decode_launch_gqa<D, 6, K_BITS, V_BITS>(args, blocks_split);

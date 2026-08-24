@@ -18,12 +18,96 @@
 #endif
 
 #include <cinttypes>
+#include <algorithm>
+#include <atomic>
 #include <cmath>
+#include <cstdio>
 #include <cstdlib>
 #include <cstring>
 #include <limits>
 #include <stdexcept>
 #include <string>
+
+static bool llama_env_enabled(const char * name) {
+    const char * const value = std::getenv(name);
+    return value != nullptr && value[0] != '\0' && value[0] != '0';
+}
+
+static bool llama_escha_dense_w2_model(const llama_model & model) {
+    const auto * gate_code = model.layers.empty() ? nullptr : model.layers[0].escha_ffn_gate.code;
+    return model.arch == LLM_ARCH_QWEN35 && !model.layers.empty() && gate_code != nullptr;
+}
+
+static bool llama_escha_logits_probe_enabled(const llama_model & model) {
+    const bool env_enabled = llama_env_enabled("DEN_ESCHA_LOGITS_PROBE");
+    const auto * gate_code = model.layers.empty() ? nullptr : model.layers[0].escha_ffn_gate.code;
+    static std::atomic<bool> gate_reported { false };
+    if (env_enabled && !gate_reported.exchange(true)) {
+        std::fprintf(stderr, "%s: arch=%d layers=%zu dense_gate_code=%p escha_lut=%p escha_dep=%p\n",
+                __func__, (int) model.arch, model.layers.size(), (const void *) gate_code,
+                (const void *) model.escha_lut, (const void *) model.escha_dep);
+    }
+    return env_enabled && llama_escha_dense_w2_model(model);
+}
+
+static void llama_escha_logits_probe(const llama_model & model, const float * values, int32_t n_vocab, int32_t row) {
+    static std::atomic<bool> emitted { false };
+    if (!llama_escha_logits_probe_enabled(model) || values == nullptr || n_vocab <= 0 || emitted.exchange(true)) {
+        return;
+    }
+
+    int32_t finite = 0;
+    int32_t nan = 0;
+    int32_t inf = 0;
+    float min_logit = std::numeric_limits<float>::infinity();
+    float max_logit = -std::numeric_limits<float>::infinity();
+    int32_t top_ids[8] = {};
+    float top_values[8] = {};
+    int32_t top_count = 0;
+
+    for (int32_t token = 0; token < n_vocab; ++token) {
+        const float value = values[token];
+        if (std::isnan(value)) {
+            ++nan;
+            continue;
+        }
+        if (std::isinf(value)) {
+            ++inf;
+            continue;
+        }
+        ++finite;
+        min_logit = std::min(min_logit, value);
+        max_logit = std::max(max_logit, value);
+
+        int32_t insert = 0;
+        while (insert < top_count && top_values[insert] >= value) {
+            ++insert;
+        }
+        if (insert >= 8) {
+            continue;
+        }
+        const int32_t count = std::min(top_count, 7);
+        for (int32_t j = count; j > insert; --j) {
+            top_ids[j] = top_ids[j - 1];
+            top_values[j] = top_values[j - 1];
+        }
+        top_ids[insert] = token;
+        top_values[insert] = value;
+        top_count = std::min(top_count + 1, 8);
+    }
+
+    std::fprintf(stderr, "%s: row=%d vocab=%d finite=%d nan=%d inf=%d min=%g max=%g top8=",
+            __func__, row, n_vocab, finite, nan, inf, min_logit, max_logit);
+    for (int32_t i = 0; i < top_count; ++i) {
+        std::fprintf(stderr, " %d:%g", top_ids[i], top_values[i]);
+    }
+    const llama_vocab * vocab = llama_model_get_vocab(&model);
+    const llama_token top_token = top_count > 0 ? top_ids[0] : LLAMA_TOKEN_NULL;
+    const bool top_is_eog = vocab != nullptr && top_token != LLAMA_TOKEN_NULL && llama_vocab_is_eog(vocab, top_token);
+    const bool top_is_control = vocab != nullptr && top_token != LLAMA_TOKEN_NULL && llama_vocab_is_control(vocab, top_token);
+    std::fprintf(stderr, " top_eog=%s top_control=%s backend_sampled_path=unobservable_from_context_probe\n",
+            top_is_eog ? "yes" : "no", top_is_control ? "yes" : "no");
+}
 
 //
 // llama_context
@@ -234,12 +318,27 @@ llama_context::llama_context(
     cparams.flash_attn = params.flash_attn_type != LLAMA_FLASH_ATTN_TYPE_DISABLED;
     cparams.auto_fa    = params.flash_attn_type == LLAMA_FLASH_ATTN_TYPE_AUTO;
 
-    cparams.fused_gdn_ar = true;
-    cparams.fused_gdn_ch = true;
-    cparams.auto_fgdn    = true;
+    // Dual-hybrid graphs (linear+full attn per layer) cannot be walked by the
+    // fused-GDN probes - gate the fusion off until the probes are made robust.
+    cparams.fused_gdn_ar = !hparams.is_dual_hybrid;
+    cparams.fused_gdn_ch = !hparams.is_dual_hybrid;
+    cparams.auto_fgdn    = !hparams.is_dual_hybrid;
 
     cparams.nvfp4_kv_enabled = params.nvfp4_kv_enabled;
-    cparams.kvarn = llama_kvarn_default_params();
+    // Dense Escha W2 is validated separately from KVarN. The experimental
+    // standard-KV route is opt-in and only applies when KVarN was not
+    // explicitly requested by the caller; all other models retain defaults.
+    const bool escha_std_kv = llama_env_enabled("DEN_ESCHA_STD_KV") &&
+        llama_escha_dense_w2_model(model) &&
+        params.kvarn.type == LLAMA_KVARN_TYPE_DISABLED;
+    cparams.kvarn = escha_std_kv
+        ? params.kvarn
+        : (params.kvarn.type == LLAMA_KVARN_TYPE_DISABLED
+            ? llama_kvarn_default_params()
+            : params.kvarn);
+    if (escha_std_kv) {
+        LLAMA_LOG_INFO("%s: using opt-in standard KV for dense Escha W2\n", __func__);
+    }
 
     cparams.fused_lid    = true;
     cparams.auto_flid    = true;
@@ -513,6 +612,12 @@ llama_context::~llama_context() {
 
 void llama_context::resolve_fused_ops(const llama_memory_context_i * mctx, uint32_t n_seqs) {
     const char * func = __func__;
+    // Dual-hybrid graphs (linear+full attn per layer) cannot be walked by any
+    // of the fused-op probes - skip the whole resolution until the probes are
+    // made robust against the dual layout.
+    if (model.hparams.is_dual_hybrid) {
+        return;
+    }
     auto resolve = [&](const llm_fused_op_probe & probe, bool & enabled) {
         if (!enabled) {
             return;
@@ -896,7 +1001,9 @@ float * llama_context::get_logits_ith(int32_t i) {
         }
 
         const int64_t j = output_resolve_row(i);
-        return logits.data + j*model.vocab.n_tokens();
+        float * const result = logits.data + j*model.vocab.n_tokens();
+        llama_escha_logits_probe(model, result, model.vocab.n_tokens(), (int32_t) j);
+        return result;
     } catch (const std::exception & err) {
         LLAMA_LOG_ERROR("%s: invalid logits id %d, reason: %s\n", __func__, i, err.what());
 #ifndef NDEBUG
@@ -1703,7 +1810,21 @@ int llama_context::decode(const llama_batch & batch_inp) {
         }
     }
 
-    if (!balloc->init(batch_inp, vocab, memory.get(), n_embd, n_seq_max, output_all)) {
+    const bool escha_probe = llama_escha_logits_probe_enabled(model);
+    llama_batch probe_batch = batch_inp;
+    std::vector<int8_t> probe_logits;
+
+    if (escha_probe && batch_inp.n_tokens > 0) {
+        probe_logits.assign(batch_inp.n_tokens, 0);
+        if (batch_inp.logits) {
+            std::memcpy(probe_logits.data(), batch_inp.logits, batch_inp.n_tokens*sizeof(*batch_inp.logits));
+        }
+        probe_logits.back() = 1;
+        probe_batch.logits = probe_logits.data();
+    }
+
+    const llama_batch & batch_decode = escha_probe ? probe_batch : batch_inp;
+    if (!balloc->init(batch_decode, vocab, memory.get(), n_embd, n_seq_max, output_all)) {
         LLAMA_LOG_ERROR("%s: failed to initialize batch\n", __func__);
         return -1;
     }
@@ -1872,7 +1993,7 @@ int llama_context::decode(const llama_batch & batch_inp) {
         }
 
         // extract logits
-        if (logits.data && t_logits && n_outputs > 0 && needs_raw_logits(ubatch, sampling.samplers)) {
+        if (logits.data && t_logits && n_outputs > 0 && (needs_raw_logits(ubatch, sampling.samplers) || escha_probe)) {
             ggml_backend_t backend_res = ggml_backend_sched_get_tensor_backend(sched.get(), t_logits);
             GGML_ASSERT(backend_res != nullptr);
             GGML_ASSERT(logits.data != nullptr);
@@ -2315,11 +2436,23 @@ uint32_t llama_context::graph_max_nodes(uint32_t n_tokens) const {
         model.arch == LLM_ARCH_MINIMAX_01 ||
         model.arch == LLM_ARCH_MINIMAX_M3) {
         res = std::max<uint32_t>(n_tokens * 40, 32u * model.n_tensors());
+        // Escha W2 dense: every projection adds the F16 casts, the ids tensor
+        // and the moe node (4 extra nodes each, ~11 projections per layer) - the
+        // base reserve undercounts and the graph ctx overflows (0xC0000005).
+        if (model.escha_lut != nullptr) {
+            res += 64 * 11 * 4;
+        }
     } else {
         res = std::max<uint32_t>(1024u, 8u*model.n_tensors());
         for (const auto & lora : model.loras) {
             res += lora->get_n_nodes();
         }
+    }
+
+    if (model.arch == LLM_ARCH_DFLASH && model.hparams.dflash_selector_rank > 0) {
+        const uint32_t selector_tokens = std::min<uint32_t>(
+                n_tokens, model.hparams.dflash_block_size * cparams.n_seq_max);
+        res += 32*selector_tokens;
     }
 
     uint32_t n_sampling_nodes = 0;
@@ -2721,6 +2854,17 @@ private:
     std::vector<uint8_t> temp_buffer;
 };
 
+static void llama_io_diag_null_buffer(const char * phase, const ggml_tensor * tensor) {
+    if (tensor == nullptr) {
+        fprintf(stderr, "LLAMA_IO_DIAG phase=%s tensor=<null> buffer=<null>\n", phase);
+        return;
+    }
+
+    fprintf(stderr, "LLAMA_IO_DIAG phase=%s tensor=%s type=%s ne[0..3]=[%" PRId64 ",%" PRId64 ",%" PRId64 ",%" PRId64 "] buffer=%p\n",
+            phase, tensor->name[0] ? tensor->name : "<unnamed>", ggml_type_name(tensor->type),
+            tensor->ne[0], tensor->ne[1], tensor->ne[2], tensor->ne[3], (void *) tensor->buffer);
+}
+
 class llama_io_write_device : public llama_io_write_i {
 public:
     llama_io_write_device(uint8_t * p, size_t len, llama_memory_buffers & mbufs) : ptr(p), buf_size(len), mbufs(mbufs)  {
@@ -2730,6 +2874,9 @@ public:
         llama_memory_buffers mbufs_new;
 
         for (const auto & winfo : winfos) {
+            if (winfo.tensor->buffer == nullptr) {
+                llama_io_diag_null_buffer("write_device_destroy_collect", winfo.tensor);
+            }
             auto * buft = ggml_backend_buffer_get_type(winfo.tensor->buffer);
 
             mbufs_new[buft].n_tensors++;
@@ -2750,6 +2897,9 @@ public:
         }
 
         for (const auto & winfo : winfos) {
+            if (winfo.tensor->buffer == nullptr) {
+                llama_io_diag_null_buffer("write_device_destroy_copy", winfo.tensor);
+            }
             auto * buft = ggml_backend_buffer_get_type(winfo.tensor->buffer);
 
             const int64_t n = winfo.size/ggml_element_size(winfo.tensor);
@@ -2862,6 +3012,9 @@ public:
         llama_memory_buffers mbufs_new;
 
         for (const auto & rinfo : rinfos) {
+            if (rinfo.tensor->buffer == nullptr) {
+                llama_io_diag_null_buffer("read_device_destroy_collect", rinfo.tensor);
+            }
             auto * buft = ggml_backend_buffer_get_type(rinfo.tensor->buffer);
 
             mbufs_new[buft].n_tensors++;
@@ -2881,6 +3034,9 @@ public:
         }
 
         for (const auto & rinfo : rinfos) {
+            if (rinfo.tensor->buffer == nullptr) {
+                llama_io_diag_null_buffer("read_device_destroy_copy", rinfo.tensor);
+            }
             auto * buft = ggml_backend_buffer_get_type(rinfo.tensor->buffer);
 
             const int64_t n = rinfo.size/ggml_element_size(rinfo.tensor);
@@ -3661,8 +3817,12 @@ llama_context * llama_init_from_model(
                            model->arch == LLM_ARCH_QWEN35MOE);
         const char *env_kv = getenv("DEN_NVFP4_KV_CACHE");
         bool nvfp4_env_off = (env_kv && strcmp(env_kv, "0") == 0);
-        bool nvfp4_wanted = (params.nvfp4_kv_enabled && !nvfp4_env_off) ||
-                            (nvfp4_auto && !nvfp4_env_off);
+        // KVarN store owns the attention KV when requested — the legacy NVFP4-KV
+        // sidecar would double-store and fight the kvarn views for the FA ops.
+        const bool kvarn_owns_kv = params.kvarn.type != LLAMA_KVARN_TYPE_DISABLED;
+        bool nvfp4_wanted = !kvarn_owns_kv &&
+                            ((params.nvfp4_kv_enabled && !nvfp4_env_off) ||
+                             (nvfp4_auto && !nvfp4_env_off));
         if (nvfp4_wanted) {
             // declared in ggml-cuda.h with GGML_BACKEND_API (dllimport)
             uint32_t il0 = 0;

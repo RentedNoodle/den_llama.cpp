@@ -563,6 +563,14 @@ class ModelBase:
                             self._fp8_dequantized.add(weight_name)
                     if name.endswith((".input_scale", ".k_scale", ".v_scale")):
                         tensors_to_remove.append(name)
+            elif quant_method in ("escha", "eschamoe"):
+                # Escha W2: the quantized tensors (escha_code/rin/rout/s_in/s_out/
+                # config + bias) pass through unchanged - the converter keeps the
+                # packed 2-bit form and emits the shared escha_lut separately.
+                # Dense endpoint pairs stay native and are mapped by the Qwen
+                # converter; generic dequantization would lose I8 weights and
+                # their F16 row scales.
+                pass
             elif quant_method is not None:
                 raise NotImplementedError(f"Quant method is not yet supported: {quant_method!r}")
 
@@ -875,8 +883,15 @@ class ModelBase:
 
             old_dtype = data_torch.dtype
 
+            is_escha_endpoint = quant_method in ("escha", "eschamoe") and name in (
+                "model.embed_tokens.weight_int8",
+                "model.embed_tokens.weight_scale",
+                "lm_head.weight_int8",
+                "lm_head.weight_scale",
+            )
+
             # convert any unsupported data types to float32
-            if data_torch.dtype not in (torch.float16, torch.float32):
+            if data_torch.dtype not in (torch.float16, torch.float32) and not is_escha_endpoint:
                 data_torch = data_torch.to(torch.float32)
 
             # use the first number-like part of the tensor name as the block id
@@ -952,6 +967,24 @@ class ModelBase:
                         # TODO: use Q4_K and Q6_K
                         data_qtype = gguf.GGMLQuantizationType.F16
 
+                if is_escha_endpoint:
+                    data_qtype = (
+                        gguf.GGMLQuantizationType.I8
+                        if name.endswith(".weight_int8")
+                        else gguf.GGMLQuantizationType.F16
+                    )
+
+                # Escha W2 sidecars keep their native dtypes (the packed 2-bit
+                # codes must stay int16, the scales f32, the residuals f16).
+                if new_name.endswith('.escha_code'):
+                    data_qtype = gguf.GGMLQuantizationType.I16
+                elif new_name.endswith(('.escha_rin', '.escha_rout', '.escha_bias')):
+                    data_qtype = gguf.GGMLQuantizationType.F16
+                elif new_name.endswith(('.escha_s_in', '.escha_s_out')):
+                    data_qtype = gguf.GGMLQuantizationType.F32
+                elif new_name.endswith('.escha_config'):
+                    data_qtype = gguf.GGMLQuantizationType.I32
+
                 # No override (data_qtype is False), or wants to be quantized (data_qtype is True)
                 if isinstance(data_qtype, bool):
                     if self.ftype == gguf.LlamaFileType.ALL_F32:
@@ -966,15 +999,25 @@ class ModelBase:
                         data_qtype = gguf.GGMLQuantizationType.TQ1_0
                     elif self.ftype == gguf.LlamaFileType.MOSTLY_TQ2_0:
                         data_qtype = gguf.GGMLQuantizationType.TQ2_0
+                    elif self.ftype == gguf.LlamaFileType.MOSTLY_MXFP4:
+                        data_qtype = gguf.GGMLQuantizationType.MXFP4
                     else:
                         raise ValueError(f"Unknown file type: {self.ftype.name}")
 
-                try:
-                    data = gguf.quants.quantize(data, data_qtype)
-                except gguf.QuantError as e:
-                    logger.warning("%s, %s", e, "falling back to F16")
-                    data_qtype = gguf.GGMLQuantizationType.F16
-                    data = gguf.quants.quantize(data, data_qtype)
+                # Escha W2 sidecars are already in their native format - no
+                # quantization step (I16 codes / F16 residuals / F32 scales).
+                escha_native = data_qtype in (
+                    gguf.GGMLQuantizationType.I8,
+                    gguf.GGMLQuantizationType.I16,
+                    gguf.GGMLQuantizationType.I32,
+                ) or is_escha_endpoint
+                if not escha_native:
+                    try:
+                        data = gguf.quants.quantize(data, data_qtype)
+                    except gguf.QuantError as e:
+                        logger.warning("%s, %s", e, "falling back to F16")
+                        data_qtype = gguf.GGMLQuantizationType.F16
+                        data = gguf.quants.quantize(data, data_qtype)
 
                 shape = gguf.quant_shape_from_byte_shape(data.shape, data_qtype) if data.dtype == np.uint8 else data.shape
 
@@ -984,7 +1027,11 @@ class ModelBase:
                 # n_dims is implicit in the shape
                 logger.info(f"{f'%-{max_name_len}s' % f'{new_name},'} {old_dtype} --> {data_qtype.name}, shape = {shape_str}")
 
-                self.gguf_writer.add_tensor(new_name, data, raw_dtype=data_qtype)
+                if escha_native:
+                    # the numpy dtypes are already correct - let the writer infer
+                    self.gguf_writer.add_tensor(new_name, data)
+                else:
+                    self.gguf_writer.add_tensor(new_name, data, raw_dtype=data_qtype)
 
     def set_type(self):
         self.gguf_writer.add_type(gguf.GGUFType.MODEL)
@@ -1478,6 +1525,9 @@ class TextModel(ModelBase):
             res = "qwen2"
         if chkhsh == "1444df51289cfa8063b96f0e62b1125440111bc79a52003ea14b6eac7016fd5f":
             # ref: https://huggingface.co/openbmb/MiniCPM-V-4_6
+            res = "qwen35"
+        if chkhsh == "c79d8d547f6693b69014b35d216033f532a989dc769f069c1420082172727243":
+            # ref: Qwen3.8-27B Cold-Fusion-GAIN (Mistral-Small-3.1 tokenizer regex)
             res = "qwen35"
         if chkhsh == "66b8d4e19ab16c3bfd89bce5d785fb7e0155e8648708a1f42077cb9fe002c273":
             # ref: https://huggingface.co/alvarobartt/grok-2-tokenizer
@@ -2527,6 +2577,7 @@ class LazyTorchTensor(gguf.LazyBase):
     _dtype_map: dict[torch.dtype, type] = {
         torch.float16: np.float16,
         torch.float32: np.float32,
+        torch.int8: np.int8,
         torch.uint8: np.uint8,
         torch.int64: np.int64,
     }

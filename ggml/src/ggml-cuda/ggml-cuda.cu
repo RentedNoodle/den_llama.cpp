@@ -30,6 +30,7 @@
 #include "ggml-cuda/fattn-kvarn-dispatch.cuh"
 #include "ggml-cuda/fwht.cuh"
 #include "ggml-cuda/getrows.cuh"
+#include "ggml-cuda/scaled-i8.cuh"
 #include "ggml-cuda/im2col.cuh"
 #include "ggml-cuda/kvarn-wht.cuh"
 #include "ggml-cuda/kvarn.cuh"
@@ -52,6 +53,7 @@
 #include "ggml-cuda/softmax.cuh"
 #include "ggml-cuda/ssm-conv.cuh"
 #include "ggml-cuda/ssm-scan.cuh"
+#include "ggml-cuda/escha-linear.cuh"
 #include "ggml-cuda/sum.cuh"
 #include "ggml-cuda/sumrows.cuh"
 #include "ggml-cuda/top-k.cuh"
@@ -2111,6 +2113,9 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
         case GGML_OP_GET_ROWS:
             ggml_cuda_op_get_rows(ctx, dst);
             break;
+        case GGML_OP_GET_ROWS_SCALED_I8:
+            ggml_cuda_op_get_rows_scaled_i8(ctx, dst);
+            break;
         case GGML_OP_GET_ROWS_BACK:
             ggml_cuda_op_get_rows_back(ctx, dst);
             break;
@@ -2144,6 +2149,10 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
                             }
                             if (!is_k) {
                                 den_nvfp4_kv_set_seq_len(&g_nvfp4_kv, layer, base_seq + n_tokens);
+                                if (layer == 0) {
+                                    fprintf(stderr, "DEN_KV_DEBUG storeV layer=%d base=%d n=%d seq=%d\n", layer, base_seq, n_tokens, base_seq + n_tokens);
+                                    fflush(stderr);
+                                }
                             }
                         }
                     }
@@ -2319,6 +2328,9 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
         case GGML_OP_MUL_MAT:
             ggml_cuda_mul_mat(ctx, dst->src[0], dst->src[1], dst);
             break;
+        case GGML_OP_MUL_MAT_SCALED_I8:
+            ggml_cuda_op_mul_mat_scaled_i8(ctx, dst);
+            break;
         case GGML_OP_MUL_MAT_ID:
             ggml_cuda_mul_mat_id(ctx, dst);
             break;
@@ -2436,6 +2448,13 @@ static bool ggml_cuda_compute_forward(ggml_backend_cuda_context & ctx, struct gg
         case GGML_OP_GATED_LINEAR_ATTN:
             ggml_cuda_op_gated_linear_attn(ctx, dst);
             break;
+        case GGML_OP_ESCHA_MOE:
+            ggml_cuda_op_escha_moe(ctx, dst);
+            break;
+        case GGML_OP_ESCHA_LINEAR:
+            ggml_cuda_op_escha_linear(ctx, dst);
+            break;
+
         case GGML_OP_GATED_DELTA_NET:
             ggml_cuda_op_gated_delta_net(ctx, dst);
             break;
@@ -2676,6 +2695,13 @@ static bool ggml_cuda_graph_check_compability(ggml_cgraph * cgraph) {
             continue;
         }
 
+        // [TAG_ESCHA_CUDA_GRAPHS] the escha ops' host-backed ids input breaks
+        // capture replay (the captured arg pointers go stale) - keep them eager.
+        if (node->op == GGML_OP_ESCHA_MOE || node->op == GGML_OP_ESCHA_LINEAR) {
+            use_cuda_graph = false;
+            continue;
+        }
+
         // [TAG_MUL_MAT_ID_CUDA_GRAPHS]
         if (node->op == GGML_OP_MUL_MAT_ID) {
             const int cc = ggml_cuda_info().devices[ggml_cuda_get_device()].cc;
@@ -2698,7 +2724,27 @@ static bool ggml_cuda_graph_check_compability(ggml_cgraph * cgraph) {
 }
 
 static const void * ggml_cuda_graph_get_key(ggml_cgraph * cgraph) {
-    return cgraph->nodes[0];
+    // Content-based key: identical graphs must map to the same capture, even
+    // when the graph rebuilds fresh tensors each call (the escha nodes allocate
+    // per call, so node/cgraph addresses jitter). Hash the op sequence + shapes.
+    static thread_local std::unordered_map<uint64_t, void *> key_pool;
+    static thread_local uint64_t pool_counter = 1;
+    uint64_t h = 1469598103934665603ull; // FNV-1a
+    for (int i = 0; i < cgraph->n_nodes; i++) {
+        const ggml_tensor * t = cgraph->nodes[i];
+        h ^= (uint64_t)t->op;            h *= 1099511628211ull;
+        h ^= (uint64_t)t->type;          h *= 1099511628211ull;
+        h ^= (uint64_t)t->ne[0];         h *= 1099511628211ull;
+        h ^= (uint64_t)t->ne[1];         h *= 1099511628211ull;
+        h ^= (uint64_t)t->ne[2];         h *= 1099511628211ull;
+        h ^= (uint64_t)t->ne[3];         h *= 1099511628211ull;
+        h ^= (t->src[0] != nullptr) ? 1ull : 0ull;  h *= 1099511628211ull;
+    }
+    auto it = key_pool.find(h);
+    if (it == key_pool.end()) {
+        it = key_pool.emplace(h, (void *) pool_counter++).first;
+    }
+    return it->second;
 }
 
 static bool ggml_cuda_graph_update_required(ggml_backend_cuda_context * cuda_ctx, ggml_cgraph * cgraph) {
@@ -2734,7 +2780,30 @@ static bool ggml_cuda_graph_update_required(ggml_backend_cuda_context * cuda_ctx
             }
         }
 
-        if (res || memcmp(&graph->node_props[i], &prop, sizeof(prop)) != 0) {
+        // Compare ONLY the stable properties (shapes/strides/type/op). The full
+        // struct includes the src DATA POINTERS, which are freshly allocated per
+        // graph build - comparing them makes the props always "changed" and the
+        // warmup never completes (the recapture-on-every-eval killer).
+        bool props_same = !res;
+        if (!res) {
+            const auto & a = graph->node_props[i];
+            if (a.node.type != prop.node.type || a.node.op != prop.node.op) {
+                props_same = false;
+            } else {
+                if (memcmp(a.node.ne, prop.node.ne, sizeof(prop.node.ne)) != 0 ||
+                    memcmp(a.node.nb, prop.node.nb, sizeof(prop.node.nb)) != 0) {
+                    props_same = false;
+                } else {
+                    for (int j = 0; j < GGML_MAX_SRC && props_same; j++) {
+                        if (memcmp(a.node_src_ne[j], prop.node_src_ne[j], sizeof(prop.node_src_ne[j])) != 0 ||
+                            memcmp(a.node_src_nb[j], prop.node_src_nb[j], sizeof(prop.node_src_nb[j])) != 0) {
+                            props_same = false;
+                        }
+                    }
+                }
+            }
+        }
+        if (res || !props_same) {
             graph->node_props[i] = prop;
             res = true;
         }
@@ -4379,6 +4448,7 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
         const bool graph_compatible = ggml_cuda_graph_check_compability(cgraph);
         if (graph_compatible) {
             const bool properties_changed = ggml_cuda_graph_update_required(cuda_ctx, cgraph);
+            fflush(stderr);
 
             if (!graph->warmup_complete) {
                 // Warmup: need at least 2 calls with no property change on the 2nd call
@@ -4387,6 +4457,14 @@ static enum ggml_status ggml_backend_cuda_graph_compute(ggml_backend_t backend, 
                     GGML_LOG_DEBUG("%s: CUDA graph warmup complete\n", __func__);
                     use_cuda_graph = true;
                     cuda_graph_update_required = true;
+                } else {
+                    // Hybrid/mixed graphs (recurrent + full-attention) build
+                    // legitimately different structures per call and never
+                    // stabilize - degrade to eager compute instead of spinning.
+                    if (++graph->warmup_unstable_calls >= 4) {
+                        graph->disable_graph = true;
+                        GGML_LOG_INFO("%s: CUDA graph disabled for unstable hybrid graph (eager mode)\n", __func__);
+                    }
                 }
                 // else: properties changed or first call - execute directly (use_cuda_graph stays false)
             } else {
@@ -5100,6 +5178,10 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
             } break;
         case GGML_OP_OUT_PROD:
             return op->type == GGML_TYPE_F32 && op->src[0]->type == GGML_TYPE_F32 && op->src[1]->type == GGML_TYPE_F32;
+        case GGML_OP_MUL_MAT_SCALED_I8:
+            return op->type == GGML_TYPE_F32 && op->src[0]->type == GGML_TYPE_I8 && op->src[1]->type == GGML_TYPE_F32 &&
+                op->src[2]->type == GGML_TYPE_F16 && op->src[0]->ne[0] == op->src[1]->ne[0] && op->src[0]->ne[1] == op->src[2]->ne[0] &&
+                ggml_is_contiguous(op->src[0]) && ggml_is_contiguous(op->src[1]) && ggml_is_contiguous(op->src[2]);
         case GGML_OP_GET_ROWS:
             {
                 switch (op->src[0]->type) {
@@ -5141,6 +5223,10 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
             {
                 return op->type == GGML_TYPE_F32 && op->src[0]->type == GGML_TYPE_F32 && op->ne[2] == 1 && op->ne[3] == 1;
             } break;
+        case GGML_OP_GET_ROWS_SCALED_I8:
+            return op->type == GGML_TYPE_F32 && op->src[0]->type == GGML_TYPE_I8 && op->src[1]->type == GGML_TYPE_I32 &&
+                op->src[2]->type == GGML_TYPE_F16 && op->src[0]->ne[1] == op->src[2]->ne[0] &&
+                ggml_is_contiguous(op->src[0]) && ggml_is_contiguous(op->src[1]) && ggml_is_contiguous(op->src[2]);
         case GGML_OP_SET_ROWS:
             {
                 return (
@@ -5398,6 +5484,15 @@ static bool ggml_backend_cuda_device_supports_op(ggml_backend_dev_t dev, const g
         case GGML_OP_GATED_LINEAR_ATTN:
         case GGML_OP_RWKV_WKV7:
             return true;
+        case GGML_OP_ESCHA_MOE:
+            return true;
+        case GGML_OP_ESCHA_LINEAR:
+            return op->type == GGML_TYPE_F32 && op->src[0]->type == GGML_TYPE_I16 &&
+                op->src[1]->type == GGML_TYPE_F16 && op->src[2]->type == GGML_TYPE_F16 &&
+                op->src[3]->type == GGML_TYPE_F32 && op->src[4]->type == GGML_TYPE_F32 &&
+                (op->src[5]->type == GGML_TYPE_I16 || op->src[5]->type == GGML_TYPE_I32) &&
+                op->src[6]->type == GGML_TYPE_F32;
+
         case GGML_OP_GATED_DELTA_NET:
             //TODO: enable once MUSA compiler is solved https://github.com/ggml-org/llama.cpp/pull/19504#issuecomment-4018634327
 #ifdef GGML_USE_MUSA
@@ -5652,6 +5747,47 @@ static bool ggml_backend_cuda_kvarn_capabilities(
 #endif
 }
 
+// KVarN exact-tail support handshake. The CUDA KVarN store keeps the recent
+// `tail_tokens` cache positions at exact precision (F16/BF16/F32 tail views) and the
+// KVarN attention kernels consume the store's tail views directly (body F16 records
+// + exact tail segment), so both procs accept any exact tail type the store emits.
+static bool ggml_backend_cuda_kvarn_tail_attention_supported(
+        ggml_backend_dev_t dev,
+        ggml_type body_k,
+        ggml_type body_v,
+        ggml_type tail_k,
+        ggml_type tail_v,
+        int64_t d_k,
+        int64_t d_v) {
+    GGML_UNUSED(dev);
+    const bool body_ok = body_k == GGML_TYPE_F16 && body_v == GGML_TYPE_F16;
+    const bool tail_ok =
+        tail_k == GGML_TYPE_F16 || tail_k == GGML_TYPE_BF16 || tail_k == GGML_TYPE_F32;
+    const bool tail_v_ok =
+        tail_v == GGML_TYPE_F16 || tail_v == GGML_TYPE_BF16 || tail_v == GGML_TYPE_F32;
+    const bool dims_ok = d_k == d_v && (d_k == 128 || d_k == 256 || d_k == 512);
+    return body_ok && tail_ok && tail_v_ok && dims_ok;
+}
+
+static bool ggml_backend_cuda_kv_tail_segmented_attention_supported(
+        ggml_type body_k,
+        ggml_type body_v,
+        ggml_type tail_k,
+        ggml_type tail_v,
+        int64_t d_k,
+        int64_t d_v) {
+    const auto row_convertible = [](ggml_type type) {
+        return type == GGML_TYPE_F32 || ggml_get_type_traits(type)->to_float != nullptr;
+    };
+    const bool body_ok = row_convertible(body_k) && row_convertible(body_v);
+    const bool tail_ok =
+        tail_k == GGML_TYPE_F16 || tail_k == GGML_TYPE_BF16 || tail_k == GGML_TYPE_F32;
+    const bool tail_v_ok =
+        tail_v == GGML_TYPE_F16 || tail_v == GGML_TYPE_BF16 || tail_v == GGML_TYPE_F32;
+    const bool dims_ok = d_k == d_v && (d_k == 128 || d_k == 256 || d_k == 512);
+    return body_ok && tail_ok && tail_v_ok && dims_ok;
+}
+
 static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, const char * name) {
     GGML_UNUSED(reg);
     if (strcmp(name, "ggml_backend_comm_init") == 0) {
@@ -5674,6 +5810,12 @@ static void * ggml_backend_cuda_reg_get_proc_address(ggml_backend_reg_t reg, con
     }
     if (strcmp(name, "ggml_backend_kvarn_capabilities") == 0) {
         return (void *)ggml_backend_cuda_kvarn_capabilities;
+    }
+    if (strcmp(name, "ggml_backend_kvarn_tail_attention_supported") == 0) {
+        return (void *)ggml_backend_cuda_kvarn_tail_attention_supported;
+    }
+    if (strcmp(name, "ggml_backend_kv_tail_segmented_attention_supported") == 0) {
+        return (void *)ggml_backend_cuda_kv_tail_segmented_attention_supported;
     }
     if (strcmp(name, "ggml_backend_kvarn_route_stats_reset") == 0) {
         return (void *)ggml_cuda_fattn_kvarn_route_stats_reset;

@@ -2167,6 +2167,11 @@ static void llama_null_log_callback(enum ggml_log_level level, const char * text
     (void) user_data;
 }
 
+static bool den_bench_log_enabled() {
+    const char * env = std::getenv("DEN_BENCH_LOG");
+    return env != nullptr && env[0] != '\0' && std::strcmp(env, "0") != 0;
+}
+
 static std::unique_ptr<printer> create_printer(output_formats format) {
     switch (format) {
         case NONE:
@@ -2220,7 +2225,7 @@ int llama_bench(int argc, char ** argv) {
     auto * ggml_threadpool_free_fn = (decltype(ggml_threadpool_free) *) ggml_backend_reg_get_proc_address(cpu_reg, "ggml_threadpool_free");
 
     // initialize llama.cpp
-    if (!params.verbose) {
+    if (!params.verbose && !den_bench_log_enabled()) {
         llama_log_set(llama_null_log_callback, NULL);
     }
     llama_backend_init();

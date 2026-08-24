@@ -613,7 +613,13 @@ extern "C" {
 
         GGML_OP_GLU,
 
-        GGML_OP_COUNT,
+        GGML_OP_ESCHA_MOE,
+        GGML_OP_ESCHA_LINEAR,
+
+        // Row-wise signed-I8 weights with one F16 scale per row.
+        GGML_OP_GET_ROWS_SCALED_I8,
+        GGML_OP_MUL_MAT_SCALED_I8,
+    GGML_OP_COUNT,
     };
 
     enum ggml_unary_op {
@@ -1448,10 +1454,48 @@ extern "C" {
     // A: k columns, n rows => [ne03, ne02, n, k]
     // B: k columns, m rows  (i.e. we transpose it internally) => [ne03 * x, ne02 * y, m, k]
     // result is n columns, m rows => [ne03 * x, ne02 * y, m, n]
+    GGML_API struct ggml_tensor * ggml_escha_moe(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * code,
+            struct ggml_tensor  * rin,
+            struct ggml_tensor  * rout,
+            struct ggml_tensor  * lut,
+            struct ggml_tensor  * dep,
+            struct ggml_tensor  * x,
+            struct ggml_tensor  * ids);
+
+
+    GGML_API struct ggml_tensor * ggml_escha_linear(
+            struct ggml_context * ctx,
+            struct ggml_tensor * code,
+            struct ggml_tensor * rin,
+            struct ggml_tensor * rout,
+            struct ggml_tensor * s_in,
+            struct ggml_tensor * s_out,
+            struct ggml_tensor * dep,
+            struct ggml_tensor * x);
+
+    // Dense Qwen3.8 W2 only. Same math as ggml_escha_linear, with an explicit
+    // op capability marker so CUDA may select its tuned reduction policy.
+    GGML_API struct ggml_tensor * ggml_escha_linear_qwen38_w2(
+            struct ggml_context * ctx,
+            struct ggml_tensor * code,
+            struct ggml_tensor * rin,
+            struct ggml_tensor * rout,
+            struct ggml_tensor * s_in,
+            struct ggml_tensor * s_out,
+            struct ggml_tensor * dep,
+            struct ggml_tensor * x);
     GGML_API struct ggml_tensor * ggml_mul_mat(
             struct ggml_context * ctx,
             struct ggml_tensor  * a,
             struct ggml_tensor  * b);
+
+    GGML_API struct ggml_tensor * ggml_mul_mat_scaled_i8(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * weights_i8,
+            struct ggml_tensor  * activations_f32,
+            struct ggml_tensor  * row_scales_f16);
 
     // change the precision of a matrix multiplication
     // set to GGML_PREC_F32 for higher precision (useful for phi-2)
@@ -1695,6 +1739,12 @@ extern "C" {
             struct ggml_context * ctx,
             struct ggml_tensor  * a,  // data
             struct ggml_tensor  * b); // row indices
+
+    GGML_API struct ggml_tensor * ggml_get_rows_scaled_i8(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * values_i8,
+            struct ggml_tensor  * rows_i32,
+            struct ggml_tensor  * row_scales_f16);
 
     GGML_API struct ggml_tensor * ggml_get_rows_back(
             struct ggml_context * ctx,

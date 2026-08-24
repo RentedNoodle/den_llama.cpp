@@ -1837,6 +1837,10 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
             {
                 ggml_compute_forward_mul_mat(params, tensor);
             } break;
+        case GGML_OP_MUL_MAT_SCALED_I8:
+            {
+                ggml_compute_forward_mul_mat_scaled_i8(params, tensor);
+            } break;
         case GGML_OP_MUL_MAT_ID:
             {
                 ggml_compute_forward_mul_mat_id(params, tensor);
@@ -1864,6 +1868,10 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
         case GGML_OP_GET_ROWS:
             {
                 ggml_compute_forward_get_rows(params, tensor);
+            } break;
+        case GGML_OP_GET_ROWS_SCALED_I8:
+            {
+                ggml_compute_forward_get_rows_scaled_i8(params, tensor);
             } break;
         case GGML_OP_GET_ROWS_BACK:
             {
@@ -2060,6 +2068,15 @@ static void ggml_compute_forward(struct ggml_compute_params * params, struct ggm
             {
                 ggml_compute_forward_gated_delta_net(params, tensor);
             } break;
+        case GGML_OP_ESCHA_MOE:
+            {
+                ggml_compute_forward_escha_moe(params, tensor);
+            } break;
+        case GGML_OP_ESCHA_LINEAR:
+            {
+                ggml_compute_forward_escha_linear(params, tensor);
+            } break;
+
         case GGML_OP_LIGHTNING_INDEXER:
             {
                 ggml_compute_forward_lightning_indexer(params, tensor);
@@ -2354,11 +2371,13 @@ static int ggml_get_n_tasks(struct ggml_tensor * node, int n_threads) {
         case GGML_OP_MUL_MAT:
         case GGML_OP_MUL_MAT_ID:
         case GGML_OP_OUT_PROD:
+        case GGML_OP_MUL_MAT_SCALED_I8:
             {
                 n_tasks = n_threads;
             } break;
         case GGML_OP_GET_ROWS:
         case GGML_OP_SET_ROWS:
+        case GGML_OP_GET_ROWS_SCALED_I8:
             {
                 // FIXME: get_rows can use additional threads, but the cost of launching additional threads
                 // decreases performance with GPU offloading
@@ -2495,6 +2514,11 @@ static int ggml_get_n_tasks(struct ggml_tensor * node, int n_threads) {
             {
                 GGML_ABORT("fatal error");
             }
+        case GGML_OP_ESCHA_LINEAR:
+        case GGML_OP_ESCHA_MOE:
+            {
+                n_tasks = 1;
+            } break;
         default:
             {
                 fprintf(stderr, "%s: op not implemented: ", __func__);
@@ -3023,6 +3047,19 @@ struct ggml_cplan ggml_graph_plan(
                 case GGML_OP_KVARN_MATERIALIZE:
                     {
                         cur = 0;
+                    } break;
+                case GGML_OP_ESCHA_MOE:
+                    {
+                        // rotated input, accumulator, and one decoded 16x16 tile
+                        const int64_t IC = node->src[0]->ne[2]*16;
+                        const int64_t OC = node->src[0]->ne[1]*16;
+                        cur = (IC + OC + 256) * sizeof(float) * n_tasks;
+                    } break;
+                case GGML_OP_ESCHA_LINEAR:
+                    {
+                        const int64_t IC = node->src[0]->ne[2]*16;
+                        const int64_t OC = node->src[0]->ne[1]*16;
+                        cur = (IC + OC + 256) * sizeof(float) * n_tasks;
                     } break;
                 case GGML_OP_COUNT:
                     {

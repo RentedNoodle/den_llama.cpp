@@ -1393,6 +1393,83 @@ void llama_grammar_apply_impl(const struct llama_grammar & grammar, llama_token_
     }
 }
 
+// A1.2/A2.1: dense allowed-token mask over the FULL vocabulary from the
+// grammar's current state (1 = allowed). The backend (GPU) sampling path
+// consumes this mask so structured output can run with -bs instead of the
+// host-sampler round-trip. n_vocab bytes; the caller owns the buffer.
+// A2.1 mask cache key: the grammar state (stacks + partial-utf8). Identical
+// states produce identical masks — JSON whitespace and digit runs hit this.
+static size_t llama_grammar_mask_fingerprint(const struct llama_grammar & grammar) {
+    size_t h = 1469598103934665603ULL;
+    const auto mix = [&](size_t v) {
+        h ^= v;
+        h *= 1099511628211ULL;
+    };
+    mix((size_t) grammar.partial_utf8.value);
+    mix((size_t) (grammar.partial_utf8.n_remain + 2));
+    for (const auto & stack : grammar.stacks) {
+        for (const auto * el : stack) {
+            mix((size_t) el);
+        }
+    }
+    return h;
+}
+
+void llama_grammar_allowed_mask_impl(
+        const struct llama_grammar & grammar,
+              llama_token   n_vocab,
+                    uint8_t * mask) {
+    GGML_ASSERT(grammar.vocab != nullptr);
+
+    // state fingerprint: repeated states reuse the cached mask (no decode/reject)
+    const size_t fp = llama_grammar_mask_fingerprint(grammar);
+    if (grammar.mask_fingerprint == fp && grammar.cached_mask.size() == (size_t) n_vocab) {
+        std::memcpy(mask, grammar.cached_mask.data(), (size_t) n_vocab);
+        return;
+    }
+
+    std::memset(mask, 0, (size_t) n_vocab);
+
+    if (!grammar.awaiting_trigger) {
+        bool allow_eog = false;
+        for (const auto & stack : grammar.stacks) {
+            if (stack.empty()) {
+                allow_eog = true;
+                break;
+            }
+        }
+
+        std::vector<llama_grammar_candidate> candidates;
+        candidates.reserve((size_t) n_vocab);
+        for (llama_token id = 0; id < n_vocab; ++id) {
+            const std::string & piece = grammar.vocab->token_to_piece(id);
+            if (grammar.vocab->is_eog(id)) {
+                if (allow_eog) {
+                    mask[id] = 1;
+                }
+                continue;
+            }
+            if (piece.empty() || piece[0] == 0) {
+                continue;
+            }
+            const auto decoded = decode_utf8(piece, grammar.partial_utf8);
+            candidates.push_back({ (size_t) id, decoded.first.data(), decoded.second, id });
+        }
+
+        // decodable candidates are allowed unless the grammar rejects them
+        for (const auto & c : candidates) {
+            mask[c.index] = 1;
+        }
+        const auto rejects = llama_grammar_reject_candidates(grammar.rules, grammar.stacks, candidates);
+        for (const auto & reject : rejects) {
+            mask[reject.index] = 0;
+        }
+    }
+
+    grammar.mask_fingerprint = fp;
+    grammar.cached_mask.assign(mask, mask + n_vocab);
+}
+
 void llama_grammar_accept_impl(struct llama_grammar & grammar, llama_token token) {
     GGML_ASSERT(grammar.vocab != nullptr);
 

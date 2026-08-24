@@ -2343,6 +2343,9 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                             /* n_rs_seq          */ cparams.n_rs_seq,
                             /* offload           */ cparams.offload_kqv,
                             /* unified           */ cparams.kv_unified,
+                            /* kvarn             */ params.kvarn,
+                            /* n_batch           */ cparams.n_batch,
+                            /* n_ubatch          */ cparams.n_ubatch,
                             /* filter_attn       */ std::move(filter_attn),
                             /* filter_recr       */ std::move(filter_recr));
                     }
@@ -2482,6 +2485,7 @@ ggml_cgraph * llama_model::build_graph(const llm_graph_params & params) const {
 
     // add backend sampling layers (if any)
     llm->build_sampling();
+    llm->build_post_sampling();
 
     // if the gguf model was converted with --sentence-transformers-dense-modules
     // there will be two additional dense projection layers
@@ -2945,6 +2949,7 @@ ggml_tensor * llama_model_base::create_tensor(const LLM_TN_IMPL & tn, const std:
     return create_tensor(*ml, tn, ne, flags);
 }
 
+
 void llama_model_base::create_tensor_gate_up_exps(llama_layer & layer, int bid, int64_t n_embd_, int64_t n_ff_, int64_t n_expert_, int flags) {
     layer.ffn_gate_up_exps = create_tensor(tn(LLM_TENSOR_FFN_GATE_UP_EXPS, "weight", bid), {n_embd_, n_ff_ * 2, n_expert_}, TENSOR_NOT_REQUIRED);
     if (layer.ffn_gate_up_exps == nullptr) {
@@ -2972,7 +2977,16 @@ void llama_model_base::create_tensor_qkv(llama_layer & layer, int bid,
         return;
     }
 
-    layer.wqkv = create_tensor(tn(LLM_TENSOR_ATTN_QKV, "weight", bid), {n_embd_, n_embd_qkv}, TENSOR_NOT_REQUIRED | TENSOR_SKIP_IF_VIRTUAL);
+    // A present ATTN_QKV with a mismatched shape (dual-hybrid qwen35 layers carry
+    // the linear-attn qkv on attention layers too) must fall back to the separate
+    // q/k/v instead of failing the load.
+    const ggml_tensor * qkv_meta = ml->get_tensor_meta(tn(LLM_TENSOR_ATTN_QKV, "weight", bid).str().c_str());
+    if (qkv_meta && (qkv_meta->ne[0] != n_embd_ || qkv_meta->ne[1] != n_embd_qkv)) {
+        qkv_meta = nullptr;
+    }
+    layer.wqkv = qkv_meta
+        ? create_tensor(tn(LLM_TENSOR_ATTN_QKV, "weight", bid), {n_embd_, n_embd_qkv}, TENSOR_NOT_REQUIRED | TENSOR_SKIP_IF_VIRTUAL)
+        : nullptr;
     if (layer.wqkv) {
         layer.wqkv_b = create_tensor(tn(LLM_TENSOR_ATTN_QKV, "bias", bid), {n_embd_qkv}, TENSOR_NOT_REQUIRED | TENSOR_SKIP_IF_VIRTUAL);
     } else {

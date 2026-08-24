@@ -344,7 +344,12 @@ static bool negotiate_hello(const std::shared_ptr<socket_t> & sock) {
     bool status = send_rpc_cmd(sock, RPC_CMD_HELLO, &request, sizeof(request), &response, sizeof(response));
     RPC_STATUS_ASSERT(status);
 
-    if (response.major != RPC_PROTO_MAJOR_VERSION || response.minor > RPC_PROTO_MINOR_VERSION) {
+    // The op enum is serialized in graph commands.  A patch mismatch is not
+    // wire-compatible once GGML_OP_COUNT changes, so reject old/new peers
+    // instead of silently treating them as compatible.
+    if (response.major != RPC_PROTO_MAJOR_VERSION ||
+        response.minor != RPC_PROTO_MINOR_VERSION ||
+        response.patch != RPC_PROTO_PATCH_VERSION) {
         GGML_LOG_ERROR("RPC server version mismatch: %d.%d.%d\n",
                        response.major, response.minor, response.patch);
         return false;

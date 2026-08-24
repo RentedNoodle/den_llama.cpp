@@ -1,6 +1,7 @@
 #include "llama-memory-hybrid.h"
 
 #include "llama-impl.h"
+#include "llama-kv-cache-kvarn.h"
 #include "llama-model.h"
 #include "llama-context.h"
 
@@ -27,30 +28,53 @@ llama_memory_hybrid::llama_memory_hybrid(
                  uint32_t   n_rs_seq,
                      bool   offload,
                      bool   unified,
+         llama_kvarn_params   kvarn,
+                 uint32_t   n_batch,
+                 uint32_t   n_ubatch,
                             /* layer filters */
     const layer_filter_cb & filter_attn,
     const layer_filter_cb & filter_recr) :
     hparams(model.hparams),
-    mem_attn(new llama_kv_cache(
-        model,
-        model.hparams,
-        type_k,
-        type_v,
-        v_trans,
-        offload,
-        unified,
-        kv_size,
-        n_seq_max,
-        n_pad,
-        n_swa,
-        swa_type,
-        nullptr,
-        filter_attn == nullptr ?
-            [&](int32_t il) { return !hparams.is_recr(il); }
-            : filter_attn,
-        nullptr,
-        nullptr
-    )),
+    kvarn_enabled(kvarn.type != LLAMA_KVARN_TYPE_DISABLED),
+    mem_attn(kvarn_enabled
+        ? (llama_memory_i *) new llama_kv_cache_kvarn(
+            model,
+            model.hparams,
+            kvarn,
+            offload,
+            unified,
+            kv_size,
+            n_seq_max,
+            n_batch,
+            n_ubatch,
+            n_pad,
+            n_swa,
+            swa_type,
+            filter_attn == nullptr ?
+                [&](int32_t il) { return !hparams.is_recr(il); }
+                : filter_attn,
+            nullptr,
+            0)
+        : (llama_memory_i *) new llama_kv_cache(
+            model,
+            model.hparams,
+            type_k,
+            type_v,
+            v_trans,
+            offload,
+            unified,
+            kv_size,
+            n_seq_max,
+            n_pad,
+            n_swa,
+            swa_type,
+            nullptr,
+            filter_attn == nullptr ?
+                [&](int32_t il) { return !hparams.is_recr(il); }
+                : filter_attn,
+            nullptr,
+            nullptr
+        )),
     mem_recr(new llama_memory_recurrent(
         model,
         type_r,
@@ -79,7 +103,7 @@ llama_memory_context_ptr llama_memory_hybrid::init_batch(llama_batch_allocr & ba
                 ubatch = balloc.split_seq(n_ubatch);
             } else {
                 // Use non-sequential split when KV cache is unified (needed for hellaswag/winogrande/multiple-choice)
-                const bool unified = (mem_attn->get_n_stream() == 1);
+                const bool unified = (mem_attn->get_kv_n_stream() == 1);
 
                 // [TAG_RECURRENT_ROLLBACK_SPLITS]
                 // the trailing (1 + n_rs_seq) tokens of each seq must stay in the same ubatch
@@ -108,8 +132,13 @@ llama_memory_context_ptr llama_memory_hybrid::init_batch(llama_batch_allocr & ba
             return std::make_unique<llama_memory_hybrid_context>(LLAMA_MEMORY_STATUS_FAILED_PREPARE);
         }
 
+        if (uses_kvarn()) {
+            // KVarN prepares its slots internally and returns the kvarn context.
+            return std::make_unique<llama_memory_hybrid_context>(this, std::move(ubatches));
+        }
+
         // prepare the attention cache
-        auto heads_attn = mem_attn->prepare(ubatches);
+        auto heads_attn = static_cast<llama_kv_cache *>(mem_attn.get())->prepare(ubatches);
         if (heads_attn.empty()) {
             LLAMA_LOG_ERROR("%s: failed to prepare attention ubatches\n", __func__);
             return std::make_unique<llama_memory_hybrid_context>(LLAMA_MEMORY_STATUS_FAILED_PREPARE);
@@ -201,7 +230,7 @@ void llama_memory_hybrid::state_read(llama_io_read_i & io, llama_seq_id seq_id, 
     mem_recr->state_read(io, seq_id, flags);
 }
 
-llama_kv_cache * llama_memory_hybrid::get_mem_attn() const {
+llama_memory_i * llama_memory_hybrid::get_mem_attn() const {
     return mem_attn.get();
 }
 
@@ -232,7 +261,18 @@ llama_memory_hybrid_context::llama_memory_hybrid_context(
         std::vector<llama_ubatch>   ubatches) :
     ubatches(std::move(ubatches)),
     // note: here we copy the ubatches. not sure if this is ideal
-    ctx_attn(new llama_kv_cache_context(mem->get_mem_attn(), std::move(sinfos_attn), this->ubatches)),
+    ctx_attn(new llama_kv_cache_context(static_cast<llama_kv_cache *>(mem->get_mem_attn()),
+                                        std::move(sinfos_attn), this->ubatches)),
+    ctx_recr(new llama_memory_recurrent_context(mem->get_mem_recr(), this->ubatches)),
+    status(llama_memory_status_combine(ctx_attn->get_status(), ctx_recr->get_status())) {
+}
+
+llama_memory_hybrid_context::llama_memory_hybrid_context(
+              llama_memory_hybrid * mem,
+        std::vector<llama_ubatch>   ubatches) :
+    ubatches(std::move(ubatches)),
+    // KVarN prepares its own slots and exposes the native store views for attention.
+    ctx_attn(mem->get_mem_attn()->init_kv_batch(this->ubatches)),
     ctx_recr(new llama_memory_recurrent_context(mem->get_mem_recr(), this->ubatches)),
     status(llama_memory_status_combine(ctx_attn->get_status(), ctx_recr->get_status())) {
 }
@@ -272,6 +312,11 @@ const llama_ubatch & llama_memory_hybrid_context::get_ubatch() const {
 
 const llama_kv_cache_context * llama_memory_hybrid_context::get_attn() const {
     return static_cast<const llama_kv_cache_context *>(ctx_attn.get());
+}
+
+uint32_t llama_memory_hybrid_context::get_kv_n_stream() const {
+    const auto * attn = get_attn();
+    return attn ? attn->get_kv_n_stream() : 0;
 }
 
 const llama_memory_recurrent_context * llama_memory_hybrid_context::get_recr() const {

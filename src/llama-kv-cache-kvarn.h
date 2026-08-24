@@ -100,6 +100,7 @@ public:
 
     uint32_t get_n_kv() const override;
     llama_kv_cache * get_kv() const override;
+    uint32_t get_kv_n_stream() const override;
     const llama_kv_cache::slot_info & current_sinfo() const override;
 
     ggml_type type_k() const override;

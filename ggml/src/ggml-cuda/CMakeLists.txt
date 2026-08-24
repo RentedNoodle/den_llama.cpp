@@ -105,6 +105,9 @@ if (CUDAToolkit_FOUND)
     file(GLOB   GGML_SOURCES_CUDA "*.cu")
     if (GGML_CUDA_KVARN)
         add_compile_definitions(GGML_CUDA_KVARN)
+        # Cluster-cooperative kvarn decode (DEN_KVARN_CLUSTER=1 at runtime).
+        # Requires the cluster PTX ISA (rank/barrier/mapa) — verified on CUDA 13.3.
+        add_compile_definitions(GGML_CUDA_KVARN_CLUSTER)
     else()
         list(FILTER GGML_SOURCES_CUDA EXCLUDE REGEX "kvarn(-wht)?[.]cu$")
     endif()

@@ -242,6 +242,19 @@ struct llama_layer_switch_lora {
     struct ggml_tensor * b_down = nullptr;
 };
 
+
+struct llama_escha_proj {
+    struct ggml_tensor * code  = nullptr;  // [32, O/16, I/16] int16 (K=2)
+    struct ggml_tensor * rin   = nullptr;  // [I] f16
+    struct ggml_tensor * rout  = nullptr;  // [O] f16
+    struct ggml_tensor * s_in  = nullptr;  // [I] f32
+    struct ggml_tensor * s_out = nullptr;  // [O] f32
+    struct ggml_tensor * bias  = nullptr;  // [O] f16
+    // Only the dense Qwen3.8 W2 geometry has the dedicated decode fast path.
+    // Keep all other ESCHA_LINEAR callers on the generic dispatch.
+    bool qwen38_w2_fast_path = false;
+};
+
 struct llama_layer {
     // normalization
     struct ggml_tensor * attn_norm       = nullptr;
@@ -358,6 +371,11 @@ struct llama_layer {
     struct ggml_tensor * ffn_act    = nullptr;
     struct ggml_tensor * ffn_exp_probs_b = nullptr;
     struct ggml_tensor * ffn_gate_tid2eid = nullptr;
+
+    struct ggml_tensor * dflash_attn_conv_base = nullptr;
+    struct ggml_tensor * dflash_attn_conv_proj = nullptr;
+    struct ggml_tensor * dflash_ffn_conv_base  = nullptr;
+    struct ggml_tensor * dflash_ffn_conv_proj  = nullptr;
 
     // mamba proj
     struct ggml_tensor * ssm_in  = nullptr;
@@ -555,6 +573,19 @@ struct llama_layer {
     struct llama_layer_nextn nextn;
 
     struct llama_layer_switch_lora switch_lora;
+
+    // Escha W2 (dense): official lane-decode dequant projections
+    struct llama_escha_proj escha_wqkv;      // linear_attn in_proj_qkv -> attn_qkv
+    struct llama_escha_proj escha_gate;      // linear_attn in_proj_z   -> attn_gate
+    struct llama_escha_proj escha_ffn_gate;
+    struct llama_escha_proj escha_ffn_up;
+    struct llama_escha_proj escha_ffn_down;
+    struct llama_escha_proj escha_ssm_out;   // linear_attn out_proj    -> ssm_out
+
+    struct llama_escha_proj escha_attn_q;      // full-attn q (separate)
+    struct llama_escha_proj escha_attn_k;
+    struct llama_escha_proj escha_attn_v;
+    struct llama_escha_proj escha_attn_out;
 };
 
 struct llama_device {
@@ -571,6 +602,9 @@ struct llama_meta_device_get_split_state_userdata {
 struct ggml_backend_meta_split_state llama_meta_device_get_split_state(const struct ggml_tensor * tensor, void * userdata);
 
 struct llama_model {
+    struct ggml_tensor * escha_lut  = nullptr;   // [65536] f16 cbA codebook
+    struct ggml_tensor * escha_dep  = nullptr;   // [16,256] i16 K=2 dependency
+    struct ggml_tensor * escha_dep3 = nullptr;   // [16,256] i16 K=3 dependency
     llm_type type = LLM_TYPE_UNKNOWN;
     llm_arch arch = LLM_ARCH_UNKNOWN;
 
@@ -583,6 +617,8 @@ struct llama_model {
     std::vector<std::string> classifier_labels;
 
     struct ggml_tensor * tok_embd   = nullptr;
+    // Optional row-wise-I8 embedding companion: one F16 scale per vocab row.
+    struct ggml_tensor * tok_embd_s = nullptr;
     struct ggml_tensor * type_embd  = nullptr;
     struct ggml_tensor * pos_embd   = nullptr;
     struct ggml_tensor * tok_norm   = nullptr;
@@ -628,6 +664,11 @@ struct llama_model {
     // eagle3 / dflash feature fusion layer
     struct ggml_tensor * fc   = nullptr;
     struct ggml_tensor * fc_s = nullptr;
+
+    // dflash2 candidate selector
+    struct ggml_tensor * dflash_selector_prev   = nullptr;
+    struct ggml_tensor * dflash_selector_next   = nullptr;
+    struct ggml_tensor * dflash_selector_hidden = nullptr;
     struct ggml_tensor * d2t = nullptr;  // draft to target vocabulary mapping
 
     // dspark

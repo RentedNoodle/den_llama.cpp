@@ -66,7 +66,8 @@ int main(int argc, char ** argv) {
     llama_context * ctx_dft = params.speculative.draft.ctx_dft;
 
     // check if the context supports partial sequence removal
-    const bool use_ckpt_tgt = common_context_can_seq_rm(ctx_tgt) == COMMON_CONTEXT_SEQ_RM_TYPE_FULL;
+    const auto ctx_tgt_seq_rm_type = common_context_can_seq_rm(ctx_tgt);
+    const bool use_ckpt_tgt = ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_FULL;
     const bool use_ckpt_dft = common_context_can_seq_rm(ctx_dft) == COMMON_CONTEXT_SEQ_RM_TYPE_FULL;
 
     if (use_ckpt_tgt) {
@@ -152,6 +153,7 @@ int main(int argc, char ** argv) {
     llama_batch batch_tgt = llama_batch_init(llama_n_batch(ctx_tgt), 0, 1);
 
     llama_tokens draft;
+    std::vector<common_speculative_token_dist> dists;
 
     common_prompt_checkpoint ckpt;
 
@@ -192,6 +194,9 @@ int main(int argc, char ** argv) {
                 /* .id_last    = */ id_last,
                 /* .prompt     = */ &prompt_tgt,
                 /* .result     = */ &draft, // output
+                /* .dists      = */ &dists,
+                /* .temperature = */ params.sampling.temp,
+                /* .seed       = */ common_sampler_get_seed(smpl.get()),
             };
             common_speculative_draft(spec);
 

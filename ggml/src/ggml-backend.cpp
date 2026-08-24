@@ -481,9 +481,13 @@ void ggml_backend_tensor_copy(const struct ggml_tensor * src, struct ggml_tensor
         return;
     }
 
-    if (ggml_backend_buffer_is_host(src->buffer)) {
+    // a NULL buffer means the tensor is a graph input backed by host data
+    // (e.g. the escha ids) - treat it as host for the copy
+    const bool src_host = src->buffer == NULL || ggml_backend_buffer_is_host(src->buffer);
+    const bool dst_host = dst->buffer == NULL || ggml_backend_buffer_is_host(dst->buffer);
+    if (src_host) {
         ggml_backend_tensor_set(dst, src->data, 0, ggml_nbytes(src));
-    } else if (ggml_backend_buffer_is_host(dst->buffer)) {
+    } else if (dst_host) {
         ggml_backend_tensor_get(src, dst->data, 0, ggml_nbytes(src));
     } else if (!ggml_backend_buffer_copy_tensor(src, dst)) {
 #ifndef NDEBUG

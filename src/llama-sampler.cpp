@@ -2664,6 +2664,13 @@ struct llama_sampler_grammar {
     std::string grammar_root;
 
     struct llama_grammar * grammar;
+
+    // backend (GPU) sampling: the full-vocab allowed-token mask + the -INF
+    // constant, filled per position by backend_set_input and applied to the
+    // logits by backend_apply (structured output with -bs).
+    std::vector<uint8_t> mask;
+    struct ggml_tensor * mask_tensor = nullptr;
+    struct ggml_tensor * neg_inf_tensor = nullptr;
 };
 
 static const char * llama_sampler_grammar_name(const struct llama_sampler * /*smpl*/) {
@@ -2748,6 +2755,65 @@ static void llama_sampler_grammar_free(struct llama_sampler * smpl) {
     delete ctx;
 }
 
+// A2.1: the grammar as a backend (GPU) sampler — the allowed-token mask applied
+// to the full logits before the top-k, so structured output runs with -bs
+// instead of the host-sampler round-trip.
+static bool llama_sampler_grammar_backend_init(
+        struct llama_sampler       * smpl,
+        ggml_backend_buffer_type_t   buft,
+        uint32_t                     n_outputs_max_per_seq) {
+    GGML_UNUSED(n_outputs_max_per_seq);
+    const bool res = llama_sampler_backend_support(smpl, buft);
+    fprintf(stderr, "DEN_GRAMMAR_BACKEND_INIT res=%d\n", (int) res);
+    return res;
+}
+
+static void llama_sampler_grammar_backend_apply(
+        struct llama_sampler      * smpl,
+        struct ggml_context       * ctx,
+        struct ggml_cgraph        * gf,
+        struct llama_sampler_data * data) {
+    auto * sctx = (llama_sampler_grammar *) smpl->ctx;
+    if (!sctx->grammar) {
+        return;
+    }
+
+    struct ggml_tensor * logits = ggml_reshape_1d(ctx, data->logits, ggml_nelements(data->logits));
+    const int64_t n_vocab = logits->ne[0];
+
+    if (sctx->mask_tensor == nullptr || sctx->mask_tensor->ne[0] != n_vocab) {
+        sctx->mask_tensor = ggml_new_tensor_1d(ctx, GGML_TYPE_F32, n_vocab);
+        ggml_set_input(sctx->mask_tensor);
+        ggml_set_name(sctx->mask_tensor, "grammar_mask");
+    }
+
+    // mask = 0 for allowed tokens, -INF for disallowed; logits += mask
+    data->logits = ggml_add(ctx, logits, sctx->mask_tensor);
+    ggml_set_name(data->logits, "grammar_masked_logits");
+
+    GGML_UNUSED(gf);
+}
+
+static void llama_sampler_grammar_backend_set_input(struct llama_sampler * smpl) {
+    auto * sctx = (llama_sampler_grammar *) smpl->ctx;
+    if (!sctx->grammar || sctx->mask_tensor == nullptr) {
+        return;
+    }
+
+    const int64_t n_vocab = sctx->mask_tensor->ne[0];
+    sctx->mask.resize(n_vocab);
+    const auto t0 = std::chrono::high_resolution_clock::now();
+    llama_grammar_allowed_mask_impl(*sctx->grammar, (llama_token) n_vocab, sctx->mask.data());
+    const auto t1 = std::chrono::high_resolution_clock::now();
+    fprintf(stderr, "DEN_GRAMMAR_MASK_MS %.2f\n",
+            std::chrono::duration<double, std::milli>(t1 - t0).count());
+
+    float * mask_dst = (float *) sctx->mask_tensor->data;
+    for (int64_t i = 0; i < n_vocab; ++i) {
+        mask_dst[i] = sctx->mask[i] ? 0.0f : -INFINITY;
+    }
+}
+
 static struct llama_sampler_i llama_sampler_grammar_i = {
     /* .name              = */ llama_sampler_grammar_name,
     /* .accept            = */ llama_sampler_grammar_accept_impl,
@@ -2755,10 +2821,10 @@ static struct llama_sampler_i llama_sampler_grammar_i = {
     /* .reset             = */ llama_sampler_grammar_reset,
     /* .clone             = */ llama_sampler_grammar_clone,
     /* .free              = */ llama_sampler_grammar_free,
-    /* .backend_init      = */ nullptr,
+    /* .backend_init      = */ llama_sampler_grammar_backend_init,
     /* .backend_accept    = */ nullptr,
-    /* .backend_apply     = */ nullptr,
-    /* .backend_set_input = */ nullptr,
+    /* .backend_apply     = */ llama_sampler_grammar_backend_apply,
+    /* .backend_set_input = */ llama_sampler_grammar_backend_set_input,
     /* .backend_reset     = */ nullptr,
     /* .copy_state        = */ nullptr,
 };

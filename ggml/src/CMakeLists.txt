@@ -237,6 +237,9 @@ endif()
 if (GGML_OPENMP_ENABLED)
     target_compile_definitions(ggml-base PRIVATE GGML_USE_OPENMP)
     target_link_libraries(ggml-base PRIVATE OpenMP::OpenMP_C OpenMP::OpenMP_CXX)
+    if (WIN32)
+        target_link_libraries(ggml-base PRIVATE dbghelp)
+    endif()
 endif()
 
 add_library(ggml

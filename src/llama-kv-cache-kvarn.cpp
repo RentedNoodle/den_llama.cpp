@@ -702,6 +702,14 @@ llama_kv_cache * llama_kv_cache_kvarn_context::get_kv() const {
     return cache->get_metadata_cache();
 }
 
+uint32_t llama_kv_cache_kvarn_context::get_kv_n_stream() const {
+    // The kvarn views expose only the current slot's stream range (the sinfo
+    // range), and the attention mask must match those views' ne[3] — not the
+    // store's total stream count.
+    const auto & s = current_sinfo();
+    return (s.s1 >= s.s0) ? (s.s1 - s.s0 + 1) : 1;
+}
+
 const llama_kv_cache::slot_info & llama_kv_cache_kvarn_context::current_sinfo() const {
     return base()->current_sinfo();
 }
@@ -1073,6 +1081,36 @@ void llama_kv_cache_kvarn_context::set_input_kvarn_rot(ggml_tensor * dst) const 
     memcpy(dst->data, data.data(), ggml_nbytes(dst));
 }
 
+// Metadata mirror: cells/tails/route bookkeeping only. The F16 K/V data is
+// never read in the kvarn path (records live on GPU); allocating it wastes
+// 21.5 KB/token of host memory and crosses a 2 GiB boundary at ~99.8k ctx,
+// stalling decode (measured 48 -> 31 t/s at the crossing, kvarn2 graphs-on).
+// Build the mirror with no_alloc so the tensors exist (shapes/cells work)
+// but the data buffers are 0-size.
+static std::unique_ptr<llama_kv_cache> make_kvarn_metadata_mirror(
+        const llama_model & model,
+        const llama_hparams & hparams,
+        bool unified,
+        uint32_t kv_size,
+        uint32_t n_seq_max,
+        uint32_t n_pad,
+        uint32_t n_swa,
+        llama_swa_type swa_type,
+        uint32_t n_ubatch,
+        uint32_t tail_tokens,
+        ggml_type tail_type_requested,
+        uint32_t tail_tokens_requested,
+        uint32_t tail_rollback_tokens) {
+    llama_hparams hp = hparams;
+    hp.no_alloc = true;
+    return std::make_unique<llama_kv_cache>(
+        model, hp, GGML_TYPE_F16, GGML_TYPE_F16, false, false, unified,
+        kv_size, n_seq_max, n_pad, n_swa, swa_type,
+        nullptr, [](int32_t) { return false; }, nullptr, nullptr,
+        n_ubatch, tail_tokens, tail_type_requested, tail_tokens_requested,
+        true, tail_rollback_tokens);
+}
+
 llama_kv_cache_kvarn::llama_kv_cache_kvarn(
         const llama_model & model,
         const llama_hparams & hparams,
@@ -1118,28 +1156,9 @@ llama_kv_cache_kvarn::llama_kv_cache_kvarn(
     exact_tail_tokens_requested(tail_tokens_requested),
     exact_tail_type_requested(tail_type_requested),
     exact_tail_type(tail_type_requested),
-    metadata(std::make_unique<llama_kv_cache>(
-        model,
-        hparams,
-        GGML_TYPE_F16,
-        GGML_TYPE_F16,
-        false,
-        false,
-        unified,
-        kv_size,
-        n_seq_max,
-        n_pad,
-        n_swa,
-        swa_type,
-        nullptr,
-        [](int32_t) { return false; },
-        nullptr,
-        nullptr,
-        n_ubatch,
-        tail_tokens,
-        tail_type_requested,
-        tail_tokens_requested,
-            true,
+    metadata(make_kvarn_metadata_mirror(
+        model, hparams, unified, kv_size, n_seq_max, n_pad, n_swa, swa_type,
+        n_ubatch, tail_tokens, tail_type_requested, tail_tokens_requested,
         tail_rollback_tokens)) {
     GGML_ASSERT(n_stream > 0);
     GGML_ASSERT(swa || kv_size % KVAR_N_GROUP == 0);
@@ -1609,7 +1628,11 @@ llama_memory_context_ptr llama_kv_cache_kvarn::init_update(llama_context * lctx,
 }
 
 uint32_t llama_kv_cache_kvarn::get_kv_n_stream() const {
-    return metadata->get_n_stream();
+    // The store's own stream count is authoritative: the metadata mirror can be
+    // configured with a different (larger) n_seq_max stream layout than the store
+    // actually allocates (seen with --parallel 2: metadata 2 vs store 1), which
+    // broke the attention mask's ne[3] vs the kvarn views' ne[3].
+    return n_stream;
 }
 
 uint32_t llama_kv_cache_kvarn::get_kv_size() const {
@@ -2416,6 +2439,9 @@ ggml_tensor * llama_kv_cache_kvarn::store(
         int32_t il,
         const llama_kv_cache::slot_info & sinfo,
         bool value) const {
+    // single-stream store: pin the stream range (see view())
+    const_cast<llama_kv_cache::slot_info &>(sinfo).s0 = get_kv_n_stream() == 1 ? 0 : sinfo.s0;
+    const_cast<llama_kv_cache::slot_info &>(sinfo).s1 = get_kv_n_stream() == 1 ? 0 : sinfo.s1;
     const auto & layer = layer_for(il);
     if (!ggml_is_contiguous(current)) {
         current = ggml_cont(ctx, current);
@@ -2456,8 +2482,8 @@ ggml_tensor * llama_kv_cache_kvarn::view(
         bool value,
         ggml_tensor * mat_idxs) const {
     const auto & layer = layer_for(il);
-    const uint32_t stream_start = sinfo.s0;
-    const uint32_t stream_count = sinfo.s1 - sinfo.s0 + 1;
+    const uint32_t stream_start = get_kv_n_stream() == 1 ? 0 : sinfo.s0;
+    const uint32_t stream_count = get_kv_n_stream() == 1 ? 1 : sinfo.s1 - sinfo.s0 + 1;
     ggml_tensor * indices = swa ? mat_idxs : stored->src[1];
 
     ggml_tensor * result = ggml_kvarn_view(
@@ -2497,8 +2523,11 @@ ggml_tensor * llama_kv_cache_kvarn::materialize(
         bool value,
         ggml_tensor * mat_idxs) const {
     const auto & layer = layer_for(il);
-    const uint32_t stream_start = sinfo.s0;
-    const uint32_t stream_count = sinfo.s1 - sinfo.s0 + 1;
+    // Single-stream store: every slot shares stream 0 regardless of what the
+    // metadata mirror reports (it may carry a stale per-seq stream when the
+    // hybrid memory passes its split ubatches through).
+    const uint32_t stream_start = get_kv_n_stream() == 1 ? 0 : sinfo.s0;
+    const uint32_t stream_count = get_kv_n_stream() == 1 ? 1 : sinfo.s1 - sinfo.s0 + 1;
     ggml_tensor * indices = swa ? mat_idxs : stored->src[1];
     GGML_ASSERT(indices != nullptr);
 

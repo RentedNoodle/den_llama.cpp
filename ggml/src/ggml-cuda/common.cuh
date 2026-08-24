@@ -1245,6 +1245,7 @@ struct ggml_cuda_graph {
     std::vector<cudaGraphNode_t> nodes;
     bool disable_due_to_gpu_arch = false;
     bool warmup_complete = false;
+    int  warmup_unstable_calls = 0;   // hybrid graphs never stabilize -> degrade to eager
     uint64_t uid = 0;
     int64_t last_used_time = 0;
     struct node_properties {
@@ -1257,8 +1258,10 @@ struct ggml_cuda_graph {
 
     bool is_enabled() const {
         static const bool disable_cuda_graphs_due_to_env = (getenv("GGML_CUDA_DISABLE_GRAPHS") != nullptr);
-        return !(disable_due_to_gpu_arch || disable_cuda_graphs_due_to_env);
+        return !(disable_due_to_gpu_arch || disable_cuda_graphs_due_to_env || disable_graph);
     }
+
+    bool disable_graph = false;   // set by the warmup when a hybrid graph never stabilizes
 #endif
 };
 

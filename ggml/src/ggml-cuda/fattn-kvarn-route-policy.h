@@ -139,11 +139,14 @@ inline ggml_cuda_fattn_kvarn_route ggml_cuda_fattn_kvarn_select_route(
     if (input.vector_eligible) {
         return GGML_CUDA_FATTN_KVARN_ROUTE_DECODE_VECTOR;
     }
-    // Split decode parallelizes one query over the KV sequence. Reusing it for
-    // speculative verification repeats K/V decoding for every query and grows
-    // its partial output with n_q * n_splits. The native MMA path instead tiles
-    // the short query batch and reuses each decoded K/V tile across those rows.
-    if (input.n_q == 1 && input.split_eligible) {
+    // Split decode parallelizes the query row(s) over the KV sequence. The
+    // speculative verification batch (n_q = n_draft+1) used to be excluded
+    // because every query re-decoded the K/V tiles; the L2 persistence window
+    // (A1) turns those re-reads into L2 hits, so small batches are now viable.
+    // The split kernel's grid is n_q-general (one block per (split, q)); the
+    // generic-MMA path still wins for wide batches where the K/V tile reuse
+    // across rows matters more than the long-KV split parallelism.
+    if (input.n_q <= 8 && input.split_eligible) {
         return GGML_CUDA_FATTN_KVARN_ROUTE_DECODE_SPLIT;
     }
     return GGML_CUDA_FATTN_KVARN_ROUTE_GENERIC_MMA;

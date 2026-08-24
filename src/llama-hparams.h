@@ -53,6 +53,9 @@ struct llama_hparams {
     uint32_t n_embd;
     uint32_t n_layer_all;
     uint32_t n_layer_nextn = 0;
+    // Dual-hybrid (linear-attn + full-attn in every layer, e.g. Cold-Fusion):
+    // the fused GDN probes cannot walk this graph layout - gate fusion off.
+    bool is_dual_hybrid = false;
 
     // granite-switch: index of the single-head "router" KV layer that encodes
     // per-token adapter selection. -1 when the model has no such layer.
@@ -147,6 +150,11 @@ struct llama_hparams {
     llama_swa_type swa_type = LLAMA_SWA_TYPE_NONE;
     // the size of the sliding window (0 - no SWA)
     uint32_t n_swa = 0;
+    uint32_t dflash_block_size       = 0;
+    uint32_t dflash_conv_kernel_size = 0;
+    uint32_t dflash_conv_group_size  = 0;
+    uint32_t dflash_selector_rank    = 0;
+    uint32_t dflash_selector_top_k   = 0;
 
     // if is_swa_impl[il] == 1, then layer il is SWA
     // if is_swa_impl[il] == 0, then layer il is dense (i.e. non-SWA)

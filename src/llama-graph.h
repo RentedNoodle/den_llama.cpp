@@ -1330,6 +1330,8 @@ struct llm_graph_context {
 
     void build_sampling() const;
 
+    virtual void build_post_sampling() const {}
+
     //
     // dense (out)
     //

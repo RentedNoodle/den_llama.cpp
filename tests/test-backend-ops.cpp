@@ -2300,6 +2300,43 @@ struct test_get_rows : public test_case {
     }
 };
 
+// Future rowwise-I8 API contract: scales are one F16 value per source row and
+// the gathered output is the signed I8 row converted to FP32 after scaling.
+struct test_get_rows_scaled_i8 : public test_case {
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "GET_ROWS_SCALED_I8";
+    }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * values = ggml_new_tensor_2d(ctx, GGML_TYPE_I8, 4, 3);
+        ggml_tensor * scales = ggml_new_tensor_1d(ctx, GGML_TYPE_F16, 3);
+        ggml_tensor * rows   = ggml_new_tensor_1d(ctx, GGML_TYPE_I32, 3);
+        ggml_set_name(values, "values_i8");
+        ggml_set_name(scales, "row_scales_f16");
+        ggml_set_name(rows,   "rows_repeated");
+
+        // Invalid IDs are defined as zero-filled rows; valid negative I8 values
+        // must retain their sign before multiplication by the F16 scale.
+        ggml_tensor * out = ggml_get_rows_scaled_i8(ctx, values, rows, scales);
+        ggml_set_name(out, "out");
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        const int8_t values[] = { -8,  3, -2,  7,
+                                  -4, -5,  6,  1,
+                                  -9,  2,  4, -3 };
+        const ggml_fp16_t scales[] = {
+            ggml_fp32_to_fp16(0.5f), ggml_fp32_to_fp16(-2.0f), ggml_fp32_to_fp16(1.5f),
+        };
+        const int32_t rows[] = { -1, 0, 3 };
+        ggml_backend_tensor_set(ggml_get_tensor(ctx, "values_i8"), values, 0, sizeof(values));
+        ggml_backend_tensor_set(ggml_get_tensor(ctx, "row_scales_f16"), scales, 0, sizeof(scales));
+        ggml_backend_tensor_set(ggml_get_tensor(ctx, "rows_repeated"), rows, 0, sizeof(rows));
+    }
+};
+
 // GGML_OP_GET_ROWS_BACK
 struct test_get_rows_back : public test_case {
     const ggml_type type;
@@ -4572,6 +4609,81 @@ struct test_mul_mat : public test_case {
     std::string op_desc(ggml_tensor * t) override {
         GGML_UNUSED(t);
         return ggml_op_name(GGML_OP_MUL_MAT);
+    }
+};
+
+// Future rowwise-I8 matmul contract: per-output-row F16 scales are applied to
+// signed I8 weights, then multiplied by a single-token FP32 activation vector.
+struct test_mul_mat_scaled_i8 : public test_case {
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "MUL_MAT_SCALED_I8";
+    }
+
+    double max_nmse_err() override {
+        return 1e-7;
+    }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        // C^T = A * B^T: A is [K, M], B is [K, 1], so this is one token.
+        ggml_tensor * weights = ggml_new_tensor_2d(ctx, GGML_TYPE_I8, 4, 3);
+        ggml_tensor * scales  = ggml_new_tensor_1d(ctx, GGML_TYPE_F16, 3);
+        // Deliberately offset the logical token by one F32.  It remains
+        // contiguous, but no longer has float4 alignment; CUDA decode paths
+        // must retain the generic implementation for this valid tensor view.
+        ggml_tensor * token_storage = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 5, 1);
+        ggml_tensor * token = ggml_view_2d(ctx, token_storage, 4, 1, token_storage->nb[1], sizeof(float));
+        ggml_set_name(weights, "weights_i8");
+        ggml_set_name(scales,  "row_scales_f16");
+        ggml_set_name(token_storage, "token_storage_f32");
+        ggml_set_name(token,         "token_f32");
+
+        ggml_tensor * out = ggml_mul_mat_scaled_i8(ctx, weights, token, scales);
+        ggml_set_name(out, "out");
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        const int8_t weights[] = { -3,  2, -1,  4,
+                                    5, -6,  7, -8,
+                                   -9, 10, -11, 12 };
+        const ggml_fp16_t scales[] = {
+            ggml_fp32_to_fp16(0.5f), ggml_fp32_to_fp16(1.25f), ggml_fp32_to_fp16(-0.75f),
+        };
+        const float token_storage[] = { 99.0f, 2.0f, -1.0f, 0.5f, 3.0f };
+        ggml_backend_tensor_set(ggml_get_tensor(ctx, "weights_i8"), weights, 0, sizeof(weights));
+        ggml_backend_tensor_set(ggml_get_tensor(ctx, "row_scales_f16"), scales, 0, sizeof(scales));
+        ggml_backend_tensor_set(ggml_get_tensor(ctx, "token_storage_f32"), token_storage, 0, sizeof(token_storage));
+    }
+};
+
+// Decode and prompt builders can carry a legal batch with no requested logits.
+// The scaled-I8 output path must preserve that as a zero-work graph rather than
+// failing validation or launching an invalid zero-sized CUDA grid.
+struct test_mul_mat_scaled_i8_empty : public test_case {
+    std::string op_desc(ggml_tensor * t) override {
+        GGML_UNUSED(t);
+        return "MUL_MAT_SCALED_I8_EMPTY";
+    }
+
+    ggml_tensor * build_graph(ggml_context * ctx) override {
+        ggml_tensor * weights = ggml_new_tensor_2d(ctx, GGML_TYPE_I8, 4, 3);
+        ggml_tensor * scales  = ggml_new_tensor_1d(ctx, GGML_TYPE_F16, 3);
+        ggml_tensor * token   = ggml_new_tensor_2d(ctx, GGML_TYPE_F32, 4, 0);
+        ggml_set_name(weights, "weights_i8_empty");
+        ggml_set_name(scales,  "row_scales_f16_empty");
+        ggml_tensor * out = ggml_mul_mat_scaled_i8(ctx, weights, token, scales);
+        ggml_set_name(out, "out_empty");
+        return out;
+    }
+
+    void initialize_tensors(ggml_context * ctx) override {
+        const int8_t weights[] = { -3, 2, -1, 4, 5, -6, 7, -8, -9, 10, -11, 12 };
+        const ggml_fp16_t scales[] = {
+            ggml_fp32_to_fp16(0.5f), ggml_fp32_to_fp16(1.25f), ggml_fp32_to_fp16(-0.75f),
+        };
+        ggml_backend_tensor_set(ggml_get_tensor(ctx, "weights_i8_empty"), weights, 0, sizeof(weights));
+        ggml_backend_tensor_set(ggml_get_tensor(ctx, "row_scales_f16_empty"), scales, 0, sizeof(scales));
     }
 };
 
@@ -8266,6 +8378,12 @@ static const ggml_type other_types[] = {
 static std::vector<std::unique_ptr<test_case>> make_test_cases_eval() {
     std::vector<std::unique_ptr<test_case>> test_cases;
     std::default_random_engine rng(0);
+
+    // RED tests for the active rowwise INT8 scaled ops.  The CPU backend is
+    // the FP32 reference in the normal backend comparison harness.
+    test_cases.emplace_back(new test_get_rows_scaled_i8());
+    test_cases.emplace_back(new test_mul_mat_scaled_i8());
+    test_cases.emplace_back(new test_mul_mat_scaled_i8_empty());
 
     // unary ops
     for (ggml_type type : {GGML_TYPE_F16, GGML_TYPE_F32}) {

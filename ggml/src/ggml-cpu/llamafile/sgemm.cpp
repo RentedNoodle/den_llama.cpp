@@ -148,7 +148,7 @@ inline __m512 madd(__m512 a, __m512 b, __m512 c) {
     return _mm512_fmadd_ps(a, b, c);
 }
 #endif
-#if defined(__AVX512BF16__)
+#if defined(__AVX512BF16__) && !defined(_MSC_VER) && !defined(_MSC_VER)
 template <>
 inline __m512 madd(__m512bh a, __m512bh b, __m512 c) {
     return _mm512_dpbf16_ps(c, a, b);
@@ -369,7 +369,7 @@ template <> inline __m512 load(const ggml_bf16_t *p) {
 }
 #endif // __AVX512F__
 
-#if defined(__AVX512BF16__)
+#if defined(__AVX512BF16__) && !defined(_MSC_VER)
 template <> inline __m512bh load(const ggml_bf16_t *p) {
     return (__m512bh)_mm512_loadu_ps((const float *)p);
 }
@@ -3891,7 +3891,7 @@ bool llamafile_sgemm(const struct ggml_compute_params * params, int64_t m, int64
     }
 
     case GGML_TYPE_BF16: {
-#if defined(__AVX512BF16__)
+#if defined(__AVX512BF16__) && !defined(_MSC_VER)
         if (Btype == GGML_TYPE_BF16) {
             tinyBLAS<32, __m512, __m512bh, ggml_bf16_t, ggml_bf16_t, float> tb{ params, k,
                 (const ggml_bf16_t *)A, lda,

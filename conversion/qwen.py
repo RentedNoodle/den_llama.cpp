@@ -289,14 +289,12 @@ class _QwenMtpMixin:
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
-        self.block_count = self.hparams["num_hidden_layers"]
-        if not self.no_mtp:
-            n_mtp = self.hparams.get("mtp_num_hidden_layers", 0)
-            # Qwen-3-Next doesn't include `mtp_num_hidden_layers` in config.
-            if n_mtp == 0:
-                assert self.opt_num_mtp_layers != 0
-                n_mtp = self.opt_num_mtp_layers
-            self.block_count += n_mtp
+        # super().__init__() already ran index_tensors -> filter_tensors, so
+        # opt_num_mtp_layers holds the REAL mtp.* tensor count from the scan.
+        # A config-declared count with no actual mtp.* tensors (untrained
+        # heads, e.g. Cold-Fusion) collapses to 0 - otherwise the GGUF carries
+        # block_count=65/nextn=1 while only 64 blocks exist.
+        self.block_count = self.hparams["num_hidden_layers"] + type(self).opt_num_mtp_layers
         self.tensor_map = gguf.get_tensor_name_map(self.model_arch, self.block_count)
 
     def index_tensors(self, remote_hf_model_id: str | None = None) -> dict[str, Callable[[], Tensor]]:
@@ -449,6 +447,20 @@ class _LinearAttentionVReorderBase(Qwen3NextModel):
     """
 
     @staticmethod
+    def _escha_endpoint_base(name: str) -> str | None:
+        for base in ("model.embed_tokens", "lm_head"):
+            if name in (f"{base}.weight_int8", f"{base}.weight_scale"):
+                return base
+        return None
+
+    def _map_escha_endpoint(self, name: str) -> tuple[str, bool] | None:
+        base = self._escha_endpoint_base(name)
+        if base is None:
+            return None
+        new_name = self.map_tensor_name(base + ".weight")
+        return new_name, name.endswith(".weight_int8")
+
+    @staticmethod
     def _reorder_v_heads(tensor: Tensor, dim: int, num_k_heads: int, num_v_per_k: int, head_dim: int) -> Tensor:
         """Reorder V heads from grouped (by K head) to tiled order along the given dimension."""
         shape = list(tensor.shape)
@@ -552,6 +564,11 @@ class _LinearAttentionVReorderBase(Qwen3NextModel):
         super()._repack_nvfp4(name, weight, scale, scale2, input_scale)
 
     def modify_tensors(self, data_torch: Tensor, name: str, bid: int | None) -> Iterable[tuple[str, Tensor]]:
+        if (mapped := self._map_escha_endpoint(name)) is not None:
+            new_name, is_weight = mapped
+            yield new_name if is_weight else new_name.replace(".weight", ".weight_scale"), data_torch
+            return
+
         num_k_heads = self.hparams.get("linear_num_key_heads", 0)
         num_v_heads = self.hparams.get("linear_num_value_heads", 0)
 
@@ -622,6 +639,169 @@ class _Qwen35MRopeMixin:
 @ModelBase.register("Qwen3_5ForConditionalGeneration", "Qwen3_5ForCausalLM")
 class Qwen3_5TextModel(_Qwen35MRopeMixin, _LinearAttentionVReorderBase):
     model_arch = gguf.MODEL_ARCH.QWEN35
+
+    def modify_tensors(self, data_torch: Tensor, name: str, bid: int | None) -> Iterable[tuple[str, Tensor]]:
+        # The linear-attn in_proj_qkv is already fused at the linear kv heads
+        # (2*key_dim + value_dim = 10240 for the CF); the V-row tiling for the
+        # engine's broadcast is handled by _LinearAttentionVReorderBase.
+        yield from self._escha_modify(data_torch, name, bid)
+
+    # ---- Escha W2 emission (EschaLabs format) ----
+    # Per escha projection, the safetensors carry 7 tensors that replace the
+    # weight: .escha_code int16 [G,1088,32] (packed 2-bit), .escha_config
+    # int32[6], .escha_rin/.escha_rout f16, .escha_s_in/.escha_s_out f32,
+    # plus the projection's .bias f16. Emitted as-is under the mapped weight
+    # name + suffix. Shared 65536-f16 cbA codebook written once as "escha_lut".
+    ESCHA_SUFFIXES = ("code", "config", "rin", "rout", "s_in", "s_out")
+
+    def __init__(self, *args, **kwargs):
+        super().__init__(*args, **kwargs)
+        # Auto-load the shared cbA codebook from ESCHA_LUT_PATH when set.
+        import os
+        p = os.environ.get("ESCHA_LUT_PATH") or "C:/Users/james/AppData/Local/Temp/escha_lut.npy"
+        if os.path.exists(p):
+            import numpy as np
+            self.set_escha_lut(np.load(p).astype(np.float16))
+        d = os.environ.get("ESCHA_DEP_PATH") or "C:/Users/james/AppData/Local/Temp/escha_dep_k2.npy"
+        if os.path.exists(d):
+            self.set_escha_dep(np.load(d).astype(np.int16))
+        d3 = os.environ.get("ESCHA_DEP3_PATH") or "C:/Users/james/AppData/Local/Temp/escha_dep_k3.npy"
+        if os.path.exists(d3):
+            self.set_escha_dep3(np.load(d3).astype(np.int16))
+
+    def _escha_state(self):
+        st = getattr(self, "_escha_state_dict", None)
+        if st is None:
+            st = self._escha_state_dict = {
+                "groups": {},      # base -> {suffix: tensor}
+                "biases": {},      # base -> bias (bias arrives FIRST in file)
+                "bases": set(),    # confirmed escha bases
+                "lut": None,       # shared 65536 f16 codebook (cbA)
+                "lut_written": False,
+            }
+        return st
+
+    def set_escha_dep(self, dep):
+        """Hook: shared [256,16] i16 dependency table (K=2)."""
+        self._escha_state()["dep"] = dep
+
+    def set_escha_dep3(self, dep):
+        """Hook: shared [256,16] i16 dependency table (K=3)."""
+        self._escha_state()["dep3"] = dep
+
+    def set_escha_lut(self, lut):
+        """Hook: shared 65536-entry f16 codebook (cbA), set at runtime."""
+        self._escha_state()["lut"] = lut
+
+    def _escha_write_lut(self):
+        st = self._escha_state()
+        if st["lut_written"]:
+            return
+        if st["lut"] is None:
+            raise RuntimeError("escha_lut not provided: call set_escha_lut(lut) first")
+        self.gguf_writer.add_tensor("escha_lut", st["lut"])
+        st["lut_written"] = True
+
+    def _escha_write_dep(self):
+        st = self._escha_state()
+        if st.get("dep_written"):
+            return
+        dep = st.get("dep")
+        if dep is None:
+            return
+        self.gguf_writer.add_tensor("escha_dep_k2", dep)
+        st["dep_written"] = True
+        dep3 = st.get("dep3")
+        if dep3 is not None:
+            self.gguf_writer.add_tensor("escha_dep_k3", dep3)
+
+    def _escha_tensor_name(self, base, suffix):
+        return self.map_tensor_name(base + ".weight") + ".escha_" + suffix
+
+    def _escha_emit_group(self, base):
+        st = self._escha_state()
+        grp = st["groups"].pop(base, None)
+        if grp is None:
+            return
+        self._escha_write_lut()
+        self._escha_write_dep()
+        import numpy as np
+        _escha_dtypes = {
+            "code":   "int16",
+            "config": "int32",
+            "rin":    "float16",
+            "rout":   "float16",
+            "s_in":   "float32",
+            "s_out":  "float32",
+            "bias":   "float16",
+        }
+        def _escha_materialize(t, suffix):
+            # the gguf lazy loader converts to F32 - force the FORMAT dtype
+            import torch as _torch
+            dt = _escha_dtypes.get(suffix, "float32")
+            arr = t.detach().cpu().numpy()
+            return _torch.from_numpy(arr.astype(dt))
+        for suffix in self.ESCHA_SUFFIXES:
+            if suffix in grp:
+                yield self._escha_tensor_name(base, suffix), _escha_materialize(grp[suffix], suffix)
+        if base in st["biases"]:
+            yield self._escha_tensor_name(base, "bias"), _escha_materialize(st["biases"].pop(base), "bias")
+
+    def _escha_group_ready(self, base):
+        st = self._escha_state()
+        group = st["groups"].get(base, {})
+        if not set(self.ESCHA_SUFFIXES).issubset(group):
+            return False
+        return base in st["biases"] or base + ".bias" not in self.model_tensors
+
+    def _escha_flush_pending(self):
+        st = self._escha_state()
+        errors = []
+        for base in sorted(st["groups"]):
+            group = st["groups"][base]
+            missing = [suffix for suffix in self.ESCHA_SUFFIXES if suffix not in group]
+            if base + ".bias" in self.model_tensors and base not in st["biases"]:
+                missing.append("bias")
+            if missing:
+                errors.append(f"{base} (missing {', '.join(missing)})")
+
+        if errors:
+            raise ValueError("Incomplete Escha companion group(s): " + "; ".join(errors))
+
+        for base in sorted(list(st["groups"])):
+            for new_name, data_torch in self._escha_emit_group(base):
+                self.gguf_writer.add_tensor(new_name, data_torch.numpy())
+
+    def _escha_modify(self, data_torch, name, bid):
+        if (mapped := self._map_escha_endpoint(name)) is not None:
+            new_name, is_weight = mapped
+            yield new_name if is_weight else new_name.replace(".weight", ".weight_scale"), data_torch
+            return
+
+        st = self._escha_state()
+        if ".escha_" in name:
+            base, suffix = name.split(".escha_", 1)
+            st["bases"].add(base)
+            grp = st["groups"].setdefault(base, {})
+            grp[suffix] = data_torch
+            if self._escha_group_ready(base):
+                yield from self._escha_emit_group(base)
+            return
+        if name.endswith(".bias"):
+            base = name[:-len(".bias")]
+            # bias may arrive before its escha group (file order) - resolve by
+            # the indexed tensor set (all names known upfront)
+            is_escha = base in st["bases"] or base in st["groups"]                 or (base + ".escha_code") in getattr(self, "model_tensors", {})
+            if is_escha:
+                st["biases"][base] = data_torch
+                if self._escha_group_ready(base):
+                    yield from self._escha_emit_group(base)
+                return
+        yield from super().modify_tensors(data_torch, name, bid)
+
+    def prepare_tensors(self):
+        super().prepare_tensors()
+        self._escha_flush_pending()
 
 
 @ModelBase.register("Qwen3_5MoeForConditionalGeneration", "Qwen3_5MoeForCausalLM")

@@ -693,8 +693,13 @@ static bool ggml_cuda_flash_attn_ext_kvarn_decode_d(
     ggml_cuda_pool_alloc<ggml_cuda_fattn_kvarn_desc> v_desc(pool, n_desc);
     ggml_cuda_fattn_kvarn_init_descs(plan, k_desc.get(), v_desc.get(), 0, 0, stream);
 
-    const size_t partial_count = (size_t) plan.n_stream * n_q_heads * n_q * n_splits * D;
-    const size_t meta_count = (size_t) plan.n_stream * n_q_heads * n_q * n_splits;
+    // Cluster-cooperative decode reduces each 8-split group to one global partial;
+    // only the group count is needed then (gate shared with the launch).
+    const int n_entries = ggml_cuda_fattn_kvarn_cluster_groups(n_splits, plan.n_stream) > 0
+        ? (n_splits + 7) / 8
+        : n_splits;
+    const size_t partial_count = (size_t) plan.n_stream * n_q_heads * n_q * n_entries * D;
+    const size_t meta_count = (size_t) plan.n_stream * n_q_heads * n_q * n_entries;
     ggml_cuda_pool_alloc<float> partial(pool, partial_count);
     ggml_cuda_pool_alloc<float2> partial_meta(pool, meta_count);
     ggml_cuda_kv_memory_transient_stats_record_kvarn(
@@ -970,6 +975,75 @@ static void ggml_cuda_fattn_kvarn_debug_route(
         fallback_reason != nullptr ? fallback_reason : "none");
 }
 
+// L2 persistence window over the kvarn store's records + stage: the decode's
+// KV reads become L2 hits instead of DRAM walks (48MB L2 on GB203; kvarn 2-bit
+// stores fit large context windows entirely). Carves the persisting L2 once and
+// pins the store tensors' span on the compute stream. The window persists the
+// hottest part of the cache (the carve-sized prefix of the store span).
+static void ggml_cuda_kvarn_l2_window_once(
+        ggml_backend_cuda_context & ctx,
+        const ggml_cuda_fattn_kvarn_plan & plan) {
+    static bool configured = false;
+    if (configured) {
+        return;
+    }
+    configured = true;
+
+    // carve most of the 48MB L2 for persistence (leave headroom for streaming)
+    int l2_size = 0;
+    if (cudaDeviceGetAttribute(&l2_size, cudaDevAttrL2CacheSize, ctx.device) != cudaSuccess) {
+        return;
+    }
+    size_t carve = (size_t) (l2_size * 3 / 5); // ~60%: conservative vs the max persisting carve
+    if (cudaDeviceSetLimit(cudaLimitPersistingL2CacheSize, carve) != cudaSuccess) {
+        carve = 0;
+    }
+    size_t limit = 0;
+    if (cudaDeviceGetLimit(&limit, cudaLimitPersistingL2CacheSize) == cudaSuccess && limit > 0) {
+        carve = limit;
+    }
+    if (carve == 0) {
+        return;
+    }
+
+    // span over the k/v records + stage tensors
+    const ggml_tensor * tensors[4] = { plan.k.records, plan.k.stage, plan.v.records, plan.v.stage };
+    const char * base = nullptr;
+    const char * end  = nullptr;
+    for (const ggml_tensor * t : tensors) {
+        if (t == nullptr || t->data == nullptr) {
+            continue;
+        }
+        const char * b = (const char *) t->data;
+        const char * e = b + ggml_nbytes(t);
+        if (base == nullptr || b < base) { base = b; }
+        if (end  == nullptr || e > end)  { end  = e; }
+    }
+    if (base == nullptr || end <= base) {
+        return;
+    }
+    const size_t span = (size_t) (end - base);
+    const size_t num_bytes = std::min(span, carve);
+    // The live working set (recent records + the F16 stage) sits at the tail of
+    // the store span; pin the LAST num_bytes so the decode's hot reads persist.
+    const char * window_base = end - num_bytes;
+
+    cudaStreamAttrValue attr = {};
+    attr.accessPolicyWindow.base_ptr  = (void *) window_base;
+    attr.accessPolicyWindow.num_bytes = num_bytes;
+    attr.accessPolicyWindow.hitRatio  = 1.0f;
+    attr.accessPolicyWindow.hitProp   = cudaAccessPropertyPersisting;
+    attr.accessPolicyWindow.missProp  = cudaAccessPropertyStreaming;
+    const cudaError_t werr = cudaStreamSetAttribute(
+            ctx.stream(), cudaStreamAttributeAccessPolicyWindow, &attr);
+    if (werr != cudaSuccess) {
+        fprintf(stderr, "DEN_KVARN_L2 setattr failed: %s\n", cudaGetErrorString(werr));
+        return;
+    }
+    fprintf(stderr, "DEN_KVARN_L2 window=%zu carve=%zu span=%zu dev=%d\n",
+            num_bytes, carve, span, ctx.device);
+}
+
 bool ggml_cuda_flash_attn_ext_kvarn(
         ggml_backend_cuda_context & ctx,
         ggml_tensor * dst,
@@ -978,6 +1052,8 @@ bool ggml_cuda_flash_attn_ext_kvarn(
     if (!ggml_cuda_fattn_kvarn_supported(ctx.device, dst, &plan)) {
         return false;
     }
+
+    ggml_cuda_kvarn_l2_window_once(ctx, plan);
 
     const auto capabilities = ggml_cuda_fattn_kvarn_device_capabilities(ctx.device);
     ggml_cuda_fattn_kvarn_record_entry(entry_path);

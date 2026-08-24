@@ -1,5 +1,6 @@
 #pragma once
 
+#include "llama.h"
 #include "ggml.h" // ggml_op
 
 #include <string>
@@ -372,6 +373,11 @@ enum llm_kv {
 
     LLM_KV_TARGET_LAYERS,
     LLM_KV_TARGET_HIDDEN_SIZE,
+    LLM_KV_DFLASH_BLOCK_SIZE,
+    LLM_KV_DFLASH_CONV_KERNEL_SIZE,
+    LLM_KV_DFLASH_CONV_GROUP_SIZE,
+    LLM_KV_DFLASH_SELECTOR_RANK,
+    LLM_KV_DFLASH_SELECTOR_TOP_K,
     LLM_KV_NORM_BEFORE_RESIDUAL,
     LLM_KV_NORM_BEFORE_FC,
 
@@ -634,9 +640,32 @@ enum llm_tensor {
     LLM_TENSOR_MASKED_EMBD_ORDERING,
     LLM_TENSOR_FC,
     LLM_TENSOR_D2T,
+    LLM_TENSOR_ESCHA_LUT,
+    LLM_TENSOR_ESCHA_DEP_K2,
+    LLM_TENSOR_ESCHA_DEP_K3,
+    // Qwen3.5-only consumer metadata for ESCHA sidecars/endpoints.
+    LLM_TENSOR_QWEN35_TOKEN_EMBD_SCALED,
+    LLM_TENSOR_QWEN35_OUTPUT_SCALED,
+    LLM_TENSOR_QWEN35_ESCHA_ATTN_QKV,
+    LLM_TENSOR_QWEN35_ESCHA_ATTN_GATE,
+    LLM_TENSOR_QWEN35_ESCHA_SSM_OUT,
+    LLM_TENSOR_QWEN35_ESCHA_ATTN_Q,
+    LLM_TENSOR_QWEN35_ESCHA_ATTN_K,
+    LLM_TENSOR_QWEN35_ESCHA_ATTN_V,
+    LLM_TENSOR_QWEN35_ESCHA_ATTN_OUT,
+    LLM_TENSOR_QWEN35_ESCHA_FFN_GATE,
+    LLM_TENSOR_QWEN35_ESCHA_FFN_UP,
+    LLM_TENSOR_QWEN35_ESCHA_FFN_DOWN,
     LLM_TENSOR_DSPARK_MARKOV_W1,
     LLM_TENSOR_DSPARK_MARKOV_W2,
     LLM_TENSOR_DSPARK_CONF_PROJ,
+    LLM_TENSOR_DFLASH_ATTN_CONV_BASE,
+    LLM_TENSOR_DFLASH_ATTN_CONV_PROJ,
+    LLM_TENSOR_DFLASH_FFN_CONV_BASE,
+    LLM_TENSOR_DFLASH_FFN_CONV_PROJ,
+    LLM_TENSOR_DFLASH_SELECTOR_PREV,
+    LLM_TENSOR_DFLASH_SELECTOR_NEXT,
+    LLM_TENSOR_DFLASH_SELECTOR_HIDDEN,
 };
 
 
@@ -714,7 +743,7 @@ const char * llm_arch_name(llm_arch arch);
 
 llm_arch llm_arch_from_string(const std::string & name);
 
-const llm_tensor_info & llm_tensor_info_for(llm_tensor tensor);
+LLAMA_API const llm_tensor_info & llm_tensor_info_for(llm_tensor tensor);
 
 bool llm_arch_is_recurrent      (const llm_arch & arch);
 bool llm_arch_is_hybrid         (const llm_arch & arch);

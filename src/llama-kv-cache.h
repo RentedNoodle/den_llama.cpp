@@ -520,7 +520,16 @@ public:
     virtual uint32_t get_n_kv() const;
 
     virtual llama_kv_cache * get_kv() const { return kv; }
-    virtual const llama_kv_cache::slot_info & current_sinfo() const { return fallback_sinfo; }
+    // the store's actual stream count (kvarn stores may keep fewer streams than
+    // the metadata mirror's n_seq_max layout — the attention mask must match the
+    // kvarn views' ne[3], not the metadata's)
+    virtual uint32_t get_kv_n_stream() const { return kv ? kv->get_kv_n_stream() : 0; }
+    // return the current ubatch's real slot info when available; the kvarn store
+    // and view paths rely on it for the per-slot stream range. The base fallback
+    // (uninitialized s0/s1) was what the kvarn path saw for hybrid ubatches.
+    virtual const llama_kv_cache::slot_info & current_sinfo() const {
+        return (!ubatches.empty() && i_cur < sinfos.size()) ? sinfos[i_cur] : fallback_sinfo;
+    }
 
     virtual ggml_type type_k() const;
     virtual ggml_type type_v() const;
@@ -707,5 +716,6 @@ private:
     int32_t n_kv;
 
     // default slot_info backing for current_sinfo() when the context has no batch
-    llama_kv_cache::slot_info fallback_sinfo;
+    // (zero-initialized: slot_info's s0/s1 have no default member initializers)
+    llama_kv_cache::slot_info fallback_sinfo = {};
 };

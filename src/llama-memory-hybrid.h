@@ -37,6 +37,10 @@ public:
                  uint32_t   n_rs_seq,
                      bool   offload,
                      bool   unified,
+                            /* kvarn (attn store) */
+         llama_kvarn_params   kvarn,
+                 uint32_t   n_batch,
+                 uint32_t   n_ubatch,
                             /* layer filters */
     const layer_filter_cb & filter_attn = nullptr,
     const layer_filter_cb & filter_recr = nullptr);
@@ -80,13 +84,16 @@ public:
     // llama_memory_hybrid specific API
     //
 
-    llama_kv_cache * get_mem_attn() const;
+    llama_memory_i * get_mem_attn() const;
     llama_memory_recurrent * get_mem_recr() const;
+
+    bool uses_kvarn() const { return kvarn_enabled; }
 
 private:
     const llama_hparams & hparams;
 
-    const std::unique_ptr<llama_kv_cache> mem_attn;
+    const bool kvarn_enabled;
+    const std::unique_ptr<llama_memory_i> mem_attn;
     const std::unique_ptr<llama_memory_recurrent> mem_recr;
 };
 
@@ -112,6 +119,11 @@ public:
                   slot_info_vec_t   sinfos_attn,
         std::vector<llama_ubatch>   ubatches);
 
+    // init success (KVarN attn store: slots prepared internally)
+    llama_memory_hybrid_context(
+              llama_memory_hybrid * mem,
+        std::vector<llama_ubatch>   ubatches);
+
     ~llama_memory_hybrid_context() = default;
 
     bool next()  override;
@@ -119,6 +131,8 @@ public:
 
     llama_memory_status  get_status() const override;
     const llama_ubatch & get_ubatch() const override;
+    // the attention store's actual stream count (kvarn: the current slot's range)
+    uint32_t get_kv_n_stream() const;
 
     //
     // llama_memory_hybrid_context

@@ -214,6 +214,7 @@ struct server_slot {
     int64_t adaptive_cycle_start_us = 0;
 
     llama_tokens spec_draft;
+    std::vector<common_speculative_token_dist> spec_dists;
     llama_tokens spec_prompt;
     std::vector<int32_t> spec_i_batch;
     common_prompt_checkpoint spec_ckpt;
@@ -342,6 +343,7 @@ struct server_slot {
 
         if (can_speculate()) {
             spec_draft.clear();
+            spec_dists.clear();
             spec_i_batch.clear();
             spec_ckpt.clear();
         }
@@ -2963,6 +2965,9 @@ private:
                             /* .id_last  = */ slot.sampled,
                             /* .prompt   = */ &slot.spec_prompt,
                             /* .result   = */ &slot.spec_draft,
+                            /* .dists    = */ &slot.spec_dists,
+                            /* .temperature = */ slot.task->params.sampling.temp,
+                            /* .seed     = */ common_sampler_get_seed(slot.smpl.get()),
                         };
 
                         drafting.push_back(&slot);
@@ -3528,6 +3533,12 @@ private:
                         slot.stats.n_gen = 0;
                         slot.i_batch     = batch.size() - 1;
 
+                        if (getenv("DEN_ESCHA_SERVER_TRACE")) {
+                            fprintf(stderr, "DEN_ESCHA_SERVER_TRACE prompt-final slot=%d batch_size=%d i_batch=%d output=%d\n",
+                                    slot.id, batch.size(), slot.i_batch, batch.tokens[slot.i_batch].output ? 1 : 0);
+                            fflush(stderr);
+                        }
+
                         slot.init_sampler();
                     } else {
                         // skip ordinary mid-prompt checkpoints, unless the batch starts a user
@@ -3603,14 +3614,25 @@ private:
             has_output |= batch.tokens[i].output;
         }
 
+        if (getenv("DEN_ESCHA_SERVER_TRACE")) {
+            fprintf(stderr, "DEN_ESCHA_SERVER_TRACE decode-view off=%d n_tokens=%d has_output=%d\n",
+                    off, batch_view.n_tokens, has_output ? 1 : 0);
+            fflush(stderr);
+        }
+
         // decode on the worker thread, so we can still handle metrics tasks while waiting
         // note: the sync is done here too, so that the wait also happens off the main thread
         int ret = 0;
         queue_tasks.yield_to_queue([&]() {
+            const auto t0 = std::chrono::steady_clock::now();
             ret = llama_decode(ctx_tgt, batch_view);
             if (ret == 0 && has_output) {
                 llama_synchronize(ctx_tgt);
             }
+            const auto t1 = std::chrono::steady_clock::now();
+            const double ms = std::chrono::duration<double, std::milli>(t1 - t0).count();
+            fprintf(stderr, "DEN_DECODE_MS %.2f n_tokens=%d\n", ms, batch_view.n_tokens);
+            fflush(stderr);
         });
 
         if (ret != 0) {
@@ -3731,6 +3753,13 @@ private:
                 }
             }
 
+            if (getenv("DEN_ESCHA_SERVER_TRACE")) {
+                fprintf(stderr, "DEN_ESCHA_SERVER_TRACE post-decode slot=%d state=%d i_batch=%d off=%d n_tokens=%d inside=%d\n",
+                        slot.id, (int) slot.state, slot.i_batch, off, n_batch_tokens,
+                        is_inside_view(slot.i_batch) ? 1 : 0);
+                fflush(stderr);
+            }
+
             if (!is_inside_view(slot.i_batch)) {
                 // the required token not in this sub-batch, skip
                 return;
@@ -3773,8 +3802,19 @@ private:
 
             llama_token id;
             {
+                if (getenv("DEN_ESCHA_SERVER_TRACE")) {
+                    fprintf(stderr, "DEN_ESCHA_SERVER_TRACE sampling slot=%d tok_idx=%d\n", slot.id, tok_idx);
+                    fflush(stderr);
+                }
                 scoped_timer timer(t_sampl, n_sampl);
                 id = common_sampler_sample(slot.smpl.get(), slot.ctx_tgt, tok_idx);
+            }
+
+            if (getenv("DEN_ESCHA_SERVER_TRACE")) {
+                fprintf(stderr, "DEN_ESCHA_SERVER_TRACE sampled slot=%d token=%d eog=%d control=%d\n",
+                        slot.id, id, llama_vocab_is_eog(vocab, id) ? 1 : 0,
+                        llama_vocab_is_control(vocab, id) ? 1 : 0);
+                fflush(stderr);
             }
 
             slot.i_batch = -1;
@@ -3804,6 +3844,11 @@ private:
             }
 
             if (!process_token(result, slot)) {
+                if (getenv("DEN_ESCHA_SERVER_TRACE")) {
+                    fprintf(stderr, "DEN_ESCHA_SERVER_TRACE stop-after-sample slot=%d token=%d n_gen=%d stop=%d text_bytes=%zu\n",
+                            slot.id, id, (int) slot.stats.n_gen, (int) slot.stop, result.text_to_send.size());
+                    fflush(stderr);
+                }
                 // release slot because of stop condition
                 slot.print_timings();
                 send_final_response(slot);
@@ -3832,7 +3877,13 @@ private:
                 common_sampler_ptr smpl_save(common_sampler_clone(slot.smpl.get()));
 
                 GGML_ASSERT(slot.spec_i_batch.size() == n_draft + 1);
-                auto accepted = common_sampler_sample_and_accept_n(slot.smpl.get(), slot.ctx_tgt, slot.spec_i_batch, slot.spec_draft);
+                const bool can_rollback =
+                    ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_PART ||
+                    (ctx_tgt_seq_rm_type == COMMON_CONTEXT_SEQ_RM_TYPE_RS && n_draft <= llama_n_rs_seq(ctx_tgt));
+                auto accepted = can_rollback && slot.task->params.sampling.temp > 0.0f &&
+                                slot.spec_dists.size() == slot.spec_draft.size()
+                    ? common_sampler_sample_and_accept_n(slot.smpl.get(), slot.ctx_tgt, slot.spec_i_batch, slot.spec_draft, slot.spec_dists)
+                    : common_sampler_sample_and_accept_n(slot.smpl.get(), slot.ctx_tgt, slot.spec_i_batch, slot.spec_draft);
                 slot.spec_i_batch.clear();
 
                 GGML_ASSERT(accepted.size() >= 1);

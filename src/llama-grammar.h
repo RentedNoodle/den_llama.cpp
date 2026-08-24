@@ -148,6 +148,12 @@ struct llama_grammar {
                              trigger_patterns;         // Regular expressions that trigger a lazy grammar. Must be a full match of the entire generated
                                                        // string, and the grammar will be given the string from the first match group onwards.
 
+    // A2.1 mask cache: the full-vocab allowed mask is state-dependent; repeated
+    // grammar states (JSON ws, number digits) reuse the cached mask. Keyed by a
+    // fingerprint of the stacks + the partial-utf8. Perf-only (rebuilt on any
+    // state change; the clone's aggregate init value-initializes them).
+    mutable size_t               mask_fingerprint = 0;
+    mutable std::vector<uint8_t> cached_mask;
 };
 
 //
@@ -179,6 +185,12 @@ struct llama_grammar * llama_grammar_clone_impl(const struct llama_grammar & gra
 void llama_grammar_apply_impl(
         const struct llama_grammar & grammar,
             llama_token_data_array * cur_p);
+
+// dense allowed-token mask over the full vocabulary (n_vocab bytes, 1 = allowed)
+void llama_grammar_allowed_mask_impl(
+        const struct llama_grammar & grammar,
+              llama_token   n_vocab,
+                    uint8_t * mask);
 
 void llama_grammar_accept_impl(
               struct llama_grammar & grammar,

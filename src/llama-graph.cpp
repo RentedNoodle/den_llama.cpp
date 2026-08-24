@@ -88,7 +88,17 @@ static ggml_tensor * build_attn_inp_kq_mask(
         const llama_cparams & cparams) {
     const auto n_kv     = mctx->get_n_kv();
     const auto n_tokens = ubatch.n_tokens;
-    const auto n_stream = cparams.kv_unified ? 1 : ubatch.n_seqs_unq;
+    // The mask's stream count must match the query tensor the graph actually
+    // builds for this ubatch. The store's total stream count is an UPPER bound:
+    // a plain cache at --parallel 2 decodes one seq per ubatch (Q ne[3] = the
+    // ubatch's seq count, not the cache's), and the kvarn views expose the slot's
+    // sinfo range. The old n_seqs_unq heuristic matched the plain path but broke
+    // kvarn at parallel 2; min() covers both.
+    const auto ctx_streams = mctx->get_kv_n_stream();
+    const auto ubatch_streams = cparams.kv_unified ? 1 : ubatch.n_seqs_unq;
+    const auto n_stream = ctx_streams != 0
+        ? std::min((int) ctx_streams, (int) ubatch_streams)
+        : ubatch_streams;
 
     // flash attention requires an f16 mask
     const auto type = cparams.flash_attn ? GGML_TYPE_F16 : GGML_TYPE_F32;
