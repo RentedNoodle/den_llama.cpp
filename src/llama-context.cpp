@@ -1283,6 +1283,11 @@ void llama_context::set_embeddings_nextn(bool value, bool masked) {
 
     cparams.embeddings_nextn        = value;
     cparams.embeddings_nextn_masked = masked;
+
+    // force a scheduler reserve: the graph must be rebuilt with embeddings outputs
+    // for the nextn positions, same as set_embeddings_layer_inp below. without this
+    // the dflash2 draft decode asserts n_outputs_max > cparams.n_outputs_max.
+    sched_need_reserve = true;
 }
 
 void llama_context::set_embeddings_layer_inp(uint32_t lid, bool enable) {
@@ -2319,7 +2324,17 @@ uint32_t llama_context::output_reserve(int32_t n_outputs) {
 
     this->n_outputs = 0;
 
-    GGML_ASSERT(n_outputs_max <= cparams.n_outputs_max);
+    // dflash2 block budgets embeddings (nextn) for ALL positions (unmasked);
+    // the nextn buffer is sized by n_batch, so exempt that path from the logits budget.
+    // NOTE: read cparams live — set_embeddings_nextn() runs AFTER the has_embd_nextn
+    // local above is captured, so the local is stale for the dflash2 path.
+    if (n_outputs_max > cparams.n_outputs_max) {
+        fprintf(stderr, "%s: DEBUG n_outputs_max=%u cparams.n_outputs_max=%u embd_nextn=%d masked=%d this=%p\n",
+                __func__, n_outputs_max, cparams.n_outputs_max,
+                (int) cparams.embeddings_nextn, (int) cparams.embeddings_nextn_masked, (void *) this);
+    }
+    GGML_ASSERT(n_outputs_max <= cparams.n_outputs_max ||
+                (cparams.embeddings_nextn && !cparams.embeddings_nextn_masked));
 
     return n_outputs_max;
 }
