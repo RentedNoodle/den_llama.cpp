@@ -1,0 +1,46 @@
+
+
+Loading model... 
+
+▄▄ ▄▄
+██ ██
+██ ██  ▀▀█▄ ███▄███▄  ▀▀█▄    ▄████ ████▄ ████▄
+██ ██ ▄█▀██ ██ ██ ██ ▄█▀██    ██    ██ ██ ██ ██
+██ ██ ▀█▄██ ██ ██ ██ ▀█▄██ ██ ▀████ ████▀ ████▀
+                                    ██    ██
+                                    ▀▀    ▀▀
+
+build      : b10469-f2514fbf9
+model      : I:\models\Ornith-1.0-35B-Heretic-MTP-APEX-I-Mini_fixed.gguf
+ftype      : Q3_K - Medium
+modalities : text
+
+available commands:
+  /exit or Ctrl+C     stop or exit
+  /regen              regenerate the last response
+  /clear              clear the chat history
+  /read <file>        add a text file
+  /glob <pattern>     add text files using globbing pattern
+
+
+
+> The capital of France is
+
+[Start thinking]
+
+Thinking Process:
+
+1.  **Identify the user's question:** The user is asking for the capital of France.
+2.  **Retrieve knowledge about France's capital:** Paris is the capital and most populous city of France.
+3.  **Formulate the answer:** State clearly that the capital of France is Paris. Keep it concise since the prompt was short.
+4.  **Check for accuracy:** Yes, Paris is definitely the capital of France (since 1792 officially, with some interruptions like during WWII).
+5.  **Final Output Generation:** "Paris" or a full sentence:
+
+[ Prompt: 67.6 t/s | Generation: 145.4 t/s ]
+
+> 
+> 
+> 
+
+Exiting...
+[0m

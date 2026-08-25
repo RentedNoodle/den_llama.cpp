@@ -1,0 +1,44 @@
+
+
+Loading model... 
+
+▄▄ ▄▄
+██ ██
+██ ██  ▀▀█▄ ███▄███▄  ▀▀█▄    ▄████ ████▄ ████▄
+██ ██ ▄█▀██ ██ ██ ██ ▄█▀██    ██    ██ ██ ██ ██
+██ ██ ▀█▄██ ██ ██ ██ ▀█▄██ ██ ▀████ ████▀ ████▀
+                                    ██    ██
+                                    ▀▀    ▀▀
+
+build      : b10469-f2514fbf9
+model      : I:\models\Ornith-1.0-35B-Heretic-MTP-APEX-I-Mini_fixed.gguf
+ftype      : Q3_K - Medium
+modalities : text
+
+available commands:
+  /exit or Ctrl+C     stop or exit
+  /regen              regenerate the last response
+  /clear              clear the chat history
+  /read <file>        add a text file
+  /glob <pattern>     add text files using globbing pattern
+
+
+
+> Explain GPU tensor cores in one sentence.
+
+[Start thinking]
+
+Here's a thinking process:
+
+1.  **Analyze User Input:**
+   - **Topic:** GPU Tensor Cores
+   - **Requirement:** Explain in exactly one sentence
+   - Need to be concise, accurate, and capture the core function
+
+2.  **Identify Key Concepts:**
+  
+
+[ Prompt: 79.1 t/s | Generation: 127.9 t/s ]
+
+
+Exiting...

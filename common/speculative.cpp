@@ -936,6 +936,15 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
     // dspark speculators
     bool sample_from_anchor = true;
 
+    // adaptive drafter: per-seq confidence EMA drives temperature auto-adjustment.
+    // high confidence → lower temp (more deterministic, higher accept)
+    // low confidence → higher temp (more diverse, explore better candidates)
+    std::vector<float> draft_confidence_ema;
+    std::vector<float> adaptive_temp;
+    static constexpr float conf_ema_alpha = 0.15f;
+    static constexpr float adaptive_temp_min = 0.05f;
+    static constexpr float adaptive_temp_max = 1.5f;
+
     const int32_t * target_layer_ids   = nullptr; // model_dft's extract layer indices
     uint32_t        target_layer_ids_n = 0;
 
@@ -1009,6 +1018,8 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
 
         selector_rng.resize(n_seq);
         selector_reset.assign(n_seq, true);
+        draft_confidence_ema.assign(n_seq, 0.5f);
+        adaptive_temp.assign(n_seq, 0.0f); // 0 = use dp.temperature as-is
 
         // offload draft sampling to the backend
         backend_chains.assign(n_seq, nullptr);
@@ -1261,6 +1272,32 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
                         predecessor = (int32_t) std::distance(scores,
                                 std::max_element(scores, scores + selector_top_k));
                         result.push_back((llama_token) row[predecessor]);
+                    }
+                }
+
+                // adaptive drafter: track confidence, adjust temperature for next cycle
+                if (!result.empty()) {
+                    float avg_conf = 0.0f;
+                    int32_t conf_n = 0;
+                    for (int32_t i = i_draft_beg; i < n_block_tokens; ++i) {
+                        const float * row_c = lattice + (size_t) (beg + i) * n_embd_dec;
+                        const float * scores_c = row_c + selector_top_k + (size_t) (i == i_draft_beg ? 0 : predecessor) * selector_top_k;
+                        float max_s = *std::max_element(scores_c, scores_c + selector_top_k);
+                        if (max_s > 0.0f) {
+                            avg_conf += scores_c[predecessor] / max_s;
+                            conf_n++;
+                        }
+                    }
+                    if (conf_n > 0) {
+                        avg_conf /= conf_n;
+                        float & ema = draft_confidence_ema[seq_id];
+                        ema = conf_ema_alpha * avg_conf + (1.0f - conf_ema_alpha) * ema;
+                        // high confidence → lower temp (deterministic, higher accept)
+                        // low confidence → raise temp (explore, find better candidates)
+                        float & at = adaptive_temp[seq_id];
+                        at = std::max(adaptive_temp_min,
+                             std::min(adaptive_temp_max, (1.0f - ema) * 1.2f));
+                        dp.temperature = at;
                     }
                 }
 
@@ -2440,13 +2477,16 @@ common_params common_base_params_to_speculative(const common_params & params) {
         });
     if (has_block_draft) {
         // per-seq output positions: DFlash decodes anchor + n_max masks (n_max + 1); DSpark n_max -> +1 covers both
-        const int32_t per_seq = std::max(1, params_spec.n_max + 2);
+        const int32_t per_seq = std::max(1, params_spec.n_max + 1);
         result.n_outputs_max = params.n_parallel * per_seq;
         result.n_batch  = std::max(result.n_batch,  result.n_outputs_max);
         result.n_ubatch = std::max(result.n_ubatch, result.n_outputs_max);
         // required in CLI mode too (backend_sampling is false there) — the anchor-first
         // block submits n_max+1 outputs per seq and the budget must cover it
         result.n_outputs_max_per_seq = per_seq;
+        // dflash2 draft is non-causal — kvarn assumes causal+rotated, which corrupts
+        // the draft's K/V → garbage predictions → accept ~0. Force plain cache.
+        result.kvarn.type = LLAMA_KVARN_TYPE_DISABLED;
     }
 
     return result;
