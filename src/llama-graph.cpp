@@ -27,6 +27,7 @@
 
 // KVarN (beellama TurboQuant) graph helpers
 
+#ifdef DEN_KVARN
 static void llm_flash_attn_ext_set_kvarn_domain(
         ggml_tensor * cur,
         enum ggml_flash_attn_ext_kvarn_domain domain) {
@@ -78,6 +79,7 @@ static void llm_kvarn_set_rot_inputs(
     if (rot_256 && rot_256->buffer) kvarn->set_input_kvarn_rot(rot_256);
     if (rot_512 && rot_512->buffer) kvarn->set_input_kvarn_rot(rot_512);
 }
+#endif // DEN_KVARN
 
 // dedup helpers
 
@@ -550,10 +552,12 @@ void llm_graph_input_attn_kv::set_input(const llama_ubatch * ubatch) {
         mctx->set_input_v_rot(self_v_rot);
     }
 
+#ifdef DEN_KVARN
     if (const auto * kvarn = dynamic_cast<const llama_kv_cache_kvarn_context *>(mctx)) {
         llm_kvarn_set_rot_inputs(kvarn,
             self_kvarn_rot_128, self_kvarn_rot_256, self_kvarn_rot_512);
     }
+#endif // DEN_KVARN
 }
 
 bool llm_graph_input_attn_kv::can_reuse(const llm_graph_params & params) {
@@ -2819,11 +2823,13 @@ static std::unique_ptr<llm_graph_input_attn_kv> build_attn_inp_kv_impl(
     inp->self_k_rot = mctx_cur->build_input_k_rot(ctx0);
     inp->self_v_rot = mctx_cur->build_input_v_rot(ctx0);
 
+#ifdef DEN_KVARN
     if (const auto * kvarn = dynamic_cast<const llama_kv_cache_kvarn_context *>(mctx_cur)) {
         inp->self_kvarn_rot_128 = kvarn->build_input_kvarn_rot(ctx0, 128);
         inp->self_kvarn_rot_256 = kvarn->build_input_kvarn_rot(ctx0, 256);
         inp->self_kvarn_rot_512 = kvarn->build_input_kvarn_rot(ctx0, 512);
     }
+#endif // DEN_KVARN
 
     return inp;
 }
@@ -2880,6 +2886,7 @@ ggml_tensor * llm_graph_context::build_attn(
 
     ggml_tensor * kq_mask = inp->get_kq_mask();
 
+#ifdef DEN_KVARN
     const auto * kvarn_ctx = dynamic_cast<const llama_kv_cache_kvarn_context *>(mctx_cur);
     const bool use_kvarn = kvarn_ctx != nullptr;
     const bool kvarn_native_attention = use_kvarn && kvarn_ctx->uses_native_attention(il);
@@ -2889,6 +2896,12 @@ ggml_tensor * llm_graph_context::build_attn(
         kvarn_ctx->native_rotated_max_query_tokens(il),
         (uint32_t) q_cur->ne[2]) : llama_kvarn_attention_plan {
             false, GGML_FLASH_ATTN_EXT_KVARN_DOMAIN_AUTO };
+#else
+    const auto * kvarn_ctx = static_cast<const llama_kv_cache_kvarn_context *>(nullptr);
+    const bool use_kvarn = false;
+    const auto kvarn_plan = llama_kvarn_attention_plan {
+            false, GGML_FLASH_ATTN_EXT_KVARN_DOMAIN_AUTO };
+#endif
     const auto kvarn_domain = kvarn_plan.domain;
     const bool use_kvarn_rotated_domain = use_kvarn &&
         kvarn_domain == GGML_FLASH_ATTN_EXT_KVARN_DOMAIN_ROTATED;

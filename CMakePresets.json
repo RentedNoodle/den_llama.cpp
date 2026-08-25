@@ -90,6 +90,23 @@
     { "name": "x64-windows-sycl-release-f16", "inherits": [ "sycl-base", "release", "sycl_f16" ] },
 
     { "name": "x64-windows-vulkan-debug", "inherits": [ "base", "vulkan", "debug" ] },
-    { "name": "x64-windows-vulkan-release", "inherits": [ "base", "vulkan", "release" ] }
+    { "name": "x64-windows-vulkan-release", "inherits": [ "base", "vulkan", "release" ] },
+
+    {
+        "name": "den-off", "hidden": true,
+        "cacheVariables": {
+            "DEN_KVARN":        "OFF",
+            "DEN_NVFP4_KV":     "OFF",
+            "DEN_QWEN35_MTP":   "OFF",
+            "DEN_ESCHA":        "OFF",
+            "DEN_GDN_FAST":     "OFF"
+        }
+    },
+    { "name": "den-full",  "inherits": [ "base", "release" ] },
+    { "name": "den-clean", "inherits": [ "base", "release", "den-off" ] },
+    {
+        "name": "den-min", "inherits": [ "base", "release", "den-off" ],
+        "cacheVariables": { "DEN_DFLASH2": "OFF" }
+    }
   ]
 }

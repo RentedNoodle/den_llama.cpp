@@ -325,6 +325,7 @@ llama_context::llama_context(
     cparams.auto_fgdn    = !hparams.is_dual_hybrid;
 
     cparams.nvfp4_kv_enabled = params.nvfp4_kv_enabled;
+#ifdef DEN_KVARN
     // Dense Escha W2 is validated separately from KVarN. The experimental
     // standard-KV route is opt-in and only applies when KVarN was not
     // explicitly requested by the caller; all other models retain defaults.
@@ -339,6 +340,9 @@ llama_context::llama_context(
     if (escha_std_kv) {
         LLAMA_LOG_INFO("%s: using opt-in standard KV for dense Escha W2\n", __func__);
     }
+#else
+    cparams.kvarn = llama_kvarn_default_params();
+#endif
 
     cparams.fused_lid    = true;
     cparams.auto_flid    = true;
@@ -3830,6 +3834,7 @@ llama_context * llama_init_from_model(
         auto * ctx = new llama_context(*model, params);
 
 #ifdef GGML_USE_CUDA
+#ifdef DEN_NVFP4_KV
         // Auto-enable NVFP4 KV for Ornith/qwen35 models (Gap 9c)
         // DEN_NVFP4_KV_CACHE=0 disables even for auto-enable models
         bool nvfp4_auto = (model->arch == LLM_ARCH_QWEN35 ||
@@ -3860,6 +3865,7 @@ llama_context * llama_init_from_model(
                 }
             }
         }
+#endif // DEN_NVFP4_KV
 #endif
 
         return ctx;
@@ -4131,7 +4137,7 @@ void llama_memory_clear(llama_memory_t mem, bool data) {
     mem->clear(data);
 
     // Reset NVFP4 KV cache seq_len after warmup/clear (Gap 4)
-#ifdef GGML_USE_CUDA
+#if defined(GGML_USE_CUDA) && defined(DEN_NVFP4_KV)
     ggml_backend_cuda_nvfp4_kv_reset_all();
 #endif
 }

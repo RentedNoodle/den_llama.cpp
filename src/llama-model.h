@@ -689,9 +689,6 @@ struct llama_model {
     struct ggml_tensor * dspark_conf_proj   = nullptr;
     struct ggml_tensor * dspark_conf_proj_b = nullptr;
 
-    struct ggml_tensor * dflash_selector_prev   = nullptr;
-    struct ggml_tensor * dflash_selector_next   = nullptr;
-    struct ggml_tensor * dflash_selector_hidden = nullptr;
 
     // unified vector to store target-model extracted layer ids in eagle3, dflash, etc.
     std::vector<int32_t> target_layer_ids;

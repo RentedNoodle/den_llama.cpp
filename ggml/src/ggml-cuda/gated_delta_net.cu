@@ -316,10 +316,16 @@ static void ggml_cuda_op_gated_delta_net_impl(
 
     // D1 gate: DEN_GDN_FAST_EXP (default OFF) selects the FMA-rate exp2 polynomial.
     // Opt-in only; the default path stays bit-identical to expf.
+    // DEN_GDN_FAST_EXP can also be fixed at configure time via -DDEN_GDN_FAST=ON,
+    // which compiles the env-var check out entirely.
+#ifdef DEN_GDN_FAST_EXP
+    static constexpr bool fast_exp = true;
+#else
     static const bool fast_exp = []() {
         const char * e = getenv("DEN_GDN_FAST_EXP");
         return e != nullptr && e[0] != '\0' && e[0] != '0';
     }();
+#endif
 
     if (kda) {
         if (keep_rs) {

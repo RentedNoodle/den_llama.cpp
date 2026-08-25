@@ -394,6 +394,7 @@ void llama_model_qwen35::load_arch_tensors(llama_model_loader & ml) {
         layer.ffn_up   = create_tensor(tn(LLM_TENSOR_FFN_UP,   "weight", il), {n_embd,   n_ff}, layer.escha_ffn_up.code ? TENSOR_NOT_REQUIRED : flags);
     };
 
+#ifdef DEN_QWEN35_MTP
     auto load_block_mtp = [&](int il) {
         auto & layer = layers[il];
 
@@ -418,18 +419,27 @@ void llama_model_qwen35::load_arch_tensors(llama_model_loader & ml) {
         layer.nextn.shared_head_head = create_tensor(tn(LLM_TENSOR_NEXTN_SHARED_HEAD_HEAD, "weight", il), { n_embd, n_vocab },     mtp_flags|TENSOR_NOT_REQUIRED);
         layer.nextn.shared_head_norm = create_tensor(tn(LLM_TENSOR_NEXTN_SHARED_HEAD_NORM, "weight", il), { n_embd },              mtp_flags|TENSOR_NOT_REQUIRED);
     };
+#endif // DEN_QWEN35_MTP
 
     for (int i = 0; i < n_layer; ++i) {
         load_block_trunk(i, trunk_flags);
     }
+#ifdef DEN_QWEN35_MTP
     for (int i = n_layer; i < n_layer_all; ++i) {
         load_block_mtp(i);
     }
+#else
+    (void) mtp_flags;
+#endif
 }
 
 std::unique_ptr<llm_graph_context> llama_model_qwen35::build_arch_graph(const llm_graph_params & params) const {
     if (params.gtype == LLM_GRAPH_TYPE_DECODER_MTP) {
+#ifdef DEN_QWEN35_MTP
         return std::make_unique<graph_mtp>(*this, params);
+#else
+        throw std::runtime_error("qwen35 MTP draft head not compiled in this build (DEN_QWEN35_MTP=OFF)");
+#endif
     }
     return std::make_unique<graph>(*this, params);
 }
@@ -868,6 +878,7 @@ ggml_tensor * llama_model_qwen35::graph::build_layer_ffn(ggml_tensor * cur, cons
 }
 
 // LLM_GRAPH_TYPE_DECODER_MTP draft head for Qwen3.5/3.6 dense series
+#ifdef DEN_QWEN35_MTP
 llama_model_qwen35::graph_mtp::graph_mtp(const llama_model & model, const llm_graph_params & params)
     : llm_graph_context(params) {
     GGML_ASSERT(hparams.n_layer_nextn > 0 && "QWEN35 MTP requires n_layer_nextn > 0");
@@ -1044,3 +1055,4 @@ llama_model_qwen35::graph_mtp::graph_mtp(const llama_model & model, const llm_gr
     res->t_logits = cur;
     ggml_build_forward_expand(gf, cur);
 }
+#endif // DEN_QWEN35_MTP

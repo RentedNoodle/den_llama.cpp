@@ -50,6 +50,9 @@ endif()
 
 option(LLAMA_USE_SYSTEM_GGML "Use system libggml" OFF)
 
+# Den compile-time feature gates (DEN_* options + compile definitions)
+include(${CMAKE_CURRENT_SOURCE_DIR}/cmake/DenFeatures.cmake)
+
 option(LLAMA_WASM_MEM64 "llama: use 64-bit memory in WASM builds" ON)
 
 if (EMSCRIPTEN)
