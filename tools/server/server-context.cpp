@@ -49,6 +49,22 @@ static common_speculative_output_limits server_output_limits(const common_params
     auto result = common_speculative_get_output_limits(
             params.n_batch, params.n_parallel, common_speculative_n_max(&params.speculative));
 
+    // dflash/dspark decode each sequence's full noise block in one pass:
+    // anchor + n_max masks (+1) outputs per seq — must mirror the sizing done
+    // in common_base_params_to_speculative(), or the target context's output
+    // budget undershoots the verification batch.
+    const bool has_block_draft = std::any_of(
+        params.speculative.types.begin(), params.speculative.types.end(),
+        [](common_speculative_type t) {
+            return t == COMMON_SPECULATIVE_TYPE_DRAFT_DFLASH || t == COMMON_SPECULATIVE_TYPE_DRAFT_DSPARK;
+        });
+    if (has_block_draft) {
+        const int64_t per_seq = std::max<int64_t>(
+                result.per_seq, (int64_t) std::max(1, common_speculative_n_max(&params.speculative)) + 2);
+        result.total   = (int32_t) std::min<int64_t>((int64_t) params.n_batch, (int64_t) params.n_parallel * per_seq);
+        result.per_seq = (int32_t) std::min<int64_t>((int64_t) params.n_batch, per_seq);
+    }
+
     result.total   = std::max<int32_t>(1, result.total);
     result.per_seq = std::max<int32_t>(1, result.per_seq);
     return result;
@@ -2977,8 +2993,10 @@ private:
         });
 
         // generate the actual drafts (if any)
-        {
-            common_speculative_draft(spec.get());
+        if (!drafting.empty()) {
+            queue_tasks.yield_to_queue([&]() {
+                common_speculative_draft(spec.get());
+            });
         }
 
         // make checkpoints if needed
@@ -3444,7 +3462,8 @@ private:
                         // add the mtmd chunk to cache
                         {
                             const auto & chunk = input_tokens.find_chunk(cur_token_idx);
-                            slot.prompt.tokens.push_back(chunk.get()); // copy
+                            // the chunk is already in the KV cache at this point, so we don't need to keep its data around
+                            slot.prompt.tokens.push_back_placeholder(chunk.get());
                         }
 
                         has_mtmd = true;
@@ -3622,6 +3641,7 @@ private:
 
         // decode on the worker thread, so we can still handle metrics tasks while waiting
         // note: the sync is done here too, so that the wait also happens off the main thread
+        // yield to the queue, so we can still handle metrics tasks while decoding
         int ret = 0;
         queue_tasks.yield_to_queue([&]() {
             const auto t0 = std::chrono::steady_clock::now();
@@ -3692,11 +3712,18 @@ private:
         // TODO: avoid restoring the draft context and re-evaluating the drafted tokens when not needed [TAG_SPEC_AVOID_DRAFT_REEVAL]
         //       for now, always re-evaluate for simplicity
         //       ref: https://github.com/ggml-org/llama.cpp/pull/22728#issuecomment-4400925384
-        if (!common_speculative_process(spec.get(), batch_view)) {
-            SRV_ERR("%s", "failed to process speculative batch\n");
+        if (spec) {
+            bool ok = true;
+            queue_tasks.yield_to_queue([&]() {
+                ok = common_speculative_process(spec.get(), batch_view);
+            });
 
-            // TODO: handle error
-            throw std::runtime_error("failed to process speculative batch");
+            if (!ok) {
+                SRV_ERR("%s", "failed to process speculative batch\n");
+
+                // TODO: handle error
+                throw std::runtime_error("failed to process speculative batch");
+            }
         }
 
         // handle `n_cmpl > 1` tasks - when the main prompt is processed, activate all child tasks too
@@ -3905,6 +3932,7 @@ private:
                         // partial acceptance is not supported by the context -> truncate the draft and restore the state
                         slot.spec_is_replay = true;
                         slot.spec_draft = std::move(accepted);
+                        slot.spec_dists.clear();
 
                         const auto & ckpt = slot.spec_ckpt;
 
@@ -3932,6 +3960,7 @@ private:
                 common_speculative_accept(spec.get(), slot.id, accepted.size() - 1);
 
                 slot.spec_draft = std::move(accepted);
+                slot.spec_dists.clear();
             }
 
             const auto ids = std::move(slot.spec_draft);

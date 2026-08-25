@@ -468,6 +468,8 @@ struct common_sampler * common_sampler_init(
         params.backend_sampling = false;
     }
 
+    // Keep verifier randomness independent from both target and draft sampling.
+    const uint32_t speculative_seed = llama_sampler_get_seed(chain) ^ 0x9e3779b9U;
     auto * result = new common_sampler {
         /* .params  = */ params,
         /* .grmr    = */ grmr,
@@ -845,6 +847,19 @@ std::vector<llama_token> common_sampler_sample_and_accept_n(struct common_sample
     }
 
     return common_sampler_sample_and_accept_n(gsmpl, ctx, idxs, draft, grammar_first);
+}
+
+std::vector<llama_token> common_sampler_sample_and_accept_n(
+        struct common_sampler * gsmpl,
+        struct llama_context * ctx,
+        const llama_tokens & draft,
+        const std::vector<common_speculative_token_dist> & dists,
+        bool grammar_first) {
+    std::vector<int> idxs(draft.size() + 1);
+    for (size_t i = 0; i < idxs.size(); ++i) {
+        idxs[i] = i;
+    }
+    return common_sampler_sample_and_accept_n(gsmpl, ctx, idxs, draft, dists, grammar_first);
 }
 
 uint32_t common_sampler_get_seed(const struct common_sampler * gsmpl) {
