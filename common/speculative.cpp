@@ -2441,9 +2441,9 @@ common_params common_base_params_to_speculative(const common_params & params) {
         result.n_outputs_max = params.n_parallel * per_seq;
         result.n_batch  = std::max(result.n_batch,  result.n_outputs_max);
         result.n_ubatch = std::max(result.n_ubatch, result.n_outputs_max);
-        if (params_spec.backend_sampling) {
-            result.n_outputs_max_per_seq = per_seq;
-        }
+        // required in CLI mode too (backend_sampling is false there) — the anchor-first
+        // block submits n_max+1 outputs per seq and the budget must cover it
+        result.n_outputs_max_per_seq = per_seq;
     }
 
     return result;
