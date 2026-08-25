@@ -1156,48 +1156,6 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
             llama_synchronize(ctx_dft);
         }
 
-            llama_batch enc_batch = {
-                /*.n_tokens =*/ n_chunk,
-                /*.token    =*/ nullptr,
-                /*.embd     =*/ features_buf.data(),
-                /*.pos      =*/ nullptr,
-                /*.n_seq_id =*/ nullptr,
-                /*.seq_id   =*/ nullptr,
-                /*.logits   =*/ nullptr,
-            };
-
-            int32_t rc = llama_encode(ctx_dft, enc_batch);
-            if (rc != 0) {
-                LOG_ERR("%s: llama_encode(ctx_dft) failed rc=%d (n_tokens=%d, offset=%d)\n",
-                        __func__, rc, (int) n_chunk, (int) offset);
-                return false;
-            }
-
-            const float * inp_g = llama_get_embeddings_nextn(ctx_dft);
-            GGML_ASSERT(inp_g && "DFlash encoder produced no output.");
-
-            batch_inject.n_tokens = n_chunk;
-            std::memcpy(batch_inject.embd, inp_g, (size_t) n_chunk * n_embd_dec * sizeof(float));
-            for (int32_t i = 0; i < n_chunk; ++i) {
-                const int32_t j = offset + i;
-                GGML_ASSERT(batch_in.n_seq_id[j] == 1);
-                const llama_seq_id seq_id = batch_in.seq_id[j][0];
-                GGML_ASSERT(seq_id >= 0 && seq_id < (llama_seq_id) n_seq);
-                batch_inject.pos[i]       = batch_in.pos[j];
-                batch_inject.n_seq_id[i]  = 1;
-                batch_inject.seq_id[i][0] = seq_id;
-                batch_inject.logits[i]    = false;
-            }
-
-            rc = llama_decode(ctx_dft, batch_inject);
-            if (rc != 0) {
-                LOG_ERR("%s: llama_decode(ctx_dft) failed rc=%d (n_tokens=%d, offset=%d)\n",
-                        __func__, rc, (int) n_chunk, (int) offset);
-                return false;
-            }
-            // The server may switch contexts before the next draft decode.
-            llama_synchronize(ctx_dft);
-        }
         return true;
     }
 
@@ -1278,64 +1236,6 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
                 // mask-first layouts start at slot 1
                 const int32_t i_draft_beg = sample_from_anchor ? 0 : 1;
                 for (int32_t i = i_draft_beg; i < n_block_tokens; ++i) {
-                    const float * row = lattice + (size_t) (beg + i) * n_embd_dec;
-                    const float * scores = row + selector_top_k + (size_t) predecessor * selector_top_k;
-
-                    if (dp.temperature > 0.0f) {
-                        common_speculative_token_dist dist;
-                        dist.ids.resize(selector_top_k);
-                        dist.probs.resize(selector_top_k);
-                        const float max_score = *std::max_element(scores, scores + selector_top_k);
-                        float sum = 0.0f;
-                        for (int32_t k = 0; k < selector_top_k; ++k) {
-                            dist.ids[k] = (llama_token) row[k];
-                            dist.probs[k] = std::exp((scores[k] - max_score) / dp.temperature);
-                            sum += dist.probs[k];
-                        }
-                        for (float & p : dist.probs) {
-                            p /= sum;
-                        }
-                        std::discrete_distribution<int32_t> sample(dist.probs.begin(), dist.probs.end());
-                        predecessor = sample(selector_rng[seq_id]);
-                        result.push_back(dist.ids[predecessor]);
-                        dp.dists->push_back(std::move(dist));
-                    } else {
-                        predecessor = (int32_t) std::distance(scores,
-                                std::max_element(scores, scores + selector_top_k));
-                        result.push_back((llama_token) row[predecessor]);
-                    }
-                }
-
-                if (result.size() < (size_t) params.n_min) {
-                    result.clear();
-                    if (dp.dists) {
-                        dp.dists->clear();
-                    }
-                }
-                continue;
-            }
-
-            if (is_dspark) {
-                // DSpark predicts the next token from position 0 and optionally truncates
-                // at the first position below the confidence threshold.
-                const float * conf = params.p_min > 0.0f ? llama_get_embeddings_nextn(ctx_dft) : nullptr;
-
-            if (is_dflash2) {
-                GGML_ASSERT(dp.temperature <= 0.0f || dp.dists);
-                const float * lattice = llama_get_embeddings_nextn(ctx_dft);
-                GGML_ASSERT(lattice && "DFlash2 selector produced no lattice");
-
-                if (selector_reset[seq_id]) {
-                    uint32_t seed = dp.seed;
-                    if (seed == LLAMA_DEFAULT_SEED) {
-                        seed = (uint32_t) std::chrono::high_resolution_clock::now().time_since_epoch().count();
-                    }
-                    selector_rng[seq_id].seed(seed ^ 0x85ebca6bU);
-                    selector_reset[seq_id] = false;
-                }
-
-                int32_t predecessor = 0;
-                for (int32_t i = 1; i < n_block_tokens; ++i) {
                     const float * row = lattice + (size_t) (beg + i) * n_embd_dec;
                     const float * scores = row + selector_top_k + (size_t) predecessor * selector_top_k;
 
@@ -2540,7 +2440,7 @@ common_params common_base_params_to_speculative(const common_params & params) {
         });
     if (has_block_draft) {
         // per-seq output positions: DFlash decodes anchor + n_max masks (n_max + 1); DSpark n_max -> +1 covers both
-        const int32_t per_seq = std::max(1, params_spec.n_max + 1);
+        const int32_t per_seq = std::max(1, params_spec.n_max + 2);
         result.n_outputs_max = params.n_parallel * per_seq;
         result.n_batch  = std::max(result.n_batch,  result.n_outputs_max);
         result.n_ubatch = std::max(result.n_ubatch, result.n_outputs_max);
