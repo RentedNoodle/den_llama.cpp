@@ -2422,6 +2422,17 @@ ggml_tensor * llm_graph_context::build_inp_embd(ggml_tensor * tok_embd) const {
         cur = ggml_view_2d(ctx0, cur, n_embd, n_tokens, cur->nb[1], 0);
     }
 
+    // activation steering: subtract refusal direction from embeddings (P8)
+    // the steering vector is set at init from a sidecar file; strength controls magnitude.
+    // reversible: remove the vector file = original behavior. works on ANY model.
+    if (cparams.has_steering && cparams.steering_vector && cparams.steering_n_embd == (int32_t) n_embd) {
+        ggml_tensor * steer = ggml_new_tensor_1d(ctx0, GGML_TYPE_F32, n_embd);
+        ggml_set_input(steer);
+        cb(steer, "steering_vec", -1);
+        auto steer_scaled = ggml_scale(ctx0, steer, cparams.steering_strength);
+        cur = ggml_sub(ctx0, cur, steer_scaled);
+    }
+
     res->t_inp_embd = cur;
 
     // For Granite architecture

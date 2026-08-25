@@ -8,6 +8,11 @@
 #define LLAMA_MAX_SEQ 256
 
 struct llama_cparams {
+    // activation steering: refusal direction subtracted from embeddings at inference
+    float *  steering_vector     = nullptr;  // [n_embd] host-side data
+    int32_t  steering_n_embd     = 0;
+    float    steering_strength   = 1.0f;
+    bool     has_steering        = false;
     uint32_t n_ctx;           // context size used during inference
     uint32_t n_ctx_seq;       // context for a single sequence
     uint32_t n_batch;
@@ -70,3 +75,4 @@ struct llama_cparams {
 
     llama_context * ctx_other;
 };
+
