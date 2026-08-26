@@ -2484,9 +2484,6 @@ common_params common_base_params_to_speculative(const common_params & params) {
         // required in CLI mode too (backend_sampling is false there) — the anchor-first
         // block submits n_max+1 outputs per seq and the budget must cover it
         result.n_outputs_max_per_seq = per_seq;
-        // dflash2 draft is non-causal — kvarn assumes causal+rotated, which corrupts
-        // the draft's K/V → garbage predictions → accept ~0. Force plain cache.
-        result.kvarn.type = LLAMA_KVARN_TYPE_DISABLED;
     }
 
     return result;
@@ -2522,6 +2519,13 @@ common_speculative_init_result::common_speculative_init_result(
     //       the extra memory for small models is likely negligible?
     cparams.n_rs_seq  = 0;
     cparams.ctx_other = ctx_tgt;
+    // beellama-pattern invariant (B1): structured/quantized KV extensions are
+    // TARGET-cache only — the draft context always runs a plain standard cache.
+    // kvarn (causal+rotated views) and the NVFP4-KV sidecar (causal absolute-
+    // position tracking) both assume causal decode; the dflash2 noise block is
+    // non-causal, so either extension corrupts the draft K/V → accept ~0.
+    cparams.kvarn.type       = LLAMA_KVARN_TYPE_DISABLED;
+    cparams.nvfp4_kv_enabled = false;
 
     std::string model_path;
     if (has_draft) {
