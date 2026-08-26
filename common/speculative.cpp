@@ -1243,9 +1243,12 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
                 }
 
                 int32_t predecessor = 0;
-                // bonus-anchor drafts (sample_from_anchor) carry a usable draft at slot 0;
-                // mask-first layouts start at slot 1
-                const int32_t i_draft_beg = sample_from_anchor ? 0 : 1;
+                // B1 accept fix: DFlash2 slot 0 is the COMMITTED ANCHOR, never a draft.
+                // Starting the lattice walk at 0 emitted one bogus leading draft every
+                // round -> whole verification block shifted by one -> accept = 0.00000.
+                // (Worktree-proven behavior: walk starts at 1. The slot-0-draft case only
+                // exists for DSPark bonus-anchor blocks, handled in the is_dspark branch.)
+                const int32_t i_draft_beg = 1;
                 for (int32_t i = i_draft_beg; i < n_block_tokens; ++i) {
                     const float * row = lattice + (size_t) (beg + i) * n_embd_dec;
                     const float * scores = row + selector_top_k + (size_t) predecessor * selector_top_k;
@@ -1275,8 +1278,11 @@ struct common_speculative_impl_draft_dflash : public common_speculative_impl {
                     }
                 }
 
-                // adaptive drafter: track confidence, adjust temperature for next cycle
-                if (!result.empty()) {
+                // adaptive drafter (P1 experiment): DISABLED by default — the temperature
+                // overwrite persisted past the draft cycle and its confidence read used a
+                // stale predecessor index. Opt in with DEN_ADAPTIVE_DRAFT=1 after re-validation.
+                static const int adaptive_draft_on = [](){ const char * e = getenv("DEN_ADAPTIVE_DRAFT"); return e && e[0] == '1'; }();
+                if (!result.empty() && adaptive_draft_on) {
                     float avg_conf = 0.0f;
                     int32_t conf_n = 0;
                     for (int32_t i = i_draft_beg; i < n_block_tokens; ++i) {

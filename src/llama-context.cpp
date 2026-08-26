@@ -3844,9 +3844,20 @@ llama_context * llama_init_from_model(
         // KVarN store owns the attention KV when requested — the legacy NVFP4-KV
         // sidecar would double-store and fight the kvarn views for the FA ops.
         const bool kvarn_owns_kv = params.kvarn.type != LLAMA_KVARN_TYPE_DISABLED;
-        bool nvfp4_wanted = !kvarn_owns_kv &&
+        // A1 guard: the sidecar's tile/dequant buffers are FIXED allocations sized to
+        // its internal max-seq cap (4096). A context beyond the cap makes every store
+        // fail ("seq_pos out of range") and crawls prefill to ~5 t/s. Auto-disable
+        // until the sidecar gains lazy/streaming allocation. Keep in sync with
+        // DEN_NVFP4_KV_MAX_SEQ in ggml/src/ggml-cuda/fattn-nvfp4-kv.cuh.
+        constexpr uint32_t DEN_NVFP4_KV_MAX_SEQ_LIMIT = 4096;
+        const bool ctx_within_sidecar = llama_n_ctx_seq(ctx) <= DEN_NVFP4_KV_MAX_SEQ_LIMIT;
+        bool nvfp4_wanted = !kvarn_owns_kv && ctx_within_sidecar &&
                             ((params.nvfp4_kv_enabled && !nvfp4_env_off) ||
                              (nvfp4_auto && !nvfp4_env_off));
+        if (!ctx_within_sidecar && nvfp4_env_off == false && getenv("DEN_NVFP4_KV_DEBUG")) {
+            LLAMA_LOG_INFO("%s: NVFP4-KV sidecar disabled: n_ctx_seq %u exceeds sidecar cap %u\n",
+                           __func__, (unsigned) llama_n_ctx_seq(ctx), (unsigned) DEN_NVFP4_KV_MAX_SEQ_LIMIT);
+        }
         if (nvfp4_wanted) {
             // declared in ggml-cuda.h with GGML_BACKEND_API (dllimport)
             uint32_t il0 = 0;
