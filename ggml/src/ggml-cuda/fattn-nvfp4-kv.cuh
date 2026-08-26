@@ -71,6 +71,7 @@ typedef struct {
     float  * d_k_dequant;    // [(max_seq - tail_tokens) * n_kv_heads * head_dim] F32 — dequantized K mirror
     float  * d_v_dequant;    // [(max_seq - tail_tokens) * n_kv_heads * head_dim] F32 — dequantized V mirror
     float  * h_readback;     // pinned host readback
+    float  * d_scores_scratch; // [max_seq] F32 global-mem score spill for seq_len > smem capacity (B2 128k fix)
     int seq_len;
     int max_seq;
     int tail_tokens;         // precision-tail size (latest N tokens kept F32); 0 => cache disabled

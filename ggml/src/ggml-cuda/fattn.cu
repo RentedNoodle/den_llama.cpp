@@ -605,6 +605,16 @@ static void ggml_cuda_flash_attn_ext_nvfp4_kv(ggml_backend_cuda_context & ctx, g
         ggml_cuda_flash_attn_ext_vec(ctx, dst);
         return;
     }
+    // B2 n_used-bound fix: the sidecar seq_len can drift past the actual used
+    // window (context shift, cache defrag, SWA). The K view's ne[2] IS the true
+    // n_kv for this batch — clamp the kernel to it so decode stays O(n_used).
+    {
+        const int n_kv_view = (int) dst->src[1]->ne[2];
+        const int cur_len   = den_nvfp4_kv_seq_len(&g_nvfp4_kv, il);
+        if (n_kv_view > 0 && n_kv_view < cur_len) {
+            den_nvfp4_kv_set_seq_len(&g_nvfp4_kv, il, n_kv_view);
+        }
+    }
     const float * d_Q = (const float *)dst->src[0]->data;
     float * d_output = (float *)dst->data;
     int n_heads = (int)dst->src[0]->ne[2];

@@ -438,6 +438,7 @@ __global__ void kv_nvfp4_attention_kernel(
     const float * __restrict__ d_k_dequant,
     const float * __restrict__ d_v_dequant,
     float * __restrict__ d_output,
+    float * __restrict__ d_scores_global,  // B2: global spill when seq_len exceeds smem capacity
     int n_heads, int n_kv_heads, int head_dim,
     int seq_len, int max_seq, int tail_tokens)
 {
@@ -464,8 +465,18 @@ __global__ void kv_nvfp4_attention_kernel(
     float inv_sqrt_hd = 1.0f / sqrtf((float)head_dim);
     int tid = threadIdx.x;
     float q_val = d_Q[(size_t)head * head_dim + tid];
-    float * smem_scores = smem;
-    float * warp_sums   = smem + seq_len;
+    int   n_warps_smem = (head_dim + 31) / 32;
+
+    // B2 128k fix: scores live in shared memory when they fit (fast path),
+    // otherwise spill to the per-layer global scratch buffer. Warp sums always
+    // stay in smem (n_warps floats — tiny).
+    float * warp_sums   = smem;
+    float * smem_scores = d_scores_global ? (smem + n_warps_smem) : nullptr;
+    if (!d_scores_global) {
+        smem_scores = smem + n_warps_smem;
+    } else {
+        smem_scores = d_scores_global + (size_t)head * max_seq;
+    }
 
     // Phase 1: Q @ K^T for all cached tokens
     for (int t = 0; t < seq_len; t++) {
@@ -779,6 +790,7 @@ int den_nvfp4_kv_init(den_nvfp4_kv_cache * cache,
             if (cudaMalloc(&layer->d_v_tiles, v_tiles_per_layer) != cudaSuccess) goto fail;
             if (cudaMalloc(&layer->d_scratch_tile, (size_t)n_kv_heads * k_tile_bytes) != cudaSuccess) goto fail;
             if (cudaMalloc(&layer->d_k_dequant, dequant_per_layer) != cudaSuccess) goto fail;
+        if (cudaMalloc(&layer->d_scores_scratch, (size_t)max_seq * sizeof(float)) != cudaSuccess) goto fail;
             if (cudaMalloc(&layer->d_v_dequant, dequant_per_layer) != cudaSuccess) goto fail;
         }
 
@@ -959,8 +971,16 @@ int den_nvfp4_kv_attention(den_nvfp4_kv_cache * cache, int layer,
     if (seq_len < 1) return -1;
 
     int n_warps_smem = (cache->head_dim + 31) / 32;
-    size_t smem_bytes = ((size_t)seq_len + (size_t)n_warps_smem) * sizeof(float);
-    if (smem_bytes > DEN_SMEM_MAX_BYTES) smem_bytes = DEN_SMEM_MAX_BYTES;
+
+    // B2 128k fix: scores fit in dynamic smem only up to ~24.8k positions on
+    // GB203 (DEN_SMEM_MAX_BYTES = 101376). Past that, spill scores to the
+    // per-layer global scratch buffer instead of clamping smem and indexing
+    // past the allocation (the old silent-corruption cliff).
+    size_t smem_needed = ((size_t)seq_len + (size_t)n_warps_smem) * sizeof(float);
+    bool   spill       = smem_needed > DEN_SMEM_MAX_BYTES;
+    float * d_spill    = spill ? kv_layer->d_scores_scratch : nullptr;
+    if (spill && !d_spill) return -1; // scratch not allocated — refuse rather than corrupt
+    size_t smem_bytes  = spill ? ((size_t)n_warps_smem * sizeof(float)) : smem_needed;
 
     // Always run attention on the caller's main compute stream when provided.
     // d_output is read by the NEXT graph node on the main compute stream, so the
@@ -977,6 +997,7 @@ int den_nvfp4_kv_attention(den_nvfp4_kv_cache * cache, int layer,
         kv_layer->d_k_tail, kv_layer->d_v_tail,
         kv_layer->d_k_dequant, kv_layer->d_v_dequant,
         d_output,
+        d_spill,
         n_heads, cache->n_kv_heads, cache->head_dim,
         seq_len, kv_layer->max_seq, kv_layer->tail_tokens);
 
@@ -1090,7 +1111,8 @@ void den_nvfp4_kv_free(den_nvfp4_kv_cache * cache) {
         if (layer->d_k_tiles)     cudaFree(layer->d_k_tiles);
         if (layer->d_v_tiles)     cudaFree(layer->d_v_tiles);
         if (layer->d_scratch_tile)cudaFree(layer->d_scratch_tile);
-        if (layer->d_k_dequant)   cudaFree(layer->d_k_dequant);
+        if (layer->d_k_dequant)           cudaFree(layer->d_k_dequant);
+        if (layer->d_scores_scratch) cudaFree(layer->d_scores_scratch);
         if (layer->d_v_dequant)   cudaFree(layer->d_v_dequant);
         if (layer->h_readback)    cudaFreeHost(layer->h_readback);
     }
