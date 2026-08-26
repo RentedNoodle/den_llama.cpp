@@ -1360,6 +1360,7 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
             LLAMA_LOG_DEBUG("load_tensors: layer %3d assigned to device %s, is_swa = %d\n", il, ggml_backend_dev_name(cpu_dev), is_swa);
             return {cpu_dev, &pimpl->cpu_buft_list};
         }
+        LLAMA_LOG_INFO("%s: TRACE-A il=%d i_gpu_start=%d act_gpu=%d n_dev=%zu\n", __func__, il, i_gpu_start, act_gpu_layers, n_devices());
         const int layer_gpu = std::upper_bound(splits.begin(), splits.begin() + n_devices(), float(il - i_gpu_start)/act_gpu_layers) - splits.begin();
         auto * dev = devices.at(layer_gpu).dev;
         LLAMA_LOG_DEBUG("load_tensors: layer %3d assigned to device %s, is_swa = %d\n", il, ggml_backend_dev_name(dev), is_swa);
@@ -1377,7 +1378,9 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
     }
 
     // assign the output layer
+    LLAMA_LOG_INFO("%s: TRACE-B output layer assign n_layer_all=%d\n", __func__, n_layer_all);
     pimpl->dev_output = get_layer_buft_list(n_layer_all);
+    LLAMA_LOG_INFO("%s: TRACE-C output layer assigned OK\n", __func__);
 
     const auto TENSOR_NOT_REQUIRED = llama_model_loader::TENSOR_NOT_REQUIRED;
 

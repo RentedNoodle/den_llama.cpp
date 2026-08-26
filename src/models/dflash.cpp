@@ -5,6 +5,7 @@
 #include "llama-kv-cache-iswa.h"
 
 void llama_model_dflash::load_arch_hparams(llama_model_loader & ml) {
+    LLAMA_LOG_WARN("[DF-TRACE] hparams begin\n");
 
     ml.get_key(LLM_KV_ATTENTION_LAYERNORM_RMS_EPS, hparams.f_norm_rms_eps);
     ml.get_key(LLM_KV_LOGIT_SCALE,                  hparams.f_logit_scale, false);
@@ -21,6 +22,7 @@ void llama_model_dflash::load_arch_hparams(llama_model_loader & ml) {
     if (!ml.get_arr(LLM_KV_TARGET_LAYERS, target_layer_ids, false)) {
         throw std::runtime_error("DFlash model requires 'target_layers' in GGUF metadata");
     }
+    LLAMA_LOG_WARN("[DF-TRACE] target_layers loaded size=%zu\n", target_layer_ids.size());
 
     hparams.n_embd_inp_enc_impl = (uint32_t) target_layer_ids.size() * hparams.n_embd;
 
@@ -52,6 +54,17 @@ void llama_model_dflash::load_arch_hparams(llama_model_loader & ml) {
         ml.get_key(LLM_KV_HYPER_CONNECTION_SINKHORN_ITERATIONS, hparams.dsv4_hc_sinkhorn_iters);
         ml.get_key(LLM_KV_HYPER_CONNECTION_EPSILON,             hparams.dsv4_hc_eps);
         ml.get_arr(LLM_KV_ATTENTION_COMPRESS_RATIOS,            hparams.dsv4_compress_ratios, false);
+        // B1 load-gate fix: dsv4_compress_ratios is optional in GGUF metadata; an empty or
+        // short array made the [il] loop below read out of bounds ("invalid vector subscript").
+        // Fail loudly with the expected-vs-actual length instead — that length IS the drafter's
+        // real n_layer_all when a GGUF ships mismatched metadata.
+        if (hparams.dsv4_compress_ratios.size() != hparams.n_layer_all) {
+            throw std::runtime_error(
+                "DSpark DSV4 draft: compress_ratios length mismatch (expected " +
+                std::to_string(hparams.n_layer_all) + ", got " +
+                std::to_string(hparams.dsv4_compress_ratios.size()) +
+                "); GGUF metadata malformed or drafter not a true DSV4 backbone");
+        }
 
         GGML_ASSERT(hparams.dsv4_o_group_count > 0); // avoid div by zero
 

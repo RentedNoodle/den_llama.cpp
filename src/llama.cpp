@@ -319,9 +319,12 @@ static std::pair<int, llama_model *> llama_model_load(struct gguf_context * meta
             params.check_tensors, params.no_alloc, params.load_mtp, params.kv_overrides, params.tensor_buft_overrides);
 
         ml.print_info();
+        LLAMA_LOG_WARN("[LOAD-TRACE] creating model\n");
         std::unique_ptr<llama_model> model_ptr(llama_model_create(ml, params));
+        LLAMA_LOG_WARN("[LOAD-TRACE] model created\n");
 
         bool ok = llama_prepare_model_devices(params, model_ptr.get());
+        LLAMA_LOG_WARN("[LOAD-TRACE] devices prepared ok=%d\n", (int)ok);
         if (!ok) {
             return {-1, nullptr};
         }
@@ -341,6 +344,7 @@ static std::pair<int, llama_model *> llama_model_load(struct gguf_context * meta
         model->hparams.vocab_only = params.vocab_only;
         model->hparams.no_alloc   = params.no_alloc;
 
+        LLAMA_LOG_WARN("[LOAD-TRACE] load_hparams begin\n");
         try {
             model->load_hparams(ml);
         } catch(const std::exception & e) {
@@ -349,6 +353,7 @@ static std::pair<int, llama_model *> llama_model_load(struct gguf_context * meta
         if (model->arch == LLM_ARCH_CLIP) {
             throw std::runtime_error("CLIP cannot be used as main model, use it with --mmproj instead");
         }
+        LLAMA_LOG_WARN("[LOAD-TRACE] load_vocab begin\n");
         try {
             model->load_vocab(ml);
         } catch(const std::exception & e) {
@@ -363,6 +368,7 @@ static std::pair<int, llama_model *> llama_model_load(struct gguf_context * meta
             return {0, model_ptr.release()};
         }
 
+        LLAMA_LOG_WARN("[LOAD-TRACE] load_tensors begin\n");
         if (!model->load_tensors(ml)) {
             return {-2, nullptr};
         }
