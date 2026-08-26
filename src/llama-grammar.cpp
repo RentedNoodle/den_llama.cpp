@@ -1362,6 +1362,13 @@ void llama_grammar_apply_impl(const struct llama_grammar & grammar, llama_token_
         return;
     }
 
+    // Grammar exhausted (model went off-schema): release control and stream freely
+    // instead of masking everything (which forced empty output / EOS). This makes the
+    // constraint "give up gracefully" — the response text flows through unconstrained.
+    if (grammar.stacks.empty()) {
+        return;
+    }
+
     bool allow_eog = false;
     for (const auto & stack : grammar.stacks) {
         if (stack.empty()) {
