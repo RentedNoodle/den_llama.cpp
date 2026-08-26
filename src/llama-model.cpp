@@ -1361,8 +1361,20 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
             return {cpu_dev, &pimpl->cpu_buft_list};
         }
         LLAMA_LOG_INFO("%s: TRACE-A il=%d i_gpu_start=%d act_gpu=%d n_dev=%zu\n", __func__, il, i_gpu_start, act_gpu_layers, n_devices());
-        const int layer_gpu = std::upper_bound(splits.begin(), splits.begin() + n_devices(), float(il - i_gpu_start)/act_gpu_layers) - splits.begin();
+        int layer_gpu = std::upper_bound(splits.begin(), splits.begin() + n_devices(), float(il - i_gpu_start)/act_gpu_layers) - splits.begin();
+        // B1 fix: upper_bound on the final layer (or output layer il==n_layer_all) can return
+        // splits.end(), making layer_gpu == n_devices() -> devices.at(layer_gpu) throws
+        // "invalid vector subscript". Clamp to the last device and fall back to CPU gracefully.
+        if (layer_gpu >= (int) n_devices() || layer_gpu < 0) {
+            layer_gpu = (int) n_devices() - 1;
+        }
         auto * dev = devices.at(layer_gpu).dev;
+        // also guard the buft_list lookup: a draft/grafted model may not have a GPU buft
+        // for every device -> fall back to CPU rather than aborting the load.
+        if (pimpl->gpu_buft_list.find(dev) == pimpl->gpu_buft_list.end()) {
+            LLAMA_LOG_WARN("%s: no GPU buft for device, using CPU for layer %d\n", __func__, il);
+            return {cpu_dev, &pimpl->cpu_buft_list};
+        }
         LLAMA_LOG_DEBUG("load_tensors: layer %3d assigned to device %s, is_swa = %d\n", il, ggml_backend_dev_name(dev), is_swa);
         return {dev, &pimpl->gpu_buft_list.at(dev)};
     };
