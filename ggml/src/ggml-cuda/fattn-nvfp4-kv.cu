@@ -784,13 +784,15 @@ int den_nvfp4_kv_init(den_nvfp4_kv_cache * cache,
 
         if (cudaMalloc(&layer->d_k_tail, tail_bytes) != cudaSuccess) goto fail;
         if (cudaMalloc(&layer->d_v_tail, tail_bytes) != cudaSuccess) goto fail;
+        // B2 score-spill scratch: allocated unconditionally — attention may need
+        // global scores even when tile_count == 0 (all-tail cache).
+        if (cudaMalloc(&layer->d_scores_scratch, (size_t)cache->max_seq * sizeof(float)) != cudaSuccess) goto fail;
 
         if (tile_count > 0) {
             if (cudaMalloc(&layer->d_k_tiles, k_tiles_per_layer) != cudaSuccess) goto fail;
             if (cudaMalloc(&layer->d_v_tiles, v_tiles_per_layer) != cudaSuccess) goto fail;
             if (cudaMalloc(&layer->d_scratch_tile, (size_t)n_kv_heads * k_tile_bytes) != cudaSuccess) goto fail;
             if (cudaMalloc(&layer->d_k_dequant, dequant_per_layer) != cudaSuccess) goto fail;
-        if (cudaMalloc(&layer->d_scores_scratch, (size_t)max_seq * sizeof(float)) != cudaSuccess) goto fail;
             if (cudaMalloc(&layer->d_v_dequant, dequant_per_layer) != cudaSuccess) goto fail;
         }
 
