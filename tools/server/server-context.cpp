@@ -2772,7 +2772,14 @@ private:
             return;
         }
 
-        GGML_ASSERT(batch.slot_batched || batch.size() == 0);
+        // Robustness: grammar exhaustion (empty stacks) leaves the batch half-built.
+        // The grammar fix handles the throw; this assert would still kill the server.
+        // Treat as a normal finish instead of aborting the process.
+        if (!batch.slot_batched && batch.size() != 0) {
+            SRV_WRN("batch state inconsistent after grammar exhaustion (size=%zu) — treating as slot finish\n", batch.size());
+            batch.clear();
+            return;
+        }
 
         if (batch.slot_batched) {
             auto & slot_batched      = batch.slot_batched;

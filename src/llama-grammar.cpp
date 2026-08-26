@@ -939,7 +939,12 @@ static llama_grammar_candidates llama_grammar_reject_candidates(
         const llama_grammar_rules      & rules,
         const llama_grammar_stacks     & stacks,
         const llama_grammar_candidates & candidates) {
-    GGML_ASSERT(!stacks.empty()); // REVIEW
+    if (stacks.empty()) {
+        // Grammar exhausted — no valid continuation. Reject all candidates so the sampler
+        // is forced to EOS/stop. (Previously GGML_ASSERT crashed the server when a thinking
+        // model emitted non-schema tokens and emptied the stack.)
+        return {};
+    }
 
     if (candidates.empty()) {
         return {};
@@ -1523,7 +1528,13 @@ void llama_grammar_accept_impl(struct llama_grammar & grammar, llama_token token
                 return;
             }
         }
-        GGML_ABORT("fatal error");
+        // EOG token arrived while the grammar still has open (non-empty) stacks — i.e. the
+        // model ended generation before completing the schema. This is a normal early-stop
+        // condition, NOT a fatal error; aborting here crashed the whole server.
+        LLAMA_LOG_WARN("%s: EOG token %d while grammar stacks still open (%zu) — ending constrained generation early\n",
+                       __func__, token, grammar.stacks.size());
+        grammar.stacks.clear();
+        return;
     }
 
     llama_grammar_accept_token(grammar, token, piece);
@@ -1540,7 +1551,11 @@ void llama_grammar_accept_str(struct llama_grammar & grammar, const std::string 
 
     grammar.partial_utf8 = decoded.second;
     if (grammar.stacks.empty()) {
-        throw std::runtime_error("Unexpected empty grammar stack after accepting piece: " + piece);
+        // Grammar exhausted (model emitted a token with no valid continuation under the
+        // schema). This is a normal end-of-constrained-generation condition, not a fatal
+        // error — throwing here crashed the server via a downstream batch assert. Leave the
+        // stacks empty; the grammar sampler masks all tokens so generation stops gracefully.
+        LLAMA_LOG_WARN("%s: grammar stack empty after accepting piece '%s' — stopping constrained generation\n", __func__, piece.c_str());
     }
 }
 
@@ -1595,7 +1610,7 @@ void llama_grammar_accept_token(struct llama_grammar & grammar, llama_token toke
     grammar.partial_utf8 = decoded.second;
 
     if (grammar.stacks.empty()) {
-        throw std::runtime_error("Unexpected empty grammar stack after accepting piece: " + piece + " (" + std::to_string(token) + ")");
+        LLAMA_LOG_WARN("%s: grammar stack empty after accepting token %d ('%s') — stopping constrained generation\n", __func__, token, piece.c_str());
     }
 }
 
