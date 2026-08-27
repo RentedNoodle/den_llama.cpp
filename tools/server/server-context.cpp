@@ -1607,13 +1607,26 @@ private:
 
                 const int64_t t_start = ggml_time_us();
 
-                ret->prompt_save(*prompt_cache);
+                try {
+                    ret->prompt_save(*prompt_cache);
 
-                if (!ret->prompt_load(*prompt_cache, task.tokens)) {
+                    if (!ret->prompt_load(*prompt_cache, task.tokens)) {
+                        ret->prompt_clear();
+                    }
+
+                    prompt_cache->update();
+                } catch (const std::exception & err) {
+                    // Prompt-cache state save/restore is an optimization, not a
+                    // correctness requirement. Some cache backends (KVarN) throw on
+                    // state restore (e.g. a pending stream copy) and can leave the
+                    // cache partially mutated. A partial write corrupts the KVarN
+                    // cache and killed the multi-turn tool loop on the next decode.
+                    // Here we fully clear the slot (full seq_rm is supported) so a
+                    // failed prompt-cache op cannot carry corrupted state forward.
+                    SRV_WRN("%s: prompt cache save/load failed (%s) - clearing slot to avoid stale KV state\n",
+                            __func__, err.what());
                     ret->prompt_clear();
                 }
-
-                prompt_cache->update();
 
                 SRV_TRC("prompt cache update took %.2f ms\n", (ggml_time_us() - t_start) / 1000.0);
             }
