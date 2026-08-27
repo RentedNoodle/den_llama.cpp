@@ -1601,7 +1601,13 @@ done:
 static void common_context_seq_rm(llama_context * ctx, llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
     auto * mem = llama_get_memory(ctx);
     if (!llama_memory_seq_rm(mem, seq_id, p0, p1)) {
-        GGML_ABORT("%s", string_format("failed to remove sequence %d with p0=%d, p1=%d\n", seq_id, p0, p1).c_str());
+        // seq_rm is an optimization (free unused KV before a new prompt), not a
+        // correctness requirement — the slot recycles the cache on reuse anyway.
+        // Some cache backends (KVarN) can only remove complete sequences or the
+        // current/previous tail group; a partial-remove failure must NOT abort the
+        // whole server (that's what killed the multi-turn tool loop). Log and move on.
+        LOG_WRN("%s: seq_rm(%d, %d, %d) unsupported by cache backend — slot will recycle on reuse\n",
+                       __func__, seq_id, p0, p1);
     }
 }
 
