@@ -175,6 +175,17 @@ bool llama_memory_hybrid::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1
     if (!mem_recr->seq_rm(seq_id, p0, p1)) {
         return false;
     }
+    // DEN anti-stale-state: a full removal frees the sequence's DeltaNet (recurrent)
+    // and attention (KVarN) state but the buffer CONTENT is not zeroed, so a reused
+    // slot reads the prior request's state -> empty/garbage on the next decode
+    // (temperature=0 same prompt gave 4,4,empty...). llama.cpp (non-hybrid) is 6/6
+    // clean; den's hybrid split is the divergence. Zero BOTH parts' state buffers on
+    // a full remove so the next request starts from clean state. Guarded to rm_all
+    // to avoid clobbering live sequences during partial/rollback removal.
+    if (seq_id >= 0 && p0 == 0 && p1 == std::numeric_limits<llama_pos>::max()) {
+        mem_attn->clear(true);
+        mem_recr->clear(true);
+    }
     return mem_attn->seq_rm(seq_id, p0, p1);
 }
 
