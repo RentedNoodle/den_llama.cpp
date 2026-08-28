@@ -2288,8 +2288,15 @@ void common_prompt_checkpoint::update_tgt(
     data_tgt.resize(ckpt_size);
 
     const size_t n = llama_state_seq_get_data_ext(ctx, data_tgt.data(), ckpt_size, seq_id, flags);
+    if (n == 0) {
+        // Failed to get checkpoint data (e.g. race with concurrent decode) — clear and skip
+        data_tgt.clear();
+        return;
+    }
     if (n != ckpt_size) {
-        GGML_ABORT("checkpoint size mismatch: expected %zu, got %zu\n", ckpt_size, n);
+        // Size changed between get_size and get_data (KV grew) — use actual size
+        data_tgt.resize(n);
+        LOG_WRN("checkpoint size mismatch: expected %zu, got %zu — using actual\n", ckpt_size, n);
     }
 }
 
@@ -2306,8 +2313,13 @@ void common_prompt_checkpoint::update_dft(
     data_dft.resize(ckpt_size);
 
     const size_t n = llama_state_seq_get_data_ext(ctx, data_dft.data(), ckpt_size, seq_id, flags);
+    if (n == 0) {
+        data_dft.clear();
+        return;
+    }
     if (n != ckpt_size) {
-        GGML_ABORT("checkpoint size mismatch: expected %zu, got %zu\n", ckpt_size, n);
+        data_dft.resize(n);
+        LOG_WRN("checkpoint size mismatch: expected %zu, got %zu — using actual\n", ckpt_size, n);
     }
 }
 

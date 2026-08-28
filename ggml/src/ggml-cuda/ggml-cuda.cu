@@ -116,8 +116,13 @@ void ggml_cuda_error(const char * stmt, const char * func, const char * file, in
     GGML_LOG_ERROR(GGML_CUDA_NAME " error: %s\n", msg);
     GGML_LOG_ERROR("  current device: %d, in function %s at %s:%d\n", id, func, file, line);
     GGML_LOG_ERROR("  %s\n", stmt);
-    // abort with GGML_ABORT to get a stack trace
-    GGML_ABORT(GGML_CUDA_NAME " error");
+    GGML_LOG_ERROR("  -> DEN: recovering (logging error, clearing stream, continuing) instead of aborting\n");
+
+    // Recover instead of abort: clear the poisoned stream error so the next
+    // kernel launch is clean. If the error recurs the model may degrade, but
+    // the server stays up (was crashing the multi-turn tool loop at turn 4-5
+    // via a stream-poisoning kernel; the sync-point abort masked the real bug).
+    cudaGetLastError();
 }
 
 // map a (possibly virtual) device id to the physical CUDA device that backs it
