@@ -107,6 +107,32 @@ gated_delta_net_cuda(const float * q,
             q_reg[r] = q_t[i];
         }
 
+        // DEN fix (NInfer normalize_qk_lane): L2-normalize q and k so the Gated Delta Rule
+        // recurrence state = exp(g)*state + k*delta stays bounded across a long sequence.
+        // Without it the state grows unbounded and the q/k dot-product corrupts the logits
+        // -> empty/garbage output (the DeltaNet bug we chased all session). This is the principled
+        // equivalent of Atlas's SSM_STATE_MAX_NORM, preferred for our sm_120a (same as NInfer).
+        {
+            constexpr float kL2Eps = 1.0e-6f;
+            float ksum = 0.0f, qsum = 0.0f;
+            #pragma unroll
+            for (int r = 0; r < rows_per_lane; r++) {
+                ksum += k_reg[r] * k_reg[r];
+                qsum += q_reg[r] * q_reg[r];
+            }
+            ksum = warp_reduce_sum<warp_size>(ksum);
+            qsum = warp_reduce_sum<warp_size>(qsum);
+            const float kinv = lane == 0 ? rsqrtf(ksum + kL2Eps) : 0.0f;
+            const float qinv = lane == 0 ? rsqrtf(qsum + kL2Eps) : 0.0f;
+            const float k_inv = __shfl_sync(0xffffffff, kinv, 0);
+            const float q_inv = __shfl_sync(0xffffffff, qinv, 0);
+            #pragma unroll
+            for (int r = 0; r < rows_per_lane; r++) {
+                k_reg[r] *= k_inv;
+                q_reg[r] *= q_inv;
+            }
+        }
+
         if constexpr (!KDA) {
             const float g_val = den_gdn_expf<FAST_EXP>(*g_t);
 
