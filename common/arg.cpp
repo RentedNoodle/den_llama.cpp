@@ -3863,6 +3863,56 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_COMPLETION, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_THINK_BUDGET_MESSAGE"));
     add_opt(common_arg(
+        {"--reasoning-loop-guard"}, "MODE",
+        string_format("reasoning loop guard mode: off, force-close, or stop (default: %s)",
+            common_reasoning_loop_guard_mode_name(params.reasoning_loop_guard.mode)),
+        [](common_params & params, const std::string & value) {
+            params.reasoning_loop_guard.mode = common_reasoning_loop_guard_mode_from_name(value);
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_COMPLETION, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_REASONING_LOOP_GUARD"));
+    add_opt(common_arg(
+        {"--reasoning-loop-min-tokens"}, "N",
+        string_format("minimum hidden reasoning tokens before loop checks (default: %d)", params.reasoning_loop_guard.min_reasoning_tokens),
+        [](common_params & params, int value) {
+            params.reasoning_loop_guard.min_reasoning_tokens = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_COMPLETION, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_REASONING_LOOP_MIN_TOKENS"));
+    add_opt(common_arg(
+        {"--reasoning-loop-window"}, "N",
+        string_format("token tail window for reasoning loop checks (default: %d)", params.reasoning_loop_guard.window_tokens),
+        [](common_params & params, int value) {
+            params.reasoning_loop_guard.window_tokens = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_COMPLETION, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_REASONING_LOOP_WINDOW"));
+    add_opt(common_arg(
+        {"--reasoning-loop-max-period"}, "N",
+        string_format("maximum periodic loop length to check (default: %d)", params.reasoning_loop_guard.max_period),
+        [](common_params & params, int value) {
+            params.reasoning_loop_guard.max_period = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_COMPLETION, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_REASONING_LOOP_MAX_PERIOD"));
+    add_opt(common_arg(
+        {"--reasoning-loop-min-coverage"}, "N",
+        string_format("minimum repeated token coverage before loop trigger (default: %d)", params.reasoning_loop_guard.min_repeated_coverage),
+        [](common_params & params, int value) {
+            params.reasoning_loop_guard.min_repeated_coverage = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_COMPLETION, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_REASONING_LOOP_MIN_COVERAGE"));
+    add_opt(common_arg(
+        {"--reasoning-loop-check-interval"}, "N",
+        string_format("accepted-token interval between loop checks (default: %d)", params.reasoning_loop_guard.check_interval),
+        [](common_params & params, int value) {
+            params.reasoning_loop_guard.check_interval = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_COMPLETION, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_REASONING_LOOP_CHECK_INTERVAL"));
+    add_opt(common_arg(
+        {"--reasoning-loop-interventions"}, "N",
+        string_format("maximum force-close interventions before stop (default: %d)", params.reasoning_loop_guard.interventions_max),
+        [](common_params & params, int value) {
+            params.reasoning_loop_guard.interventions_max = value;
+        }
+    ).set_examples({LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_COMPLETION, LLAMA_EXAMPLE_CLI}).set_env("LLAMA_ARG_REASONING_LOOP_INTERVENTIONS"));
+    add_opt(common_arg(
         {"--reasoning-preserve"},
         {"--no-reasoning-preserve"},
         "preserve reasoning trace in the full history, not just the last assistant message (default: template default)\n"

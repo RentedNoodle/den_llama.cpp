@@ -50,3 +50,7 @@ const llama_tokens * common_reasoning_budget_get_end_match(const struct llama_sa
 // Manually transition the reasoning budget sampler into the FORCING state.
 // Returns true if the transition occurred.
 bool common_reasoning_budget_force(struct llama_sampler * smpl);
+
+// DEN: force the end sequence now regardless of the current session state
+// (used by the reasoning loop guard to force-close a stuck hidden-reasoning loop).
+bool common_reasoning_budget_force_end(struct llama_sampler * smpl);

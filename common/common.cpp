@@ -2367,3 +2367,56 @@ void common_prompt_checkpoint::clear_dft() {
     data_dft.clear();
     data_spec.clear();
 }
+
+// ---- DEN: reasoning loop guard (ported from beellama/Anbeeld) ----
+common_reasoning_loop_guard_mode common_reasoning_loop_guard_mode_from_name(const std::string & value) {
+    if (value == "off") {
+        return COMMON_REASONING_LOOP_GUARD_OFF;
+    }
+    if (value == "force-close") {
+        return COMMON_REASONING_LOOP_GUARD_FORCE_CLOSE;
+    }
+    if (value == "stop") {
+        return COMMON_REASONING_LOOP_GUARD_STOP;
+    }
+    throw std::invalid_argument("invalid reasoning-loop-guard, expected one of: off, force-close, stop");
+}
+
+const char * common_reasoning_loop_guard_mode_name(common_reasoning_loop_guard_mode value) {
+    switch (value) {
+        case COMMON_REASONING_LOOP_GUARD_OFF:         return "off";
+        case COMMON_REASONING_LOOP_GUARD_FORCE_CLOSE: return "force-close";
+        case COMMON_REASONING_LOOP_GUARD_STOP:        return "stop";
+    }
+    return "unknown";
+}
+
+void common_validate_reasoning_loop_guard_params(const common_reasoning_loop_guard_params & params) {
+    if (params.min_reasoning_tokens < 0) {
+        throw std::invalid_argument("reasoning-loop-min-tokens must be >= 0");
+    }
+    if (params.window_tokens <= 0) {
+        throw std::invalid_argument("reasoning-loop-window must be > 0");
+    }
+    if (params.max_period <= 0) {
+        throw std::invalid_argument("reasoning-loop-max-period must be > 0");
+    }
+    if (params.min_repeated_coverage <= 0) {
+        throw std::invalid_argument("reasoning-loop-min-coverage must be > 0");
+    }
+    if (params.check_interval <= 0) {
+        throw std::invalid_argument("reasoning-loop-check-interval must be > 0");
+    }
+    if (params.interventions_max < 0) {
+        throw std::invalid_argument("reasoning-loop-interventions must be >= 0");
+    }
+    if (params.window_tokens < params.min_repeated_coverage) {
+        throw std::invalid_argument("reasoning-loop-window must be >= reasoning-loop-min-coverage");
+    }
+    if (params.max_period > params.window_tokens / 3) {
+        throw std::invalid_argument("reasoning-loop-max-period must be <= reasoning-loop-window / 3");
+    }
+    if (params.min_repeated_coverage < params.max_period * 2) {
+        throw std::invalid_argument("reasoning-loop-min-coverage must be >= 2 * reasoning-loop-max-period");
+    }
+}

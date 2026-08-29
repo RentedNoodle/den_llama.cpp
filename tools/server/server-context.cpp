@@ -3,6 +3,7 @@
 #include "server-chat.h"
 #include "server-common.h"
 #include "server-http.h"
+#include "server-loop-guard.h"
 #include "server-task.h"
 #include "server-queue.h"
 #include "server-schema.h"
@@ -39,6 +40,31 @@
 using json = nlohmann::ordered_json;
 
 constexpr int HTTP_POLLING_SECONDS = 1;
+
+static std::string server_loop_guard_reason_to_string(const server_loop_guard_result & result) {
+    std::string reason = result.kind.empty() ? "unknown" : result.kind;
+    if (result.period > 0) {
+        reason += string_format(" period=%d", result.period);
+    }
+    if (result.coverage > 0) {
+        reason += string_format(" coverage=%d", result.coverage);
+    }
+    if (result.score > 0.0f) {
+        reason += string_format(" score=%.3f", (double) result.score);
+    }
+    return reason;
+}
+
+static bool server_accept_info_is_reasoning(const common_sampler_accept_info & info) {
+    // a generated token is "reasoning" while the budget sampler is counting/forcing the end of the
+    // hidden thinking section. Once the end sequence (or budget) completes, it becomes visible output.
+    const bool completing = info.reasoning_state_before == REASONING_BUDGET_COUNTING ||
+                            info.reasoning_state_before == REASONING_BUDGET_FORCING ||
+                            info.reasoning_state_after  == REASONING_BUDGET_COUNTING ||
+                            info.reasoning_state_after  == REASONING_BUDGET_FORCING ||
+                            info.reasoning_state_before == REASONING_BUDGET_WAITING_UTF8;
+    return completing;
+}
 
 static common_speculative_output_limits server_output_limits(const common_params & params) {
     if (params.embedding ||
@@ -267,12 +293,23 @@ struct server_slot {
 
     stop_type stop;
 
+    std::string stop_detail;
+
     std::string stopping_word;
 
     // state
     slot_state state = SLOT_STATE_IDLE;
 
     server_prompt prompt;
+
+    // DEN: reasoning loop guard (ported from beellama/Anbeeld)
+    server_loop_guard loop_guard;
+    int32_t loop_guard_interventions = 0;
+    bool    loop_guard_triggered = false;
+    std::string loop_guard_action;
+    std::string loop_guard_reason;
+    int32_t reasoning_output_tokens = 0;
+    int32_t visible_output_tokens = 0;
 
     bool prompt_save(server_prompt_cache & prompt_cache) const {
         if (prompt.tokens.size() == 0) {
@@ -355,7 +392,17 @@ struct server_slot {
         truncated      = false;
         stop           = STOP_TYPE_NONE;
         stopping_word  = "";
+        stop_detail    = "";
         n_sent_text    = 0;
+
+        // DEN: reset reasoning loop guard
+        loop_guard.reset();
+        loop_guard_interventions = 0;
+        loop_guard_triggered = false;
+        loop_guard_action = "";
+        loop_guard_reason = "";
+        reasoning_output_tokens = 0;
+        visible_output_tokens = 0;
 
         if (can_speculate()) {
             spec_draft.clear();
@@ -1762,6 +1809,15 @@ private:
                 send_error(task, err_msg, ERROR_TYPE_INVALID_REQUEST);
                 return false;
             }
+
+            // DEN: configure the reasoning loop guard for this task
+            slot.loop_guard.configure(task.params.reasoning_loop_guard);
+            slot.loop_guard_interventions = 0;
+            slot.loop_guard_triggered = false;
+            slot.loop_guard_action = "";
+            slot.loop_guard_reason = "";
+            slot.reasoning_output_tokens = 0;
+            slot.visible_output_tokens = 0;
 
             const bool need_pre_sample_logits = task.params.sampling.n_probs > 0 && !task.params.post_sampling_probs;
 
@@ -3867,7 +3923,51 @@ private:
 
             slot.i_batch = -1;
 
-            common_sampler_accept(slot.smpl.get(), id, true);
+            {
+                // DEN: reasoning loop guard (beellama port). Capture reasoning state via
+                // accept_with_info so we can detect a hidden-reasoning repetition loop and
+                // force-close the think section (or stop) instead of looping to empty content.
+                auto accept_info = common_sampler_accept_with_info(slot.smpl.get(), id, true);
+                const bool guard_on = slot.task &&
+                                      slot.task->params.reasoning_loop_guard.mode != COMMON_REASONING_LOOP_GUARD_OFF &&
+                                      slot.task->params.sampling.reasoning_budget_tokens >= 0;
+
+                if (guard_on && server_accept_info_is_reasoning(accept_info)) {
+                    slot.reasoning_output_tokens++;
+
+                    const bool forcing = accept_info.reasoning_state_before == REASONING_BUDGET_FORCING ||
+                                         accept_info.reasoning_state_after  == REASONING_BUDGET_FORCING;
+                    if (forcing) {
+                        // already forcing the end - let it complete
+                    } else {
+                        slot.loop_guard.accept(id, SERVER_LOOP_REGION_REASONING);
+                        const bool token_is_eog = llama_vocab_is_eog(vocab, id);
+                        if (slot.loop_guard.should_check(SERVER_LOOP_REGION_REASONING, token_is_eog, false)) {
+                            const auto check = slot.loop_guard.check(SERVER_LOOP_REGION_REASONING);
+                            if (check.triggered) {
+                                slot.loop_guard_triggered = true;
+                                slot.loop_guard_reason = server_loop_guard_reason_to_string(check);
+                                const auto & lg = slot.task->params.reasoning_loop_guard;
+                                if (lg.mode == COMMON_REASONING_LOOP_GUARD_FORCE_CLOSE &&
+                                        slot.loop_guard_interventions < lg.interventions_max &&
+                                        common_sampler_force_reasoning_end(slot.smpl.get())) {
+                                    slot.loop_guard_interventions++;
+                                    slot.loop_guard_action = "force-close";
+                                    SLT_WRN(slot, "reasoning loop guard force-closing hidden reasoning: %s\n", slot.loop_guard_reason.c_str());
+                                } else {
+                                    slot.loop_guard_action = "stop";
+                                    slot.stop = STOP_TYPE_LIMIT;
+                                    slot.stop_detail = "reasoning_loop_guard";
+                                    slot.has_next_token = false;
+                                    SLT_WRN(slot, "reasoning loop guard stopping generation: %s\n", slot.loop_guard_reason.c_str());
+                                }
+                            }
+                        }
+                    }
+                } else if (guard_on) {
+                    slot.visible_output_tokens++;
+                }
+            }
 
             // here we have synchronized the llama_context (due to the sampling above), so we can do time measurement
             const int64_t t_now = ggml_time_us();
@@ -4704,6 +4804,7 @@ void server_routes::init_routes() {
 
         task_params tparams;
         tparams.sampling = params.sampling;
+        tparams.reasoning_loop_guard = params.reasoning_loop_guard;
         json default_generation_settings_for_props = json {
             { "params", tparams.to_json(true) },
             { "n_ctx",  meta->slot_n_ctx },

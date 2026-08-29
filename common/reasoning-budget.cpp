@@ -308,3 +308,20 @@ bool common_reasoning_budget_force(struct llama_sampler * smpl) {
 
     return true;
 }
+
+bool common_reasoning_budget_force_end(struct llama_sampler * smpl) {
+    if (!smpl) {
+        return false;
+    }
+
+    auto * ctx = (common_reasoning_budget_ctx *) smpl->ctx;
+
+    // DEN (loop guard): force the end sequence now regardless of session state,
+    // so a stuck hidden-reasoning loop can always be closed.
+    ctx->state = REASONING_BUDGET_FORCING;
+    ctx->force_pos = 0;
+    ctx->end_matcher.reset();
+    COM_TRC("%s", "forced into forcing state (loop guard)\n");
+
+    return true;
+}

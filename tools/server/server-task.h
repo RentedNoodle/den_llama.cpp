@@ -77,6 +77,7 @@ struct task_params {
 
     struct common_params_sampling sampling;
     struct common_params_speculative speculative;
+    common_reasoning_loop_guard_params reasoning_loop_guard;  // DEN: reasoning loop guard (beellama port)
 
     // response formatting
     bool               verbose  = false;

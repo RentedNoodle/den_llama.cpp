@@ -450,6 +450,29 @@ enum common_reasoning_format {
     // see: https://github.com/ggml-org/llama.cpp/pull/15408
 };
 
+// DEN: reasoning loop guard (ported from beellama/Anbeeld). Detects periodic repetition
+// in hidden reasoning tokens and force-closes the think section (or stops generation).
+// Fixes the kvarn4+thinking-ON repetitive-reasoning loop -> empty content.
+enum common_reasoning_loop_guard_mode {
+    COMMON_REASONING_LOOP_GUARD_OFF,
+    COMMON_REASONING_LOOP_GUARD_FORCE_CLOSE,
+    COMMON_REASONING_LOOP_GUARD_STOP,
+};
+
+struct common_reasoning_loop_guard_params {
+    common_reasoning_loop_guard_mode mode = COMMON_REASONING_LOOP_GUARD_FORCE_CLOSE;
+    int32_t min_reasoning_tokens = 512;
+    int32_t window_tokens = 1024;
+    int32_t max_period = 128;
+    int32_t min_repeated_coverage = 256;
+    int32_t check_interval = 64;
+    int32_t interventions_max = 2;
+};
+
+common_reasoning_loop_guard_mode common_reasoning_loop_guard_mode_from_name(const std::string & value);
+const char * common_reasoning_loop_guard_mode_name(common_reasoning_loop_guard_mode value);
+void common_validate_reasoning_loop_guard_params(const common_reasoning_loop_guard_params & params);
+
 
 struct lr_opt {
     float    lr0          = 1e-5; // learning rate at first epoch
@@ -683,6 +706,7 @@ struct common_params {
     bool force_pure_content_parser = false;
     common_reasoning_format reasoning_format = COMMON_REASONING_FORMAT_DEEPSEEK;
     int enable_reasoning = -1; // -1 = auto, 0 = disable, 1 = enable
+    common_reasoning_loop_guard_params reasoning_loop_guard;
     bool prefill_assistant = true; // if true, any trailing assistant message will be prefilled into the response
     int sleep_idle_seconds = -1;   // if >0, server will sleep after this many seconds of idle time
 
