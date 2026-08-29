@@ -71,9 +71,15 @@ gated_delta_net_cuda(const float * q,
     float         s_shard[rows_per_lane];
     // state is stored transposed: M[col][i] = S[i][col], row col is contiguous
 
-    if (n_tokens > 1) {
-        ggml_cuda_pdl_sync();
-    }
+    // DEN fix: llama.cpp calls ggml_cuda_pdl_sync() unconditionally. A PDL
+    // launch overlaps this kernel with the previous one on the same stream, so
+    // this kernel MUST wait (cudaGridDependencySynchronize) for the prior kernel
+    // to finish writing the recurrent state before reading it. The old
+    // `if (n_tokens > 1)` guard skipped the sync on single-token decode (every
+    // autoregressive step), allowing the decode kernel to read state still being
+    // written -> race -> intermittent empty/garbage output. Always sync, even
+    // for n_tokens == 1.
+    ggml_cuda_pdl_sync();
 #pragma unroll
     for (int r = 0; r < rows_per_lane; r++) {
         const int i = r * warp_size + lane;
