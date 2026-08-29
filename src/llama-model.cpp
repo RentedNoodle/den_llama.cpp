@@ -1443,9 +1443,12 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
             ggml_backend_dev_memory(dev, &free, &total);
 
             // devices can return 0 bytes for free and total memory if they do not
-            // have any to report. in this case, we will use the host memory as a fallback
+            // have any to report, OR a GPU that is already filled by a previously
+            // loaded model reports total > 0 but free == 0. In either case we use
+            // host memory as a fallback so the split sum is never 0.
             // fixes: https://github.com/ggml-org/llama.cpp/issues/18577
-            if (free == 0 && total == 0) {
+            //        https://github.com/ggml-org/llama.cpp/issues/27454
+            if (free == 0) {
                 ggml_backend_dev_memory(cpu_dev, &free, &total);
             }
             splits[i] = free;
@@ -1455,13 +1458,22 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
     }
 
     // sum and normalize the splits to get the split points
-    float split_sum = 0.0f;
+    float     split_sum = 0.0f;
     for (size_t i = 0; i < n_devices(); ++i) {
         split_sum += splits[i];
         splits[i] = split_sum;
     }
-    for (size_t i = 0; i < n_devices(); ++i) {
-        splits[i] /= split_sum;
+    if (split_sum > 0.0f) {
+        for (size_t i = 0; i < n_devices(); ++i) {
+            splits[i] /= split_sum;
+        }
+    } else {
+        // degenerate: no device reported any free memory — fall back to an
+        // even split so the splits stay monotonic and end at 1.0 (fixes the
+        // NaN -> upper_bound=end() -> devices.at(n_devices()) out-of-range).
+        for (size_t i = 0; i < n_devices(); ++i) {
+            splits[i] = float(i + 1) / n_devices();
+        }
     }
 
     const int i_gpu_start = std::max(n_layer_all + 1 - n_gpu_layers, 0);
