@@ -30,6 +30,7 @@
 #include <cfloat>
 #include <cstdint>
 #include <cstring>
+#include <cstdlib>
 #include <cmath>
 #include <functional>
 #include <map>
@@ -1777,6 +1778,20 @@ bool llama_model_base::load_tensors(llama_model_loader & ml) {
             // indicate that this buffer contains weights
             // this is used by ggml_backend_sched to improve op scheduling: ops that use a weight are preferably scheduled to the backend that contains the weight
             ggml_backend_buffer_set_usage(buf.get(), GGML_BACKEND_BUFFER_USAGE_WEIGHTS);
+
+            if (getenv("GGML_CUDA_PREFER_MODEL_WEIGHTS") != nullptr) {
+                ggml_backend_buffer_type_t buft_weights = ggml_backend_buffer_get_type(buf.get());
+                ggml_backend_dev_t dev_weights = ggml_backend_buft_get_device(buft_weights);
+                if (dev_weights != nullptr) {
+                    ggml_backend_reg_t reg_weights = ggml_backend_dev_backend_reg(dev_weights);
+                    using prefer_device_fn_t = bool (*)(ggml_backend_buffer_t);
+                    auto * prefer_device_fn = (prefer_device_fn_t) ggml_backend_reg_get_proc_address(
+                        reg_weights, "ggml_backend_cuda_buffer_set_preferred_device");
+                    if (prefer_device_fn != nullptr) {
+                        (void) prefer_device_fn(buf.get());
+                    }
+                }
+            }
         }
 
         pimpl->ctxs_bufs.emplace_back(std::move(ctx_ptr), std::move(bufs));
@@ -2550,7 +2565,8 @@ llama_memory_i * llama_model::create_memory(const llama_memory_params & params, 
                             /* offload           */ cparams.offload_kqv,
                             /* unified           */ cparams.kv_unified,
                             /* filter_attn       */ std::move(filter_attn),
-                            /* filter_recr       */ std::move(filter_recr));
+                            /* filter_recr       */ std::move(filter_recr),
+                            /* kv stream stage   */ arch == LLM_ARCH_QWEN35 ? params.kv_stream_stage_bytes : 0);
                     }
                 } else {
                     llama_kv_cache::layer_filter_cb filter = nullptr;

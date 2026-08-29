@@ -1,4 +1,5 @@
 #include "llama-kv-cache.h"
+#include "llama-kv-stream-plan.h"
 
 #include "llama-impl.h"
 #include "llama-io.h"
@@ -9,6 +10,7 @@
 #include <array>
 #include <cassert>
 #include <cmath>
+#include <cstdlib>
 #include <cstring>
 #include <limits>
 #include <map>
@@ -80,7 +82,8 @@ llama_kv_cache::llama_kv_cache(
     const layer_filter_cb & filter,
     const  layer_reuse_cb & reuse,
     const  layer_share_cb & share,
-             const char *   name_tag) :
+             const char *   name_tag,
+                     size_t kv_stream_stage_bytes) :
     model(model), hparams(hparams), v_trans(v_trans),
     n_seq_max(n_seq_max), n_stream(unified ? 1 : n_seq_max), n_pad(n_pad), n_swa(n_swa), swa_type(swa_type),
     other(static_cast<llama_kv_cache *>(mem_other)),
@@ -163,6 +166,17 @@ llama_kv_cache::llama_kv_cache(
 
     const bool is_mla = hparams.is_mla();
 
+    ggml_backend_dev_t kv_stream_dev = nullptr;
+    ggml_backend_buffer_type_t kv_stream_buft = nullptr;
+    uint32_t kv_stream_layer_count = 0;
+    if (kv_stream_stage_bytes != 0) {
+        for (uint32_t il = 0; il < n_layer; ++il) {
+            if (hparams.has_kv(il) && (!filter || filter(il))) {
+                ++kv_stream_layer_count;
+            }
+        }
+    }
+
     for (uint32_t il = 0; il < n_layer; il++) {
         if (!hparams.has_kv(il)) {
             LLAMA_LOG_DEBUG("%s: layer %3d: does not have KV cache\n", __func__, il);
@@ -219,6 +233,69 @@ llama_kv_cache::llama_kv_cache(
             buft = ggml_backend_dev_buffer_type(dev);
 
             dev_name = ggml_backend_dev_name(dev);
+
+            if (kv_stream_stage_bytes != 0 && !hparams.no_alloc) {
+                if (kv_stream_dev != nullptr && kv_stream_dev != dev) {
+                    throw std::runtime_error("block KV streaming requires every attention layer on one CUDA device");
+                }
+
+                if (kv_stream_runtime.runtime == nullptr) {
+                    ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(dev);
+                    using runtime_new_fn_t = void * (*)(ggml_backend_dev_t, size_t, size_t, uint32_t);
+                    using runtime_free_fn_t = void (*)(void *);
+                    using buffer_type_fn_t = ggml_backend_buffer_type_t (*)(void *);
+                    using feedback_fn_t = kv_stream_runtime_owner::feedback_fn_t;
+                    using repartition_fn_t = kv_stream_runtime_owner::repartition_fn_t;
+                    using decode_layout_fn_t = kv_stream_runtime_owner::decode_layout_fn_t;
+                    using mark_dirty_rows_fn_t = kv_stream_runtime_owner::mark_dirty_rows_fn_t;
+
+                    auto * runtime_new_fn = (runtime_new_fn_t) ggml_backend_reg_get_proc_address(
+                        reg, "ggml_backend_cuda_kv_stream_runtime_new_for_device");
+                    auto * runtime_free_fn = (runtime_free_fn_t) ggml_backend_reg_get_proc_address(
+                        reg, "ggml_backend_cuda_kv_stream_runtime_free");
+                    auto * buffer_type_fn = (buffer_type_fn_t) ggml_backend_reg_get_proc_address(
+                        reg, "ggml_backend_cuda_kv_stream_buffer_type");
+                    auto * feedback_fn = (feedback_fn_t) ggml_backend_reg_get_proc_address(
+                        reg, "ggml_backend_cuda_kv_stream_feedback");
+                    auto * repartition_fn = (repartition_fn_t) ggml_backend_reg_get_proc_address(
+                        reg, "ggml_backend_cuda_kv_stream_repartition");
+                    auto * decode_layout_fn = (decode_layout_fn_t) ggml_backend_reg_get_proc_address(
+                        reg, "ggml_backend_cuda_kv_stream_set_decode_layout");
+                    auto * mark_dirty_rows_fn = (mark_dirty_rows_fn_t) ggml_backend_reg_get_proc_address(
+                        reg, "ggml_backend_cuda_kv_stream_mark_dirty_rows");
+
+                    if (runtime_new_fn == nullptr || runtime_free_fn == nullptr ||
+                            buffer_type_fn == nullptr || feedback_fn == nullptr ||
+                            repartition_fn == nullptr || decode_layout_fn == nullptr ||
+                            mark_dirty_rows_fn == nullptr) {
+                        throw std::runtime_error("block KV streaming requires the CUDA backend");
+                    }
+
+                    const size_t page_bytes = 256ULL*(
+                        ggml_row_size(type_k, n_embd_k_gqa) +
+                        ggml_row_size(type_v, n_embd_v_gqa));
+                    kv_stream_runtime.runtime = runtime_new_fn(
+                        dev, kv_stream_stage_bytes, page_bytes, kv_stream_layer_count);
+                    kv_stream_runtime.free_fn = runtime_free_fn;
+                    kv_stream_runtime.feedback_fn = feedback_fn;
+                    kv_stream_runtime.repartition_fn = repartition_fn;
+                    kv_stream_runtime.decode_layout_fn = decode_layout_fn;
+                    kv_stream_runtime.mark_dirty_rows_fn = mark_dirty_rows_fn;
+                    kv_stream_runtime.layer_count = kv_stream_layer_count;
+                    if (kv_stream_runtime.runtime == nullptr) {
+                        throw std::runtime_error("failed to create CUDA block KV streaming runtime");
+                    }
+
+                    kv_stream_buft = buffer_type_fn(kv_stream_runtime.runtime);
+                    if (kv_stream_buft == nullptr) {
+                        throw std::runtime_error("failed to obtain CUDA block KV streaming buffer type");
+                    }
+                    kv_stream_dev = dev;
+                }
+
+                buft = kv_stream_buft;
+                dev_name = ggml_backend_buft_name(buft);
+            }
         }
 
         LLAMA_LOG_DEBUG("%s: layer %3d: dev = %s\n", __func__, il, dev_name);
@@ -292,6 +369,19 @@ llama_kv_cache::llama_kv_cache(
         LLAMA_LOG_INFO("%s: %10s KV buffer size = %8.2f MiB\n", __func__, ggml_backend_buffer_name(buf), ggml_backend_buffer_get_size(buf)/1024.0/1024.0);
 
         ggml_backend_buffer_clear(buf, 0);
+        if (kv_stream_stage_bytes == 0 && getenv("GGML_CUDA_PREFER_KV_HOST") != nullptr && ggml_backend_buffer_get_size(buf) > 0) {
+            ggml_backend_dev_t dev_kv = ggml_backend_buft_get_device(buft);
+            if (dev_kv != nullptr) {
+                ggml_backend_reg_t reg_kv = ggml_backend_dev_backend_reg(dev_kv);
+                using prefer_host_fn_t = bool (*)(ggml_backend_buffer_t);
+                auto * prefer_host_fn = (prefer_host_fn_t) ggml_backend_reg_get_proc_address(
+                    reg_kv, "ggml_backend_cuda_buffer_set_preferred_host");
+                if (prefer_host_fn != nullptr) {
+                    (void) prefer_host_fn(buf);
+                }
+            }
+        }
+
         ctxs_bufs.emplace_back(std::move(ctx), buf);
     }
 
@@ -1207,6 +1297,125 @@ uint32_t llama_kv_cache::get_n_stream() const {
     return n_stream;
 }
 
+bool llama_kv_cache::kv_stream_adapt(uint32_t active_tokens, uint32_t query_tokens) {
+    auto & owner = kv_stream_runtime;
+    if (owner.runtime == nullptr || owner.feedback_fn == nullptr ||
+            owner.repartition_fn == nullptr || owner.decode_layout_fn == nullptr ||
+            owner.layer_count == 0) {
+        return false;
+    }
+
+    uint64_t deadline_samples = 0;
+    uint64_t deadline_misses = 0;
+    double copy_busy_ratio = 0.0;
+    uint32_t peak_occupancy = 0;
+    uint32_t ring_slots = 0;
+    uint32_t resident_pages = 0;
+    uint32_t controlled_pages = 0;
+    if (!owner.feedback_fn(owner.runtime,
+            &deadline_samples, &deadline_misses, &copy_busy_ratio,
+            &peak_occupancy, &ring_slots, &resident_pages, &controlled_pages)) {
+        return false;
+    }
+
+    const auto delta = llama_kv_stream_feedback_delta_make(
+        { deadline_samples, deadline_misses },
+        { owner.previous_deadline_samples, owner.previous_deadline_misses });
+    owner.previous_deadline_samples = deadline_samples;
+    owner.previous_deadline_misses = deadline_misses;
+    if (getenv("LLAMA_KV_STREAM_TRACE") != nullptr) {
+        LLAMA_LOG_WARN("%s: active %u, resident %u, ring %u, samples %llu, misses %llu, copy busy %.1f%%, peak %u\n",
+            __func__, active_tokens, resident_pages, ring_slots,
+            (unsigned long long) delta.deadline_samples,
+            (unsigned long long) delta.deadline_misses,
+            100.0*copy_busy_ratio, peak_occupancy);
+    }
+    const uint32_t active_pages = (active_tokens + 255)/256;
+    // Prompt chunks use the uniform layout because it grows without
+    // repartitioning. Decode-like microbatches concentrate the same page
+    // budget into fewer split layers, bounded by the ring working set so copy
+    // and compute can still overlap. A zero target restores prefill.
+    constexpr uint32_t MAX_DECODE_QUERY_TOKENS = 32;
+    const uint32_t decode_layout_pages =
+        query_tokens <= MAX_DECODE_QUERY_TOKENS && active_pages > resident_pages ?
+            active_pages : 0;
+    if (decode_layout_pages != owner.decode_layout_pages) {
+        if (!owner.decode_layout_fn(owner.runtime, decode_layout_pages)) {
+            LLAMA_LOG_WARN("%s: failed to select CUDA KV decode layout for %u active pages\n",
+                __func__, decode_layout_pages);
+            return false;
+        }
+        owner.decode_layout_pages = decode_layout_pages;
+    }
+    if (!delta.valid) {
+        owner.starved_evaluations = 0;
+        owner.overprovisioned_evaluations = 0;
+        LLAMA_LOG_WARN("%s: ignoring invalid CUDA feedback: %s\n",
+            __func__, delta.error.c_str());
+        return false;
+    }
+    if (!delta.has_evaluation || ring_slots == 0) {
+        return false;
+    }
+    if (getenv("GGML_CUDA_KV_STREAM_FIXED_RING_SLOTS") != nullptr) {
+        return false;
+    }
+    if (owner.minimum_ring_slots == 0) {
+        owner.minimum_ring_slots = ring_slots;
+    }
+
+    // No streaming pressure exists while every active page fits in the
+    // resident partition; preserve the current boundary without churn.
+    if (active_pages <= resident_pages) {
+        owner.starved_evaluations = 0;
+        owner.overprovisioned_evaluations = 0;
+        return false;
+    }
+
+    if (owner.evaluations_since_repartition != UINT32_MAX) {
+        ++owner.evaluations_since_repartition;
+    }
+    llama_kv_stream_partition_params params;
+    params.total_pool_pages = controlled_pages;
+    params.layer_count = owner.layer_count;
+    params.active_pages_per_layer = active_pages;
+    params.minimum_ring_slots = owner.minimum_ring_slots;
+    params.previous_resident_pages_per_layer = resident_pages;
+    params.previous_ring_slots = ring_slots;
+    params.deadline_miss_ratio = delta.deadline_miss_ratio;
+    params.copy_engine_busy_ratio = copy_busy_ratio;
+    params.ring_peak_occupancy_ratio =
+        std::min(1.0, double(peak_occupancy)/double(ring_slots));
+    params.starved_evaluations = owner.starved_evaluations;
+    params.overprovisioned_evaluations = owner.overprovisioned_evaluations;
+    params.evaluations_since_repartition =
+        owner.evaluations_since_repartition;
+
+    const auto partition = llama_kv_stream_partition_adapt(params);
+    if (!partition.valid) {
+        LLAMA_LOG_WARN("%s: ignoring invalid partition feedback: %s\n",
+            __func__, partition.error.c_str());
+        return false;
+    }
+    owner.starved_evaluations = partition.starved_evaluations;
+    owner.overprovisioned_evaluations = partition.overprovisioned_evaluations;
+    if (!partition.changed) {
+        return false;
+    }
+    if (!owner.repartition_fn(owner.runtime, partition.ring_slots)) {
+        LLAMA_LOG_WARN("%s: failed to move KV resident/ring boundary to %u slots\n",
+            __func__, partition.ring_slots);
+        return false;
+    }
+    owner.evaluations_since_repartition = 0;
+
+    LLAMA_LOG_WARN("%s: adaptive KV partition: resident pages/layer %u -> %u, ring slots %u -> %u, miss %.1f%%, copy busy %.1f%%\n",
+        __func__, resident_pages, partition.resident_pages_per_layer,
+        ring_slots, partition.ring_slots,
+        100.0*delta.deadline_miss_ratio, 100.0*copy_busy_ratio);
+    return true;
+}
+
 bool llama_kv_cache::get_has_shift() const {
     bool result = false;
 
@@ -1487,6 +1696,12 @@ void llama_kv_cache::set_input_k_idxs(ggml_tensor * dst, const llama_ubatch * ub
         for (uint32_t i = 0; i < sinfo.size(); ++i) {
             data[s*sinfo.size() + i] = offs + sinfo.idxs[s][i];
         }
+    }
+
+    if (kv_stream_runtime.runtime != nullptr) {
+        GGML_ASSERT(kv_stream_runtime.mark_dirty_rows_fn != nullptr);
+        GGML_ASSERT(kv_stream_runtime.mark_dirty_rows_fn(
+            kv_stream_runtime.runtime, data, n_tokens));
     }
 }
 

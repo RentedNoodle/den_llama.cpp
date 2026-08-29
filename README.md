@@ -1,3 +1,78 @@
+# Adaptive KV Streaming for llama.cpp
+
+This branch adds an experimental, block-granular KV cache streaming path to the CUDA `llama-server`. It is intended for running long contexts when model weights leave too little VRAM for the complete KV cache.
+
+With `--kv-stream-stage-mib N`, the authoritative KV tensors are stored in pinned host memory while a bounded CUDA pool is shared by resident KV pages and a transfer ring. The runtime adapts that split as the context grows: it keeps as many pages resident as the budget allows, reclaims resident space for staging when more streaming is required, and prefetches later layers while the current layer computes. This avoids relying on uncontrolled Unified Memory page thrashing and preserves exact attention over the full context.
+
+Detailed project story, design, implementation, and benchmark results are in
+[Running Qwen 27B on 16G VRAM with Full Context Length: Building Adaptive KV Cache Streaming for llama.cpp](https://medium.com/@raymond860909/running-qwen-27b-on-16g-vram-with-full-context-length-building-adaptive-kv-cache-streaming-for-bf1e819116e9).
+
+> [!WARNING]
+> This is research code tailored to our current NVIDIA CUDA configuration: an RTX 5070 Ti with 16 GB VRAM, `unsloth/Qwen3.8-27B-GGUF` `UD-Q3_K_XL`, a 262144-token context, Flash Attention, a Q8_0 K cache, a Q4_0 V cache, and one server slot. Other models, KV cache quantization combinations, parallel slots, and non-CUDA backends are not yet supported or validated. Expanding model and KV quantization support is follow-up work.
+
+## Build the modified server
+
+Install a C++ compiler, CMake, and the CUDA toolkit, then run this command from the repository root:
+
+```bash
+cmake -S . -B build -DGGML_CUDA=ON -DGGML_CUDA_FA_ALL_QUANTS=ON -DCMAKE_BUILD_TYPE=Release && cmake --build build --config Release --target llama-server -j
+```
+
+The executable is created at `build/bin/llama-server`.
+
+Example using the tested cache configuration:
+
+```bash
+./build/bin/llama-server \
+  --model /path/to/model.gguf \
+  --ctx-size 262144 \
+  -fa on \
+  -ctk q8_0 \
+  -ctv q4_0 \
+  -ngl all \
+  -np 1 \
+  --kv-stream-stage-mib 2304
+```
+
+The best value for `--kv-stream-stage-mib` depends on the model, context capacity, GPU, and other VRAM consumers. Start conservatively and increase it while checking startup and peak VRAM use.
+
+### Optional Unified Memory for model weights
+
+Adaptive KV streaming works with or without Unified Memory. Leave `GGML_CUDA_ENABLE_UNIFIED_MEMORY` unset for ordinary CUDA device allocations. To make GPU-offloaded model buffers CUDA managed allocations, launch the same server with the environment variable enabled:
+
+```bash
+GGML_CUDA_ENABLE_UNIFIED_MEMORY=1 \
+./build/bin/llama-server \
+  --model /path/to/model.gguf \
+  --ctx-size 262144 \
+  -fa on \
+  -ctk q8_0 \
+  -ctv q4_0 \
+  -ngl all \
+  -np 1 \
+  --kv-stream-stage-mib 2304
+```
+
+With this flag, CUDA-backed model buffers, including GPU-offloaded weights, are allocated with `cudaMallocManaged` and their pages can migrate between VRAM and host memory. The adaptive resident-page and transfer-ring pool is intentionally different: it is still allocated with `cudaMalloc`, so that fixed-size pool remains physically allocated in VRAM instead of becoming managed memory. UVM is therefore optional for this branch and does not change the KV streaming pool into pageable storage.
+
+## Recreate the benchmark graph
+
+The benchmark driver automatically selects the largest practical adaptive KV pool for each configured context capacity, sweeps from 8K through the requested maximum, and generates the CSV, PNG, and SVG results:
+
+```bash
+python3 -m pip install matplotlib
+
+python3 benchmarks/benchmark_kv_stream.py \
+  --model /path/to/model.gguf \
+  --max-context 192K
+```
+
+The only required arguments are the model GGUF and maximum context. See [benchmarks/README.md](benchmarks/README.md) for the pool-probing algorithm, generated files, optional settings, and resumable output directories.
+
+---
+
+## Upstream llama.cpp README
+
 # llama.cpp
 
 ![llama](https://raw.githubusercontent.com/ggml-org/llama.brand/refs/heads/master/cover/llama-cpp/cover-llama-cpp-dark.svg)

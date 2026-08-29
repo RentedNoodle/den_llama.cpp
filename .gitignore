@@ -130,6 +130,7 @@ flake.lock
 /hellaswag_val_full.txt
 /winogrande-debiased-eval.csv
 /wikitext-2-raw/
+/benchmarks/results/
 
 # Test models for lora adapters
 

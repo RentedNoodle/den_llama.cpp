@@ -6,7 +6,9 @@
 #include "llama-impl.h"
 #include "llama-batch.h"
 #include "llama-io.h"
+#include "llama-kv-stream-config.h"
 #include "llama-memory.h"
+#include "llama-memory-hybrid.h"
 #include "llama-mmap.h"
 #include "llama-model.h"
 #include "llama-ext.h"
@@ -118,6 +120,7 @@ llama_context::llama_context(
     cparams.embeddings_nextn        = false;
     cparams.embeddings_nextn_masked = false;
     cparams.offload_kqv             = params.offload_kqv;
+    cparams.kv_stream_stage_mib     = params.kv_stream_stage_mib;
     cparams.no_perf                 = params.no_perf;
     cparams.warmup                  = false;
 
@@ -384,12 +387,45 @@ llama_context::llama_context(
 
     // init the memory module
     if (!hparams.vocab_only) {
+        const uint64_t kv_stream_stage_bytes = uint64_t(cparams.kv_stream_stage_mib)*1024ULL*1024ULL;
+        uint64_t kv_stream_minimum_stage_bytes = 0;
+        if (kv_stream_stage_bytes != 0 && model.arch == LLM_ARCH_QWEN35) {
+            for (uint32_t il = 0; il < hparams.n_layer(); ++il) {
+                if (hparams.has_kv(il) && !hparams.is_recr(il)) {
+                    kv_stream_minimum_stage_bytes = 256ULL*(
+                        ggml_row_size(params.type_k, hparams.n_embd_k_gqa(il)) +
+                        ggml_row_size(params.type_v, hparams.n_embd_v_gqa(il)));
+                    break;
+                }
+            }
+        }
+
+        const llama_kv_stream_config stream_config = {
+            /*.stage_bytes         =*/ kv_stream_stage_bytes,
+            /*.minimum_stage_bytes =*/ kv_stream_minimum_stage_bytes,
+            /*.arch_qwen35         =*/ model.arch == LLM_ARCH_QWEN35,
+            /*.context_default     =*/ cparams.ctx_type == LLAMA_CONTEXT_TYPE_DEFAULT,
+            /*.single_sequence     =*/ cparams.n_seq_max == 1,
+            /*.flash_attention     =*/ cparams.flash_attn,
+            /*.kv_offload          =*/ cparams.offload_kqv,
+            /*.cache_q8_q4         =*/ params.type_k == GGML_TYPE_Q8_0 && params.type_v == GGML_TYPE_Q4_0,
+        };
+        const auto stream_validation = llama_kv_stream_config_validate(stream_config);
+        if (!stream_validation.valid) {
+            throw std::runtime_error(stream_validation.error);
+        }
+        if (stream_validation.enabled) {
+            LLAMA_LOG_INFO("%s: experimental block KV streaming enabled, pool = %.2f MiB\n",
+                    __func__, kv_stream_stage_bytes/1024.0/1024.0);
+        }
+
         llama_memory_params params_mem = {
-            /*.type_k    =*/ params.type_k,
-            /*.type_v    =*/ params.type_v,
-            /*.swa_full  =*/ params.swa_full,
-            /*.ctx_type  =*/ cparams.ctx_type,
-            /*.mem_other =*/ llama_get_memory(cparams.ctx_other),
+            /*.type_k                =*/ params.type_k,
+            /*.type_v                =*/ params.type_v,
+            /*.kv_stream_stage_bytes =*/ kv_stream_stage_bytes,
+            /*.swa_full              =*/ params.swa_full,
+            /*.ctx_type              =*/ cparams.ctx_type,
+            /*.mem_other             =*/ llama_get_memory(cparams.ctx_other),
         };
 
         memory.reset(model.create_memory(params_mem, cparams));
@@ -1335,6 +1371,19 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         LLAMA_LOG_ERROR("%s: failed to apply memory context\n", __func__);
         ret = GGML_STATUS_FAILED;
         return nullptr;
+    }
+
+    // Consume feedback from the previous completed decode before building the
+    // next graph. Repartition itself synchronizes only when hysteresis selects
+    // a new boundary, so steady-state token generation stays asynchronous.
+    if (auto * hybrid_memory = dynamic_cast<llama_memory_hybrid *>(memory.get())) {
+        if (auto * hybrid_context = dynamic_cast<llama_memory_hybrid_context *>(mctx)) {
+            const llama_kv_cache_context * attn_context = hybrid_context->get_attn();
+            if (attn_context != nullptr) {
+                (void) hybrid_memory->get_mem_attn()->kv_stream_adapt(
+                    attn_context->get_n_kv(), ubatch.n_tokens);
+            }
+        }
     }
 
     auto * res = gf_res_prev.get();
@@ -3617,6 +3666,7 @@ llama_context_params llama_context_default_params() {
         /*.cb_eval_user_data           =*/ nullptr,
         /*.type_k                      =*/ GGML_TYPE_F16,
         /*.type_v                      =*/ GGML_TYPE_F16,
+        /*.kv_stream_stage_mib         =*/ 0,
         /*.abort_callback              =*/ nullptr,
         /*.abort_callback_data         =*/ nullptr,
         /*.embeddings                  =*/ false,
