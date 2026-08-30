@@ -140,7 +140,11 @@ int ggml_cuda_get_device() {
 static cudaError_t ggml_cuda_device_malloc(void ** ptr, size_t size, int device) {
     ggml_cuda_set_device(device);
     cudaError_t err;
-    if (getenv("GGML_CUDA_ENABLE_UNIFIED_MEMORY") != nullptr) {
+    // DEN fix: never cudaMallocManaged for device-resident tensors on WDDM —
+    // managed paging at 196k hangs the driver (machine crash). Use device
+    // cudaMalloc; the kv_stream stage (already cudaHostAllocMapped) handles spill.
+    if (getenv("GGML_CUDA_ENABLE_UNIFIED_MEMORY") != nullptr
+            && getenv("DEN_KV_STREAM_ONLY_UM") != nullptr) {
         err = cudaMallocManaged(ptr, size);
 #if defined(GGML_USE_HIP)
         if (err == hipSuccess) {
