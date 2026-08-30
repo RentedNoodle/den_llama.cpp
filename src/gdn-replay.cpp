@@ -56,3 +56,16 @@ void gdn_replay_clear() {
     for (int i = 0; i < 64; ++i) { g_layers[i].k.clear(); g_layers[i].beta.clear(); g_layers[i].alpha.clear(); }
     g_num_layers = 0; g_seq_len = 0;
 }
+
+static std::vector<float> g_hidden; // final hidden (t_h_nextn) per layer for MTP default
+void gdn_replay_record_hidden(int layer_idx, const float * hidden, int dim) {
+    if (!hidden || dim <= 0) return;
+    if ((int)g_hidden.size() < (layer_idx+1)*dim) g_hidden.resize((layer_idx+1)*dim);
+    std::memcpy(&g_hidden[layer_idx*dim], hidden, dim*sizeof(float));
+}
+const float * gdn_replay_get_hidden(int layer_idx) {
+    if (g_hidden.empty()) return nullptr;
+    size_t head = g_hidden.size() / (size_t)(g_num_layers > 0 ? g_num_layers : 1);
+    if (head == 0 || (size_t)layer_idx >= g_num_layers) return nullptr;
+    return &g_hidden[(size_t)layer_idx * head];
+}

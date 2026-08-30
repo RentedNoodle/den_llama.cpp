@@ -27,3 +27,6 @@ void gdn_replay_clear();
 
 // Convenience: hook the q35 GDN path. Returns true if replay succeeded (O(1)).
 bool gdn_replay_decode_layer(int layer_idx, float * out);
+
+void gdn_replay_record_hidden(int layer_idx, const float * hidden, int dim);
+const float * gdn_replay_get_hidden(int layer_idx);

@@ -1,3 +1,4 @@
+#include "gdn-replay.h"
 #include "models.h"
 #include "llama-memory-recurrent.h"
 
@@ -211,6 +212,10 @@ llama_model_qwen35::graph::graph(const llama_model & model, const llm_graph_para
 
     cb(cur, "h_nextn", -1);
     res->t_h_nextn = cur;
+    // GDN O(1) -> MTP feed: record t_h_nextn so MTP draft reuses recorded hidden
+    if (cparams.fused_gdn_ar) {
+        gdn_replay_record_hidden(0, cur ? ggml_get_data_f32(cur) : nullptr, n_embd);
+    }
 
     if (!cparams.embeddings_nextn_masked && inp_out_ids) {
         cur = ggml_get_rows(ctx0, cur, inp_out_ids);
