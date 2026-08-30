@@ -14,6 +14,7 @@ __device__ static void kvarn_varnorm_tile(float * tile, int n) {
     float inv = var > 1e-6f ? rsqrtf(var) : 1.0f;
     for (int i = 0; i < n; ++i) tile[i] = (tile[i] - mean) * inv;
 }
+__device__ static void wht128(float * x) { for (int len=1; len<128; len<<=1) for (int i=0;i<128;i+=len<<1) for (int j=0;j<len;++j){float u=x[i+j],v=x[i+j+len];x[i+j]=u+v;x[i+j+len]=u-v;} float n=0.08838834764831843f; for(int i=0;i<128;++i) x[i]*=n; }
 template <typename idx_t, typename block_type, int qk, void (*quantize_func)(const float *, block_type *)>
 static __global__ void k_set_rows_quant(const float * __restrict__ src0,
                                         const idx_t * __restrict__ src1,
@@ -73,7 +74,7 @@ static __global__ void k_set_rows_quant(const float * __restrict__ src0,
     const float * src_block = src0_row + i00;
     block_type * dst_block = dst_row_ptr + i00 / qk;
 
-    quantize_func(src_block, dst_block);
+    float wht_tmp[128]; for(int i=0;i<qk;++i) wht_tmp[i]=src_block[i]; wht128(wht_tmp); quantize_func(wht_tmp, dst_block);
 
     GGML_UNUSED(ne10);
     GGML_UNUSED(ne11);
