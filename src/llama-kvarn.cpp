@@ -11,6 +11,7 @@ static std::vector<uint8_t> g_head_policy;   // per-head 0=static,1=dynamic
 static int g_num_static = 0;
 static int g_num_dynamic = 0;
 static int g_total_heads = 0;
+static int g_sink_tokens = 4;
 
 // Sink: first ~8 tokens attend strongly (must stay resident). Recent: last window.
 // Static if the head converges attention on sink+recent (rare in GQA); else dynamic.
@@ -31,7 +32,6 @@ bool hybridkv_head_static(int head_idx, bool is_sink, bool is_recent) {
 
 // Sink pinning: never evict the first `sink_tokens` (attention sinks).
 void hybridkv_pin_sink(int sink_tokens) { g_sink_tokens = std::max(g_sink_tokens, sink_tokens); }
-static int g_sink_tokens = 4;
 
 int hybridkv_sink_tokens() { return g_sink_tokens; }
 
