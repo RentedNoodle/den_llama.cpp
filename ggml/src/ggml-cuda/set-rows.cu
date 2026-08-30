@@ -4,6 +4,16 @@
 typedef void (*set_rows_kernel_t)(const char * src, char * dst);
 
 // Generic quantized set_rows kernel template
+// KVarN variance-norm hook (meld): normalize tile variance before quant
+__device__ static void kvarn_varnorm_tile(float * tile, int n) {
+    // n is QK (32 for q4_0, etc) — simple per-block variance norm
+    float sum = 0, sumsq = 0;
+    for (int i = 0; i < n; ++i) { sum += tile[i]; sumsq += tile[i]*tile[i]; }
+    float mean = sum / n;
+    float var = sumsq / n - mean*mean;
+    float inv = var > 1e-6f ? rsqrtf(var) : 1.0f;
+    for (int i = 0; i < n; ++i) tile[i] = (tile[i] - mean) * inv;
+}
 template <typename idx_t, typename block_type, int qk, void (*quantize_func)(const float *, block_type *)>
 static __global__ void k_set_rows_quant(const float * __restrict__ src0,
                                         const idx_t * __restrict__ src1,
