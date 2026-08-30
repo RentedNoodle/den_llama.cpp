@@ -55,6 +55,7 @@ set(TARGET llama-common)
 
 add_library(${TARGET}
     arg.cpp
+    fit-kvarn-tail.cpp
     arg.h
     base64.hpp
     chat-auto-parser-generator.cpp

@@ -27,6 +27,10 @@ add_library(llama
             llama-kv-cache-dsa.cpp
             llama-kv-cache-dsa-iswa.cpp
             llama-kv-cache-msa.cpp
+            llama-kvarn.cpp
+            llama-kv-cache-kvarn.cpp
+            llama-kv-cache-tail.cpp
+            llama-kv-tail-request.cpp
             llama-kv-cache-dsv4.cpp
             llama-kv-stream-config.cpp
             llama-kv-stream-config.h
