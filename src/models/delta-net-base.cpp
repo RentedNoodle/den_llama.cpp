@@ -401,10 +401,11 @@ std::pair<ggml_tensor *, ggml_tensor *> llm_build_delta_net_base::build_delta_ne
 
     // K=1: output carries the final state only. state s is 4D [S_v, S_v, H_v, n_seqs].
     ggml_tensor * result = ggml_gated_delta_net(ctx0, q, k, v, g, b, s, /*K=*/1);
-    // GDN O(1) replay: record prefill q/k state for decode reuse (48 linear_attn layers)
+    // GDN O(1) replay: record prefill q/k state, replay at decode (48 linear_attn layers)
     if (n_tokens > 1) {
         GdnReplayRecord rec; rec.spec.layers = 48; rec.spec.width = S_v; rec.spec.qk_heads = H_v;
-        (void)rec; (void)ggml_get_data_f32(q);
+        gdn_replay_configure(48, S_v);
+        gdn_replay_record_prefill(rec, ggml_get_data_f32(q), ggml_get_data_f32(k));
     }
     if (n_tokens == 1) {
         res->add_fused_node({LLM_FUSED_OP_GDN_AR, result, il});
