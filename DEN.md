@@ -33,12 +33,15 @@ Non-negotiables found the hard way: `--fit off` (fit-on + MTP randomly drops to 
 
 `needle` (retrieval @ depth) · `toolcall` (name + args + must-not-fire + chains) · `coherence` (multi-turn) · `speed` (MTP ladder + temp/KV A-Bs, medians-of-3, baseline re-measured at end). Prompts + raw logs ship per release (see model repo `evals/`).
 
-## Patch stack (top of pinned upstream)
+## Patch stack (70 commits atop pinned upstream — verified composition)
 
-- GDN-O1→MTP feed (`gdn_replay_get_hidden`, O(1) GDN into MTP)
-- HybridKV per-head residency, adaptive-KV streaming
-- beellama reasoning-loop guard (force-close repetitive hidden-reasoning loops)
-- Gated-DeltaNet PDL sync + q/k L2-normalize fixes
+- kv-stream series (~47): adaptive-KV streaming merge + Windows/WDDM fixes, device-resident pool under UVM, bench automation
+- seven-stack (5): GDN O(1) record/replay across 48 layers, HybridKV head-aware classifier (kvarn4 resident / q8 streamed), NIAH gates
+- shippable-q4 lane: 196K q8_0/q4_0 resident configs
+- GDN-O1→MTP feed (`gdn_replay_get_hidden`), HybridKV per-head policy + sink pin, PDL sync + q/k normalize fixes, DFlash NaN defensive fix
+- FA_ALL_QUANTS build flag (quantized KV on hybrid arch)
+
+NOT yet merged (remotes wired, awaiting gates): beellama (`beel/main` — reasoning-loop guard port lives in `den-legacy` history, not here yet), ik_llama (no remote yet). True superfork assembly is tracked work, not current state — see branches `seven-stack`, `gdn-replay`, `kvarn-variance-meld`, `shippable-q4-resident`.
 
 ## License
 
