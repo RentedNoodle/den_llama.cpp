@@ -2319,6 +2319,14 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_examples({LLAMA_EXAMPLE_EMBEDDING, LLAMA_EXAMPLE_RETRIEVAL, LLAMA_EXAMPLE_SERVER, LLAMA_EXAMPLE_DEBUG}).set_env("LLAMA_ARG_POOLING"));
     add_opt(common_arg(
+        {"--embeddings-nextn"},
+        "also capture the MTP head input hidden state (h_nextn) alongside embeddings",
+        [](common_params & params) {
+            params.embedding = true;
+            params.embeddings_nextn = true;
+        }
+    ).set_examples({LLAMA_EXAMPLE_EMBEDDING, LLAMA_EXAMPLE_SERVER}).set_env("LLAMA_ARG_EMBEDDINGS_NEXTN"));
+    add_opt(common_arg(
         {"--attention"}, "{causal,non-causal}",
         "attention type for embeddings, use model default if unspecified",
         [](common_params & params, const std::string & value) {

@@ -2176,6 +2176,17 @@ private:
             }
 
             res->embedding.emplace_back(embd, embd + n_embd_out);
+
+            // also capture the MTP head input hidden (h_nextn) per token when enabled
+            if (params_base.embeddings_nextn) {
+                const int n_embd = llama_model_n_embd(model_tgt);
+                const float * hnextn = llama_get_embeddings_nextn_ith(slot.ctx_tgt, i);
+                if (hnextn != nullptr) {
+                    res->nextn.emplace_back(hnextn, hnextn + n_embd);
+                } else {
+                    res->nextn.emplace_back(n_embd, 0.0f);
+                }
+            }
         }
 
         SLT_DBG(slot, "%s", "sending embeddings\n");

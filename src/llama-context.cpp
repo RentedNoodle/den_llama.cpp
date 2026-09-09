@@ -17,10 +17,12 @@
 
 #include <cinttypes>
 #include <cmath>
+#include <cstdio>
 #include <cstring>
 #include <limits>
 #include <stdexcept>
 #include <string>
+#include <vector>
 
 //
 // llama_context
@@ -1689,6 +1691,123 @@ static bool needs_raw_logits(const llama_ubatch & ubatch, const std::map<llama_s
     return false; // all sequences use backend sampling
 }
 
+// ============================================================================
+// TEMPORARY DEBUG: dump intermediate MTP draft-head tensors for byte-compare
+// against a PyTorch reimplementation. Triggered by env LLAMA_DUMP_MTP.
+// Writes raw f32 payloads (with a small dim header) into C:\Den\dreya\mtp\dump\
+// for the FIRST single-token MTP draft decode only. This block is clearly marked and should be
+// removed once the divergence is found. It does not alter graph logic.
+// ============================================================================
+#include <sys/stat.h>
+#include <direct.h>
+static bool g_mtp_dump_done = false;
+static void llm_mtp_dump_tensor(ggml_cgraph * gf, const char * name) {
+    if (!gf) return;
+    ggml_tensor * t = ggml_graph_get_tensor(gf, name);
+    if (t == nullptr) return;
+    const size_t nbytes = ggml_nbytes(t);
+    const size_t n = nbytes / ggml_element_size(t);
+    std::vector<float> buf(n);
+    ggml_backend_tensor_get(t, buf.data(), 0, nbytes);
+    // dim header (ne0 ne1 ne2 ne3) as 4 int64, then raw element data in native order
+    char path[1024];
+    snprintf(path, sizeof(path), "C:\\Den\\dreya\\mtp\\dump\\%s.f32", name);
+    FILE * f = fopen(path, "wb");
+    if (!f) { LLAMA_LOG_ERROR("%s: cannot open %s for writing\n", __func__, path); return; }
+    int64_t dims[4] = { (int64_t)t->ne[0], (int64_t)t->ne[1], (int64_t)t->ne[2], (int64_t)t->ne[3] };
+    fwrite(dims, sizeof(int64_t), 4, f);
+    fwrite(buf.data(), sizeof(float), buf.size(), f);
+    fclose(f);
+    LLAMA_LOG_INFO("%s: dumped %s (nbytes=%zu, dims=[%d,%d,%d,%d], dtype=%d)\n",
+            __func__, name, nbytes, (int)t->ne[0], (int)t->ne[1], (int)t->ne[2], (int)t->ne[3], (int)t->type);
+}
+// dump a tensor directly by pointer (guaranteed allocated at eval time)
+static void llm_mtp_dump_tensor_ptr(ggml_tensor * t, const char * name) {
+    if (t == nullptr) {
+        LLAMA_LOG_INFO("%s: sample tensor '%s' is null (skip)\n", __func__, name);
+        return;
+    }
+    const size_t nbytes = ggml_nbytes(t);
+    const size_t n = nbytes / ggml_element_size(t);
+    std::vector<float> buf(n);
+    ggml_backend_tensor_get(t, buf.data(), 0, nbytes);
+    char path[1024];
+    snprintf(path, sizeof(path), "C:\\Den\\dreya\\mtp\\dump\\%s.f32", name);
+    FILE * f = fopen(path, "wb");
+    if (!f) { LLAMA_LOG_ERROR("%s: cannot open %s for writing\n", __func__, path); return; }
+    int64_t dims[4] = { (int64_t)t->ne[0], (int64_t)t->ne[1], (int64_t)t->ne[2], (int64_t)t->ne[3] };
+    fwrite(dims, sizeof(int64_t), 4, f);
+    fwrite(buf.data(), sizeof(float), buf.size(), f);
+    fclose(f);
+    LLAMA_LOG_INFO("%s: dumped '%s' (nbytes=%zu, dims=[%d,%d,%d,%d])\n",
+            __func__, name, nbytes, (int)t->ne[0], (int)t->ne[1], (int)t->ne[2], (int)t->ne[3]);
+}
+static void llm_mtp_dump_graph(const llama_context * ctx, const llm_graph_result * res, const llama_ubatch & ubatch) {
+    if (!res) return;
+    const char * outdir = "C:\\Den\\dreya\\mtp\\dump";
+    (void)outdir;
+#ifdef _WIN32
+    _mkdir(outdir);
+#else
+    mkdir(outdir, 0755);
+#endif
+    ggml_cgraph * gf = res->get_gf();
+    LLAMA_LOG_INFO("%s: === MTP DEBUG DUMP: n_nodes=%d ===\n", __func__, ggml_graph_n_nodes(gf));
+    // graph_mtp names most intermediates with a "-<il>" suffix (il = n_layer() >= 0),
+    // and the final h_nextn / result_output with no suffix (il = -1). So walk every
+    // node and dump any whose name begins with "mtp_" or equals h_nextn/result_output.
+    {
+        const int n_nodes = ggml_graph_n_nodes(gf);
+        for (int i = 0; i < n_nodes; ++i) {
+            ggml_tensor * node = ggml_graph_node(gf, i);
+            const char * nm = ggml_get_name(node);
+            if (nm == nullptr) continue;
+            bool want = false;
+            if (strncmp(nm, "mtp_", 4) == 0) want = true;
+            if (strcmp(nm, "h_nextn") == 0 || strcmp(nm, "result_output") == 0) want = true;
+            if (want) {
+                llm_mtp_dump_tensor(gf, nm);
+            }
+        }
+    }
+    // the MTP input hidden is a leaf (not in nodes list) — dump it explicitly too
+    llm_mtp_dump_tensor(gf, "mtp_h_input");
+    // the two graph outputs are exposed reliably via the result: dump by pointer
+    // logits = result_output (vocab x n_out); h_nextn = shared_head_norm output
+    llm_mtp_dump_tensor_ptr(res->get_logits(), "result_output");
+    llm_mtp_dump_tensor_ptr(res->get_h_nextn(), "h_nextn");
+    // also capture the input token IDs and the harvested h (per-row) for exact repro
+    {
+        // token ids + position (single-token draft step)
+        if (ubatch.token) {
+            FILE * f = fopen("C:\\Den\\dreya\\mtp\\dump\\input_token_ids.bin", "wb");
+            if (f) {
+                int64_t nt = (int64_t)ubatch.n_tokens;
+                int64_t pos = ubatch.pos ? (int64_t)ubatch.pos[0] : -1;
+                fwrite(&nt, sizeof(int64_t), 1, f);
+                fwrite(&pos, sizeof(int64_t), 1, f);
+                fwrite(ubatch.token, sizeof(llama_token), (size_t)ubatch.n_tokens, f);
+                fclose(f);
+            }
+        }
+        // harvested h (the MTP input hidden). In the ubatch it lives as embd.
+        if (ubatch.embd && res->get_h_nextn()) {
+            // ubatch embd is the h row fed to this MTP layer: dump raw too
+            FILE * f = fopen("C:\\Den\\dreya\\mtp\\dump\\input_h.bin", "wb");
+            if (f) {
+                int64_t ne0 = (int64_t)res->get_h_nextn()->ne[0];
+                int64_t ne1 = (int64_t)ubatch.n_tokens;
+                fwrite(&ne0, sizeof(int64_t), 1, f);
+                fwrite(&ne1, sizeof(int64_t), 1, f);
+                fwrite(ubatch.embd, sizeof(float), (size_t)(ubatch.n_tokens * ne0), f);
+                fclose(f);
+            }
+        }
+    }
+    LLAMA_LOG_INFO("%s: === MTP DEBUG DUMP DONE ===\n", __func__);
+}
+// ----------------------------------------------------------------------------
+
 int llama_context::decode(const llama_batch & batch_inp) {
     // MTP hook batches carry both token (next-token id) and embd (h_nextn row),
     // so accept either present rather than requiring exactly one.
@@ -1907,6 +2026,18 @@ int llama_context::decode(const llama_batch & batch_inp) {
         //if (n_past%100 == 0) {
         //    ggml_graph_dump_dot(gf, NULL, "llama.dot");
         //}
+
+        // TEMPORARY DEBUG: dump MTP draft-head intermediate tensors once.
+        // Capture a single-token draft step (clean 1-token input -> logits pair)
+        // rather than the multi-token prompt catch-up decode.
+        if (cparams.ctx_type == LLAMA_CONTEXT_TYPE_MTP &&
+            cparams.embeddings_nextn &&      // only when harvesting h (draft path)
+            ubatch.n_tokens == 1 &&          // single draft step, not prompt catch-up
+            getenv("LLAMA_DUMP_MTP") && !g_mtp_dump_done) {
+            g_mtp_dump_done = true;
+            llm_mtp_dump_graph(this, res, ubatch);
+        }
+
 
         auto * t_logits  = res->get_logits();
         auto * t_embd    = cparams.embeddings       ? res->get_embd()     : nullptr;
@@ -3853,6 +3984,10 @@ void llama_set_embeddings(llama_context * ctx, bool embeddings) {
     ctx->set_embeddings(embeddings);
 }
 
+void llama_set_embeddings_nextn(llama_context * ctx, bool embeddings_nextn) {
+    ctx->set_embeddings_nextn(embeddings_nextn, false);
+}
+
 void llama_set_causal_attn(llama_context * ctx, bool causal_attn) {
     ctx->set_causal_attn(causal_attn);
 }
@@ -3897,6 +4032,16 @@ float * llama_get_embeddings_ith(llama_context * ctx, int32_t i) {
     return ctx->get_embeddings_ith(i);
 }
 
+float * llama_get_embeddings_nextn_ith(llama_context * ctx, int32_t i) {
+    ctx->synchronize();
+
+    try {
+        return ctx->get_embeddings_nextn_ith(i);
+    } catch (const std::exception &) {
+        return nullptr;
+    }
+}
+
 float * llama_get_embeddings_seq(llama_context * ctx, llama_seq_id seq_id) {
     ctx->synchronize();
 
@@ -3927,12 +4072,6 @@ float * llama_get_embeddings_nextn(llama_context * ctx) {
     ctx->synchronize();
 
     return ctx->get_embeddings_nextn();
-}
-
-float * llama_get_embeddings_nextn_ith(llama_context * ctx, int32_t i) {
-    ctx->synchronize();
-
-    return ctx->get_embeddings_nextn_ith(i);
 }
 
 float * llama_get_embeddings_layer_inp(llama_context * ctx, uint32_t lid) {

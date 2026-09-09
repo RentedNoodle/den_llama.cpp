@@ -1401,6 +1401,10 @@ common_init_result::common_init_result(common_params & params, bool model_only) 
         return;
     }
 
+    if (params.embeddings_nextn) {
+        llama_set_embeddings_nextn(lctx, true);
+    }
+
     pimpl->context.reset(lctx);
 
     set_process_priority(params.cpuparams.priority);

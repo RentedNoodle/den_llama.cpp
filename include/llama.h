@@ -1006,6 +1006,7 @@ extern "C" {
     // Set whether the context outputs embeddings or not
     // TODO: rename to avoid confusion with llama_get_embeddings()
     LLAMA_API void llama_set_embeddings(struct llama_context * ctx, bool embeddings);
+    LLAMA_API void llama_set_embeddings_nextn(struct llama_context * ctx, bool embeddings_nextn);
 
     // Set whether to use causal attention or not
     // If set to true, the model will only attend to the past tokens
@@ -1056,6 +1057,10 @@ extern "C" {
     // shape: [n_embd] (1-dimensional)
     // returns NULL for invalid ids.
     LLAMA_API float * llama_get_embeddings_ith(struct llama_context * ctx, int32_t i);
+
+    // Get the MTP head input hidden state (h_nextn) for token i, when embeddings_nextn was enabled.
+    // shape: [n_embd] (1-dimensional); returns NULL if not enabled or index out of range.
+    LLAMA_API float * llama_get_embeddings_nextn_ith(struct llama_context * ctx, int32_t i);
 
     // Get the embeddings for a sequence id
     // Returns NULL if pooling_type is LLAMA_POOLING_TYPE_NONE
