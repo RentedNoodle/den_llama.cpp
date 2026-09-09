@@ -1345,6 +1345,11 @@ vec_dot_q6_K_q8_1(const void *__restrict__ vbq,
 }
 
 
+// NOTE: the VDR_IQ*_Q8_1_MMVQ values deliberately differ from the identically named CUDA constants
+// (vecdotq.cuh): the SYCL kernels pair them with a halved qi (e.g. QI3_S/2), so the values are not
+// interchangeable and must not be copied across backends.
+#define VDR_IQ2_XXS_Q8_1_MMVQ 1
+
 static __dpct_inline__ float
 vec_dot_iq2_xxs_q8_1(const void *__restrict__ vbq,
                      const block_q8_1 *__restrict__ bq8_1, const int &iqs,
@@ -1375,6 +1380,8 @@ vec_dot_iq2_xxs_q8_1(const void *__restrict__ vbq,
     return 0.f;
 #endif
 }
+
+#define VDR_IQ2_XS_Q8_1_MMVQ 1
 
 static __dpct_inline__ float
 vec_dot_iq2_xs_q8_1(const void *__restrict__ vbq,
@@ -1425,6 +1432,8 @@ vec_dot_iq2_xs_q8_1(const void *__restrict__ vbq,
     return 0.f;
 #endif
 }
+
+#define VDR_IQ2_S_Q8_1_MMVQ 1
 
 static __dpct_inline__ float
 vec_dot_iq2_s_q8_1(const void *__restrict__ vbq,
@@ -1478,6 +1487,8 @@ vec_dot_iq2_s_q8_1(const void *__restrict__ vbq,
 #endif
 }
 
+#define VDR_IQ3_XXS_Q8_1_MMVQ 1
+
 static __dpct_inline__ float
 vec_dot_iq3_xxs_q8_1(const void *__restrict__ vbq,
                      const block_q8_1 *__restrict__ bq8_1, const int &iqs,
@@ -1518,6 +1529,8 @@ vec_dot_iq3_xxs_q8_1(const void *__restrict__ vbq,
 #endif
 }
 
+#define VDR_IQ3_S_Q8_1_MMVQ 1
+
 static __dpct_inline__ float
 vec_dot_iq3_s_q8_1(const void *__restrict__ vbq,
                    const block_q8_1 *__restrict__ bq8_1, const int &iqs,
@@ -1556,6 +1569,8 @@ vec_dot_iq3_s_q8_1(const void *__restrict__ vbq,
 #endif
 }
 
+#define VDR_IQ1_S_Q8_1_MMVQ 1
+
 static __dpct_inline__ float
 vec_dot_iq1_s_q8_1(const void *__restrict__ vbq,
                    const block_q8_1 *__restrict__ bq8_1, const int &iqs,
@@ -1583,6 +1598,8 @@ vec_dot_iq1_s_q8_1(const void *__restrict__ vbq,
     assert(false);
 #endif
 }
+
+#define VDR_IQ1_M_Q8_1_MMVQ 1
 
 static __dpct_inline__ float
 vec_dot_iq1_m_q8_1(const void *__restrict__ vbq,
@@ -1618,6 +1635,8 @@ vec_dot_iq1_m_q8_1(const void *__restrict__ vbq,
 }
 
 
+#define VDR_IQ4_NL_Q8_1_MMVQ 2
+
 static __dpct_inline__ float
 vec_dot_iq4_nl_q8_1(const void *__restrict__ vbq,
                     const block_q8_1 *__restrict__ bq8_1, const int &iqs) {
@@ -1642,6 +1661,8 @@ vec_dot_iq4_nl_q8_1(const void *__restrict__ vbq,
     return d * (sumi1 + sumi2);
 }
 
+
+#define VDR_IQ4_XS_Q8_1_MMVQ 1
 
 static __dpct_inline__ float
 vec_dot_iq4_xs_q8_1(const void *__restrict__ vbq,
