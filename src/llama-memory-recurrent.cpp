@@ -1380,7 +1380,7 @@ void llama_memory_recurrent::state_write_data(
             const uint64_t p_size_row = ggml_row_size(p_l[il]->type, hparams.ple_conv_state());
             io.write(&p_size_row, sizeof(p_size_row));
 
-            for (const auto & range : cell_ranges) {
+            for (const auto & range : r_ranges) {
                 const size_t range_size = range.second - range.first;
                 io.write_tensor(p_l[il], range.first * p_size_row, range_size * p_size_row);
             }
