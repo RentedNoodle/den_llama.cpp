@@ -104,6 +104,7 @@ llama_memory_recurrent::llama_memory_recurrent(
 
     r_l.resize(n_layer);
     s_l.resize(n_layer);
+    p_l.resize(n_layer);
     s_snap_l.resize(n_layer);
     txn_l.resize(n_layer);
     txn_prior_l.resize(n_layer);
@@ -148,6 +149,13 @@ llama_memory_recurrent::llama_memory_recurrent(
         ggml_format_name(s, "cache_s_l%d", i);
         r_l[i] = r;
         s_l[i] = s;
+
+        // the PLE history needs its own row: Meta must mirror it while the delta-net conv state next door stays split
+        if (hparams.ple_conv_state() > 0 && hparams.is_ple(i)) {
+            ggml_tensor * p = ggml_new_tensor_2d(ctx, type_r, hparams.ple_conv_state(), n_rows_r);
+            ggml_format_name(p, "cache_ple_r_l%d", i);
+            p_l[i] = p;
+        }
 
         if (split_s_snapshots) {
             ggml_tensor * s_snap = ggml_new_tensor_2d(ctx, GGML_TYPE_F16,
@@ -1820,6 +1828,10 @@ ggml_tensor * llama_memory_recurrent_context::get_r_l(int32_t il) const {
 
 ggml_tensor * llama_memory_recurrent_context::get_s_l(int32_t il) const {
     return mem->s_l[il];
+}
+
+ggml_tensor * llama_memory_recurrent_context::get_p_l(int32_t il) const {
+    return mem->p_l[il];
 }
 
 ggml_tensor * llama_memory_recurrent_context::get_s_snap_l(int32_t il) const {
