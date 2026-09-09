@@ -18,6 +18,7 @@
 #include <cinttypes>
 #include <cmath>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <limits>
 #include <stdexcept>
@@ -146,6 +147,12 @@ llama_context::llama_context(
 
     cparams.ctx_other = nullptr;
 
+    if (params.ctx_type == LLAMA_CONTEXT_TYPE_MTP && params.ctx_other != nullptr &&
+        &params.ctx_other->get_model() == &model &&
+        cparams.n_seq_max == 1 && params.ctx_other->n_seq_max() == 1) {
+        ctx_compute = params.ctx_other;
+    }
+
     // TODO: more generic
     if (model.arch == LLM_ARCH_GEMMA4_ASSISTANT) {
         if (params.ctx_other == nullptr) {
@@ -250,6 +257,23 @@ llama_context::llama_context(
     cparams.n_batch = cparams.causal_attn ? std::min(cparams.n_ctx, params.n_batch) : params.n_batch;
 
     cparams.n_ubatch = std::min(cparams.n_batch, params.n_ubatch == 0 ? params.n_batch : params.n_ubatch);
+
+    if (model.arch == LLM_ARCH_QWEN35 && cparams.ctx_type == LLAMA_CONTEXT_TYPE_DEFAULT && cparams.n_seq_max == 1) {
+        if (const char * value = std::getenv("LLAMA_QWEN35_LAYER_MAJOR_WINDOW")) {
+            char * end = nullptr;
+            const unsigned long requested = std::strtoul(value, &end, 10);
+            if (end != value && *end == '\0' && requested >= cparams.n_batch) {
+                const uint32_t capped = std::min<uint32_t>((uint32_t) requested, std::min<uint32_t>(cparams.n_ctx, 8192));
+                layer_major_window = std::max(cparams.n_batch, (capped / cparams.n_ubatch) * cparams.n_ubatch);
+                LLAMA_LOG_WARN("%s: experimental Qwen layer-major prefill enabled, window = %u, physical ubatch = %u\n",
+                        __func__, layer_major_window, cparams.n_ubatch);
+            }
+        }
+    } else if (cparams.ctx_type == LLAMA_CONTEXT_TYPE_MTP && params.ctx_other != nullptr) {
+        // The native MTP hook receives the target's logical prompt window and
+        // still splits it into its normal physical microbatches.
+        layer_major_window = params.ctx_other->prefill_batch_size();
+    }
 
     cparams.n_outputs_max = params.n_outputs_max == 0 || llama_model_has_encoder(&model) ? cparams.n_batch : params.n_outputs_max;
     cparams.n_outputs_max_per_seq = params.n_outputs_max_per_seq == 0 ?
@@ -445,7 +469,8 @@ llama_context::llama_context(
             auto * buft = ggml_backend_get_default_buffer_type(backend.get());
             auto backend_type = ggml_backend_dev_type(ggml_backend_get_device(backend.get()));
 
-            if (backend_type == GGML_BACKEND_DEVICE_TYPE_CPU && !model.devices.empty()) {
+            if (backend_type == GGML_BACKEND_DEVICE_TYPE_CPU && !model.devices.empty() &&
+                    getenv("LLAMA_KV_MANAGED") == nullptr) {
                 // use the host buffer of the first device CPU for faster transfer of the intermediate state
                 const auto & dev = model.devices[0];
                 auto * host_buft = ggml_backend_dev_host_buffer_type(dev.dev);
@@ -519,6 +544,13 @@ llama_context::llama_context(
 llama_context::~llama_context() {
     // wait for any pending asynchronous copies into the output buffers before they are freed
     synchronize();
+
+    if (compute_share) {
+        std::lock_guard<std::mutex> lock(compute_share->mutex);
+        if (compute_share->active == this) {
+            compute_share->active = nullptr;
+        }
+    }
 
     if (!model.hparams.no_alloc) {
         for (size_t i = 0; i < backend_ptrs.size(); ++i) {
@@ -600,6 +632,10 @@ void llama_context::resolve_fused_ops(const llama_memory_context_i * mctx, uint3
         resolve(llm_fused_op_gdn_ch_probe, cparams.fused_gdn_ch);
         cparams.auto_fgdn = false;
     }
+    if (std::getenv("LLAMA_DISABLE_FUSED_GDN_CH") != nullptr) {
+        cparams.fused_gdn_ch = false;
+        LLAMA_LOG_INFO("%s: fused Gated Delta Net (chunked) disabled by environment\n", func);
+    }
 
     if (cparams.auto_flid) {
         LLAMA_LOG_INFO("%s: resolving fused Lightning Indexer support:\n", func);
@@ -637,9 +673,46 @@ void llama_context::sched_reserve() {
     LLAMA_LOG_DEBUG("%s: max_nodes = %zu\n", __func__, max_nodes);
 
     gf_res_prev.reset(new llm_graph_result(max_nodes));
+    if (cparams.ctx_type == LLAMA_CONTEXT_TYPE_MTP) {
+        gf_res_prev_mtp_prefill.reset(new llm_graph_result(max_nodes));
+    } else {
+        gf_res_prev_mtp_prefill.reset();
+    }
     gf_res_reserve.reset(new llm_graph_result(max_nodes));
+    gf_res_prev_active = nullptr;
 
     sched.reset(ggml_backend_sched_new(backend_ptrs.data(), backend_buft.data(), backend_ptrs.size(), max_nodes, cparams.pipeline_parallel, cparams.op_offload));
+
+    const char * mtp_shared_env = std::getenv("LLAMA_MTP_SHARED_COMPUTE");
+    const bool mtp_shared_enabled = mtp_shared_env == nullptr || strcmp(mtp_shared_env, "0") != 0;
+
+    if (ctx_compute != nullptr && mtp_shared_enabled) {
+        int n_devices = 0;
+        bool is_cuda = true;
+        for (ggml_backend_t backend : backend_ptrs) {
+            ggml_backend_dev_t device = ggml_backend_get_device(backend);
+            if (device == nullptr || ggml_backend_dev_type(device) == GGML_BACKEND_DEVICE_TYPE_CPU) {
+                continue;
+            }
+
+            n_devices++;
+            ggml_backend_reg_t reg = ggml_backend_dev_backend_reg(device);
+            is_cuda = is_cuda && reg != nullptr && strcmp(ggml_backend_reg_name(reg), "CUDA") == 0;
+        }
+
+        if (n_devices == 1 && is_cuda &&
+            ggml_backend_sched_share_compute_buffers(sched.get(), ctx_compute->get_sched())) {
+            if (!ctx_compute->compute_share) {
+                ctx_compute->compute_share = std::make_shared<llama_compute_buffer_share>();
+            }
+            compute_share = ctx_compute->compute_share;
+            LLAMA_LOG_INFO("%s: sharing compute buffers with the target context (synchronized handoff)\n", __func__);
+        } else {
+            LLAMA_LOG_INFO("%s: compute buffer sharing unavailable; using independent buffers\n", __func__);
+        }
+    } else if (ctx_compute != nullptr) {
+        LLAMA_LOG_INFO("%s: compute buffer sharing disabled by LLAMA_MTP_SHARED_COMPUTE=0\n", __func__);
+    }
 
     llama_memory_context_ptr mctx;
     if (memory) {
@@ -782,6 +855,39 @@ void llama_context::synchronize() {
     t_compute_start_us = 0;
 }
 
+void llama_context::compute_arena_request_reset() {
+    if (!sched) {
+        return;
+    }
+
+    synchronize();
+
+    // Any reused graph may refer to pages released below. Force the next
+    // process_ubatch() to rebuild/allocate its tensors, which remaps exactly
+    // the ranges it needs at the same virtual addresses.
+    gf_res_prev->reset();
+    if (gf_res_prev_mtp_prefill) {
+        gf_res_prev_mtp_prefill->reset();
+    }
+    gf_res_prev_active = nullptr;
+    ggml_backend_sched_request_reset(sched.get());
+}
+
+void llama_context::compute_arena_request_invalidate() {
+    if (!sched) {
+        return;
+    }
+
+    // The physical pages are owned/reset by the target context. The draft
+    // context only needs to forget graph bindings into that shared arena.
+    gf_res_prev->reset();
+    if (gf_res_prev_mtp_prefill) {
+        gf_res_prev_mtp_prefill->reset();
+    }
+    gf_res_prev_active = nullptr;
+    ggml_backend_sched_reset(sched.get());
+}
+
 const llama_model & llama_context::get_model() const {
     return model;
 }
@@ -804,6 +910,10 @@ uint32_t llama_context::n_ctx_seq() const {
 
 uint32_t llama_context::n_batch() const {
     return cparams.n_batch;
+}
+
+uint32_t llama_context::prefill_batch_size() const {
+    return layer_major_window > 0 ? layer_major_window : cparams.n_batch;
 }
 
 uint32_t llama_context::n_ubatch() const {
@@ -855,6 +965,10 @@ bool llama_context::memory_update(bool optimize) {
         // TODO: change the mctx->apply() to return information if a graph reserve is needed
         //       reset the graph result only if the memory module did reset the scheduler
         gf_res_prev->reset();
+        if (gf_res_prev_mtp_prefill) {
+            gf_res_prev_mtp_prefill->reset();
+        }
+        gf_res_prev_active = nullptr;
 
         if (!mctx->apply()) {
             LLAMA_LOG_ERROR("%s: failed to apply memory update\n", __func__);
@@ -1252,6 +1366,34 @@ void llama_context::set_warmup(bool value) {
     //sched_need_reserve = true;
 }
 
+void llama_context::set_recurrent_transaction(bool enabled) {
+    if (memory) {
+        memory->set_recurrent_transaction(enabled);
+    }
+}
+
+bool llama_context::recurrent_transaction_deferred() const {
+    return memory && memory->recurrent_transaction_deferred();
+}
+
+bool llama_context::recurrent_transaction_accept(llama_seq_id seq_id, uint32_t n_keep) {
+    if (!memory) {
+        return false;
+    }
+    ggml_backend_t replay_backend = nullptr;
+    for (ggml_backend_t backend : backend_ptrs) {
+        const auto device = ggml_backend_get_device(backend);
+        if (device != nullptr && ggml_backend_dev_type(device) == GGML_BACKEND_DEVICE_TYPE_GPU) {
+            replay_backend = backend;
+            break;
+        }
+    }
+    if (replay_backend == nullptr) {
+        synchronize();
+    }
+    return memory->recurrent_transaction_accept(seq_id, n_keep, replay_backend);
+}
+
 bool llama_context::set_sampler(llama_seq_id seq_id, llama_sampler * sampler) {
     if (!sampler && sampling.samplers.count(seq_id) == 0) {
         return true;
@@ -1368,8 +1510,15 @@ bool llama_context::set_adapter_cvec(
     return res;
 }
 
-llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, llm_graph_type gtype, llama_memory_context_i * mctx, ggml_status & ret) {
-    if (mctx && !mctx->apply()) {
+llm_graph_result * llama_context::process_ubatch(
+        const llama_ubatch & ubatch,
+              llm_graph_type gtype,
+        llama_memory_context_i * mctx,
+                 ggml_status & ret,
+                        bool apply_memory,
+                    uint32_t layer_start,
+                    uint32_t layer_end) {
+    if (apply_memory && mctx && !mctx->apply()) {
         LLAMA_LOG_ERROR("%s: failed to apply memory context\n", __func__);
         ret = GGML_STATUS_FAILED;
         return nullptr;
@@ -1389,13 +1538,16 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
     }
 
     auto * res = gf_res_prev.get();
+    if (cparams.ctx_type == LLAMA_CONTEXT_TYPE_MTP && n_outputs == 0) {
+        res = gf_res_prev_mtp_prefill.get();
+    }
     auto * gf  = res->get_gf();
 
     // the new graph parameters
     // in order to correctly reuse a graph, it's full topology has to be uniquely determined by these parameters
-    const auto gparams = graph_params(res, ubatch, mctx, gtype);
+    const auto gparams = graph_params(res, ubatch, mctx, gtype, layer_start, layer_end);
 
-    if (!graph_reuse_disable && res->can_reuse(gparams)) {
+    if (!graph_reuse_disable && gf_res_prev_active == res && res->can_reuse(gparams)) {
         //LLAMA_LOG_DEBUG("%s: reusing previous graph\n", __func__);
 
         // with pipeline parallelism, the previous graph_compute_async may still be running
@@ -1407,6 +1559,7 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
 
         n_reused++;
     } else {
+        gf_res_prev_active = nullptr;
         res->reset();
 
         ggml_backend_sched_reset(sched.get());
@@ -1429,6 +1582,8 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
             ret = GGML_STATUS_ALLOC_FAILED;
             return nullptr;
         }
+
+        gf_res_prev_active = res;
     }
 
     // set the input data for the input tensors
@@ -1884,7 +2039,7 @@ int llama_context::decode(const llama_batch & batch_inp) {
         }
     }
 
-    GGML_ASSERT(n_tokens_all <= cparams.n_batch);
+    GGML_ASSERT(n_tokens_all <= prefill_batch_size());
 
     GGML_ASSERT((cparams.causal_attn || cparams.n_ubatch >= n_tokens_all) && "non-causal attention requires n_ubatch >= n_tokens");
 
@@ -1955,7 +2110,7 @@ int llama_context::decode(const llama_batch & batch_inp) {
     }
 
     // reserve output buffer
-    if (output_reserve(n_outputs_all) < n_outputs_all) {
+    if (output_reserve(n_outputs_all, n_tokens_all) < n_outputs_all) {
         LLAMA_LOG_ERROR("%s: could not reserve space for batch with %d outputs\n", __func__, n_outputs_all);
         return -2;
     };
@@ -1968,7 +2123,276 @@ int llama_context::decode(const llama_batch & batch_inp) {
     int64_t n_outputs_prev = 0;
     int64_t n_tokens_prev  = 0;
 
-    do {
+    auto consume_layer_major_output = [&](const llama_ubatch & ubatch, const llm_graph_result * res) {
+        auto * t_logits  = res->get_logits();
+        auto * t_embd    = cparams.embeddings       ? res->get_embd()    : nullptr;
+        auto * t_h_nextn = cparams.embeddings_nextn ? res->get_h_nextn() : nullptr;
+
+        if (t_embd && res->get_embd_pooled()) {
+            t_embd = res->get_embd_pooled();
+        }
+
+        if (logits.data && t_logits && n_outputs > 0 && needs_raw_logits(ubatch, sampling.samplers)) {
+            ggml_backend_t backend_res = ggml_backend_sched_get_tensor_backend(sched.get(), t_logits);
+            GGML_ASSERT(backend_res != nullptr);
+            float * logits_out = logits.data + n_outputs_prev*n_vocab;
+            GGML_ASSERT(n_outputs_prev + n_outputs <= n_outputs_all);
+            GGML_ASSERT((n_outputs_prev + n_outputs)*n_vocab <= (int64_t) logits.size);
+            ggml_backend_tensor_get_async(backend_res, t_logits, logits_out, 0, n_outputs*n_vocab*sizeof(float));
+        }
+
+        if (embd.data && t_embd && n_outputs > 0) {
+            ggml_backend_t backend_embd = ggml_backend_sched_get_tensor_backend(sched.get(), t_embd);
+            GGML_ASSERT(backend_embd != nullptr);
+
+            if (cparams.pooling_type == LLAMA_POOLING_TYPE_NONE) {
+                const uint32_t n_embd_out = hparams.n_embd_out();
+                float * embd_out = embd.data + n_outputs_prev*n_embd_out;
+                GGML_ASSERT(n_outputs_prev + n_outputs <= n_outputs_all);
+                GGML_ASSERT((n_outputs_prev + n_outputs)*n_embd_out <= (int64_t) embd.size);
+                ggml_backend_tensor_get_async(backend_embd, t_embd, embd_out, 0, n_outputs*n_embd_out*sizeof(float));
+            } else {
+                // The experimental path is restricted to ordinary causal
+                // generation. Pooling requests keep the established path.
+                GGML_ABORT("layer-major prefill does not support pooled embeddings");
+            }
+        }
+
+        extract_layer_inputs(res, n_tokens_prev, ubatch.n_tokens);
+
+        {
+            const bool masked    = cparams.embeddings_nextn_masked;
+            const int64_t n_rows = masked ? n_outputs : (int64_t) ubatch.n_tokens;
+            const int64_t offset = masked ? n_outputs_prev : n_tokens_prev;
+
+            if (embd_nextn.data && t_h_nextn && n_rows > 0 && cparams.pooling_type == LLAMA_POOLING_TYPE_NONE) {
+                ggml_backend_t backend_h = ggml_backend_sched_get_tensor_backend(sched.get(), t_h_nextn);
+                GGML_ASSERT(backend_h != nullptr);
+                const uint32_t n_embd_out = hparams.n_embd_out();
+                float * embd_nextn_out = embd_nextn.data + offset*n_embd_out;
+                GGML_ASSERT((offset + n_rows)*n_embd_out <= (int64_t) embd_nextn.size);
+                ggml_backend_tensor_get_async(backend_h, t_h_nextn, embd_nextn_out, 0, n_rows*n_embd_out*sizeof(float));
+            }
+        }
+
+        if (has_samplers) {
+            const auto stride = n_vocab;
+            copy_tensor_async_rows(res->t_sampled,        sampling.sampled,    1,      n_outputs_prev, sched.get());
+            copy_tensor_async_rows(res->t_sampled_logits, sampling.logits,     stride, n_outputs_prev, sched.get(), &sampling.logits_count);
+            copy_tensor_async_rows(res->t_sampled_probs,  sampling.probs,      stride, n_outputs_prev, sched.get(), &sampling.probs_count);
+            copy_tensor_async_rows(res->t_candidates,     sampling.candidates, stride, n_outputs_prev, sched.get(), &sampling.candidates_count);
+        }
+
+        n_outputs_prev += n_outputs;
+        n_tokens_prev  += ubatch.n_tokens;
+    };
+
+    bool used_layer_major = false;
+    const bool layer_major_candidate =
+        layer_major_window >= cparams.n_batch &&
+        n_tokens_all >= cparams.n_ubatch &&
+        model.arch == LLM_ARCH_QWEN35 &&
+        cparams.ctx_type == LLAMA_CONTEXT_TYPE_DEFAULT &&
+        cparams.n_seq_max == 1 &&
+        !output_all &&
+        cparams.pooling_type == LLAMA_POOLING_TYPE_NONE;
+
+    if (layer_major_candidate) {
+        auto * hctx = dynamic_cast<llama_memory_hybrid_context *>(mctx.get());
+        if (hctx == nullptr || hctx->ubatch_count() < 1) {
+            LLAMA_LOG_WARN("%s: layer-major prefill unavailable for this memory context; using established order\n", __func__);
+        } else {
+            const uint32_t n_embd_stage = hparams.n_embd;
+            const size_t activation_spool_elements = (size_t) n_tokens_all * n_embd_stage;
+            const bool device_spool_requested = [] {
+                const char * value = std::getenv("LLAMA_QWEN35_LAYER_MAJOR_DEVICE_SPOOL");
+                return value != nullptr && std::atoi(value) != 0;
+            }();
+
+            std::vector<float> activation_spool;
+            ggml_context_ptr activation_spool_ctx;
+            ggml_backend_buffer_ptr activation_spool_buffer;
+            ggml_tensor * activation_spool_root = nullptr;
+            std::vector<ggml_tensor *> activation_spool_views;
+            ggml_backend_t activation_spool_backend = nullptr;
+
+            if (device_spool_requested) {
+                for (ggml_backend_t backend : backend_ptrs) {
+                    if (ggml_backend_dev_type(ggml_backend_get_device(backend)) == GGML_BACKEND_DEVICE_TYPE_GPU) {
+                        activation_spool_backend = backend;
+                        break;
+                    }
+                }
+
+                if (activation_spool_backend != nullptr) {
+                    ggml_init_params spool_params = {
+                        /*.mem_size   =*/ ggml_tensor_overhead() * (hctx->ubatch_count() + 1),
+                        /*.mem_buffer =*/ nullptr,
+                        /*.no_alloc   =*/ true,
+                    };
+                    activation_spool_ctx.reset(ggml_init(spool_params));
+                    if (activation_spool_ctx) {
+                        activation_spool_root = ggml_new_tensor_2d(
+                                activation_spool_ctx.get(), GGML_TYPE_F32,
+                                n_embd_stage, n_tokens_all);
+                        auto * buft = ggml_backend_get_default_buffer_type(activation_spool_backend);
+                        const size_t spool_bytes = ggml_backend_buft_get_alloc_size(buft, activation_spool_root);
+                        activation_spool_buffer.reset(ggml_backend_buft_alloc_buffer(buft, spool_bytes));
+                        if (activation_spool_buffer &&
+                                ggml_backend_tensor_alloc(
+                                    activation_spool_buffer.get(), activation_spool_root,
+                                    ggml_backend_buffer_get_base(activation_spool_buffer.get())) == GGML_STATUS_SUCCESS) {
+                            activation_spool_views.reserve(hctx->ubatch_count());
+                        } else {
+                            activation_spool_buffer.reset();
+                            activation_spool_root = nullptr;
+                            activation_spool_ctx.reset();
+                        }
+                    }
+                }
+            }
+
+            const bool device_spool = activation_spool_root != nullptr;
+            if (!device_spool) {
+                activation_spool.resize(activation_spool_elements);
+            }
+            std::vector<size_t> offsets(hctx->ubatch_count());
+
+            size_t token_offset = 0;
+            for (size_t i = 0; i < hctx->ubatch_count(); ++i) {
+                offsets[i] = token_offset;
+                token_offset += hctx->get_ubatch(i).n_tokens;
+            }
+            GGML_ASSERT(token_offset == n_tokens_all);
+
+            if (device_spool) {
+                for (size_t i = 0; i < hctx->ubatch_count(); ++i) {
+                    const auto & prepared = hctx->get_ubatch(i);
+                    ggml_tensor * view = ggml_view_2d(
+                            activation_spool_ctx.get(), activation_spool_root,
+                            n_embd_stage, prepared.n_tokens,
+                            n_embd_stage * sizeof(float),
+                            offsets[i] * n_embd_stage * sizeof(float));
+                    if (ggml_backend_view_init(view) != GGML_STATUS_SUCCESS) {
+                        LLAMA_LOG_ERROR("%s: failed to initialize device activation spool view %zu\n", __func__, i);
+                        return -2;
+                    }
+                    activation_spool_views.push_back(view);
+                }
+            }
+
+            uint32_t stage_layers = 4;
+            if (const char * value = std::getenv("LLAMA_QWEN35_LAYER_MAJOR_STAGE")) {
+                char * end = nullptr;
+                const unsigned long requested = std::strtoul(value, &end, 10);
+                if (end != value && *end == '\0' && requested > 0) {
+                    stage_layers = std::min<uint32_t>((uint32_t) requested, hparams.n_layer());
+                }
+            }
+            const uint32_t n_layers = hparams.n_layer();
+            LLAMA_LOG_INFO("%s: layer-major prefill: tokens=%u, ubatches=%zu, stages=%u, spool=%s %.2f MiB\n",
+                    __func__, n_tokens_all, hctx->ubatch_count(),
+                    (n_layers + stage_layers - 1) / stage_layers,
+                    device_spool ? "CUDA-F32" : "host-F32",
+                    activation_spool_elements * sizeof(float) / 1024.0 / 1024.0);
+
+            for (uint32_t layer_start = 0; layer_start < n_layers; layer_start += stage_layers) {
+                const uint32_t layer_end = std::min(n_layers, layer_start + stage_layers);
+                const bool final_stage = layer_end == n_layers;
+
+                for (size_t i = 0; i < hctx->ubatch_count(); ++i) {
+                    if (layer_start == 0) {
+                        if (i > 0 && !mctx->next()) {
+                            LLAMA_LOG_ERROR("%s: layer-major microbatch enumeration ended early\n", __func__);
+                            return -3;
+                        }
+                    } else {
+                        if (!hctx->select_ubatch(i)) {
+                            LLAMA_LOG_ERROR("%s: failed to select prepared microbatch %zu\n", __func__, i);
+                            return -3;
+                        }
+                    }
+
+                    llama_ubatch staged = hctx->get_ubatch();
+                    if (layer_start > 0) {
+                        staged.token = nullptr;
+                        if (device_spool) {
+                            staged.embd = nullptr;
+                            staged.embd_device = activation_spool_views[i];
+                            staged.embd_device_backend = activation_spool_backend;
+                        } else {
+                            staged.embd = activation_spool.data() + offsets[i] * n_embd_stage;
+                        }
+                    }
+
+                    if (final_stage) {
+                        int32_t n_outputs_new = 0;
+                        for (uint32_t k = 0; k < staged.n_tokens; ++k) {
+                            n_outputs_new += (int32_t) (staged.output[k] != 0);
+                        }
+                        n_outputs = n_outputs_new;
+                    } else {
+                        n_outputs = 0;
+                    }
+
+                    ggml_status status;
+                    const bool apply_memory = layer_start == 0;
+                    const auto * res = process_ubatch(
+                            staged, LLM_GRAPH_TYPE_DECODER_LAYER, hctx, status,
+                            apply_memory, layer_start, layer_end);
+                    if (!res) {
+                        LLAMA_LOG_ERROR("%s: layer-major stage [%u, %u) failed for microbatch %zu, status=%d\n",
+                                __func__, layer_start, layer_end, i, (int) status);
+                        return status == GGML_STATUS_ALLOC_FAILED ? -2 : -3;
+                    }
+
+                    // Diagnostic/correctness fence for the experimental
+                    // layer-major scheduler.  A later microbatch reuses the
+                    // same scheduler and writes another slice of the same KV
+                    // tensors.  Keep this behind an environment switch while
+                    // we establish whether an explicit cross-graph CUDA
+                    // dependency is required on this path.
+                    if (const char * layer_sync = std::getenv("LLAMA_QWEN35_LAYER_MAJOR_SYNC")) {
+                        if (std::atoi(layer_sync) == 2) {
+                            const int n_backends = ggml_backend_sched_get_n_backends(sched.get());
+                            for (int ib = 0; ib < n_backends; ++ib) {
+                                ggml_backend_t backend = ggml_backend_sched_get_backend(sched.get(), ib);
+                                if (ggml_backend_dev_type(ggml_backend_get_device(backend)) == GGML_BACKEND_DEVICE_TYPE_GPU) {
+                                    ggml_backend_synchronize(backend);
+                                }
+                            }
+                        } else {
+                            ggml_backend_sched_synchronize(sched.get());
+                        }
+                    }
+
+                    if (!final_stage) {
+                        ggml_tensor * t_stage = res->get_embd();
+                        GGML_ASSERT(t_stage != nullptr);
+                        ggml_backend_t backend_stage = ggml_backend_sched_get_tensor_backend(sched.get(), t_stage);
+                        GGML_ASSERT(backend_stage != nullptr);
+                        if (device_spool) {
+                            ggml_backend_tensor_copy_async(
+                                    backend_stage, activation_spool_backend,
+                                    t_stage, activation_spool_views[i]);
+                        } else {
+                            ggml_backend_tensor_get(
+                                    t_stage,
+                                    activation_spool.data() + offsets[i] * n_embd_stage,
+                                    0,
+                                    (size_t) staged.n_tokens * n_embd_stage * sizeof(float));
+                        }
+                    } else {
+                        consume_layer_major_output(staged, res);
+                    }
+                }
+            }
+
+            used_layer_major = true;
+        }
+    }
+
+    if (!used_layer_major) do {
         const auto & ubatch = mctx->get_ubatch();
 
         // count the outputs in this ubatch
@@ -2217,13 +2641,13 @@ int llama_context::decode(const llama_batch & batch_inp) {
 // output
 //
 
-uint32_t llama_context::output_reserve(int32_t n_outputs) {
+uint32_t llama_context::output_reserve(int32_t n_outputs, uint32_t n_tokens) {
     const auto & hparams = model.hparams;
     const auto & vocab   = model.vocab;
 
     const int64_t n_outputs_max = std::max<int64_t>(n_outputs, n_seq_max());
 
-    const auto n_batch    = cparams.n_batch;
+    const auto n_batch    = std::max(cparams.n_batch, n_tokens);
     const auto n_vocab    = vocab.n_tokens();
     const auto n_embd     = hparams.n_embd;
     const auto n_embd_out = hparams.n_embd_out();
@@ -2265,8 +2689,7 @@ uint32_t llama_context::output_reserve(int32_t n_outputs) {
         backend_token_count = (1 + n_vocab) * n_outputs_max;    // sampled + candidates
     }
 
-    if (output_ids.empty()) {
-        // init, never resized afterwards
+    if (output_ids.size() < n_batch) {
         output_ids.resize(n_batch);
     }
 
@@ -2603,6 +3026,10 @@ ggml_cgraph * llama_context::graph_reserve(
 
     // when the scheduler is reset, we cannot reuse the old graph, so we reset the previous graph result to prevent that
     gf_res_prev->reset();
+    if (gf_res_prev_mtp_prefill) {
+        gf_res_prev_mtp_prefill->reset();
+    }
+    gf_res_prev_active = nullptr;
 
     // store the n_outputs as it is, and restore it afterwards
     // TODO: not sure if needed, might simplify in the future by removing this
@@ -2645,13 +3072,17 @@ llm_graph_params llama_context::graph_params(
                         llm_graph_result * res,
                       const llama_ubatch & ubatch,
             const llama_memory_context_i * mctx,
-                          llm_graph_type   gtype) const {
+                          llm_graph_type   gtype,
+                                uint32_t   layer_start,
+                                uint32_t   layer_end) const {
     return {
         /*.arch        =*/ model.arch,
         /*.hparams     =*/ model.hparams,
         /*.cparams     =*/ cparams,
         /*.ubatch      =*/ ubatch,
         /*.gtype       =*/ gtype,
+        /*.layer_start =*/ layer_start,
+        /*.layer_end   =*/ layer_end,
         /*.sched       =*/ sched.get(),
         /*.backend_cpu =*/ backend_cpu,
         /*.cvec        =*/ cvec.get(),
@@ -2668,6 +3099,17 @@ llm_graph_params llama_context::graph_params(
 ggml_status llama_context::graph_compute(
             ggml_cgraph * gf,
                    bool   batched) {
+    // llama_decode() queues CUDA work asynchronously. Before another context
+    // reuses the same physical arena, wait for the previous owner's graph.
+    // Repeated work by the same context remains asynchronous.
+    if (compute_share) {
+        std::lock_guard<std::mutex> lock(compute_share->mutex);
+        if (compute_share->active != nullptr && compute_share->active != this) {
+            compute_share->active->synchronize();
+        }
+        compute_share->active = this;
+    }
+
     int n_threads        = batched ? cparams.n_threads_batch : cparams.n_threads;
     ggml_threadpool_t tp = batched ? threadpool_batch        : threadpool;
 
@@ -3085,17 +3527,26 @@ public:
             }
 
             if (mbuf_cur.n_tensors == mbuf.n_tensors) {
-                // same chunking: copy 1:1 by index
+                // Equal tensor counts do not guarantee equal chunking, e.g. save ranges [2,1]
+                // and restore runs [1,2]. Only use the direct path when every split matches.
+                bool same_chunking = true;
                 for (size_t i = 0; i < mbuf_cur.org.size(); ++i) {
-                    GGML_ASSERT(ggml_nbytes(mbuf_cur.cpy[i]) == ggml_nbytes(mbuf.org[i]));
-                    ggml_backend_tensor_copy(mbuf_cur.cpy[i], mbuf.org[i]);
+                    if (ggml_nbytes(mbuf_cur.cpy[i]) != ggml_nbytes(mbuf.org[i])) {
+                        same_chunking = false;
+                        break;
+                    }
                 }
-                continue;
+
+                if (same_chunking) {
+                    for (size_t i = 0; i < mbuf_cur.org.size(); ++i) {
+                        ggml_backend_tensor_copy(mbuf_cur.cpy[i], mbuf.org[i]);
+                    }
+                    continue;
+                }
             }
 
-            // different chunking: copy the write-side data (mbuf_cur.cpy) into the read-side targets (mbuf.org)
-            // with a byte cursor. Write and read enumerate the same logical data in the same order but may chunk
-            // it differently, so copy across tensor boundaries rather than 1:1 by index.
+            // The writer and reader enumerate the same logical bytes in the same order, but
+            // can split them at different tensor boundaries. Walk both lists with byte cursors.
             const size_t total = mbuf_cur.total_size;
 
             ggml_init_params params_scratch = {
@@ -3118,13 +3569,11 @@ public:
 
                 const size_t src_size = ggml_nbytes(src_t);
                 const size_t dst_size = ggml_nbytes(dst_t);
-
                 const size_t src_off  = src_pos - src_base;
                 const size_t dst_off  = dst_pos - dst_base;
+                const size_t n_copy   = std::min(src_size - src_off, dst_size - dst_off);
 
-                const size_t n_copy = std::min(src_size - src_off, dst_size - dst_off);
-
-                const size_t   el   = ggml_element_size(src_t);
+                const size_t  el   = ggml_element_size(src_t);
                 const int64_t n_el = (int64_t) (n_copy / el);
 
                 auto * src_v = ggml_view_1d(ctx_scratch, src_t, n_el, src_off);
@@ -3676,6 +4125,7 @@ void llama_context::opt_epoch_iter(
 
             const auto gparams = graph_params(res, ubatch, mctx.get(), ctx_type_to_graph_type(cparams.ctx_type));
 
+            gf_res_prev_active = nullptr;
             res->reset();
 
             auto * gf = model.build_graph(gparams);
@@ -3931,6 +4381,10 @@ uint32_t llama_n_ctx_seq(const llama_context * ctx) {
 
 uint32_t llama_n_batch(const llama_context * ctx) {
     return ctx->n_batch();
+}
+
+uint32_t llama_prefill_batch_size(const llama_context * ctx) {
+    return ctx->prefill_batch_size();
 }
 
 uint32_t llama_n_ubatch(const llama_context * ctx) {
@@ -4191,6 +4645,22 @@ bool llama_memory_seq_rm(
     return mem->seq_rm(seq_id, p0, p1);
 }
 
+bool llama_memory_seq_rm_attn(
+        llama_memory_t mem,
+          llama_seq_id seq_id,
+             llama_pos p0,
+             llama_pos p1) {
+    if (!mem) {
+        return true;
+    }
+
+    return mem->seq_rm_attn(seq_id, p0, p1);
+}
+
+bool llama_memory_can_rm_attn(llama_memory_t mem) {
+    return mem && mem->get_can_rm_attn();
+}
+
 void llama_memory_seq_cp(
         llama_memory_t mem,
           llama_seq_id seq_id_src,
@@ -4407,6 +4877,26 @@ int32_t llama_decode(
     }
 
     return ret;
+}
+
+void llama_compute_arena_request_reset(struct llama_context * ctx) {
+    ctx->compute_arena_request_reset();
+}
+
+void llama_compute_arena_request_invalidate(struct llama_context * ctx) {
+    ctx->compute_arena_request_invalidate();
+}
+
+void llama_set_recurrent_transaction(llama_context * ctx, bool enabled) {
+    ctx->set_recurrent_transaction(enabled);
+}
+
+bool llama_recurrent_transaction_deferred(const llama_context * ctx) {
+    return ctx->recurrent_transaction_deferred();
+}
+
+bool llama_recurrent_transaction_accept(llama_context * ctx, llama_seq_id seq_id, uint32_t n_keep) {
+    return ctx->recurrent_transaction_accept(seq_id, n_keep);
 }
 
 //

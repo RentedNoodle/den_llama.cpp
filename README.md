@@ -92,6 +92,25 @@ The only required arguments are the model GGUF and maximum context. See [benchma
 
 </div>
 
+## Qwen3.8 Blackwell 256K runtime branch
+
+This branch contains the complete derived source for the experimental Qwen3.8-27B
+runtime developed on an RTX 5070 Ti. It is based on upstream commit
+`d775b8967a46d8beb110d444aa3b8938179e0dd8` and includes the CUDA, allocator,
+hybrid-KV, recurrent-state, MTP, and server changes needed by the published
+runtime profile.
+
+- Read the [engineering study](docs/LOCAL-QWEN-BLACKWELL-STUDY.md).
+- Use the [reproducible Windows launcher](examples/qwen38-blackwell/README.md).
+- Model weights and generated binaries are intentionally not committed.
+
+Compatibility is deliberately narrow: this branch was tested only with the exact
+Qwen3.8-27B UD-IQ4_XS model documented in the study on an RTX 5070 Ti 16 GB.
+RTX 5060 Ti 16 GB and RTX 5080 16 GB are plausible Blackwell ports, but remain
+untested and require their own memory-fit, token-identity, and repository-quality
+validation. Other models and quantizations are not supported by inference from
+these results.
+
 ## Quick start
 
 A few options to get `llama.cpp` installed on your machine:
