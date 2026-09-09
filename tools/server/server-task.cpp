@@ -1470,10 +1470,14 @@ json server_task_result_embd::to_json() {
 }
 
 json server_task_result_embd::to_json_non_oaicompat() {
-    return json {
+    json ret = {
         {"index",     index},
         {"embedding", embedding},
     };
+    if (!nextn.empty()) {
+        ret["nextn"] = nextn;
+    }
+    return ret;
 }
 
 json server_task_result_embd::to_json_oaicompat() {

@@ -15,9 +15,15 @@
 #include <algorithm>
 #include <cassert>
 #include <cmath>
+#include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <iomanip>
 #include <map>
+#include <sys/stat.h>
+#ifdef _WIN32
+#include <direct.h>
+#endif
 #include <cinttypes>
 
 #define SPC_DBG(fmt, ...) LOG_DBG("spec %12.*s: " fmt, 12, __func__, __VA_ARGS__)
@@ -1512,6 +1518,16 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
                     "(need_embd / logits=1 on every prompt position?). "
                     "Drafts may degrade.\n",
                     (int) pos_max, N - 1);
+
+            // [local fix #27296] the new prompt does not extend this slot draft
+            // state: the per-sequence MTP carryover belongs to a previous request.
+            // Keep it from poisoning the first catch-up row pairing (stale h-row
+            // paired with the first token of an unrelated conversation).
+            if (pending_h.size() > (size_t) seq_id) {
+                pending_h[seq_id].assign(n_embd, 0.0f);
+                verify_h[seq_id].clear();
+                verify_h_rows[seq_id] = 0;
+            }
         }
     }
 
@@ -1688,6 +1704,57 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
             if (ret != 0) {
                 SPC_ERR("llama_decode[%d] returned %d\n", i, ret);
                 break;
+            }
+
+            // TEMPORARY DEBUG: capture the ground-truth MTP head output for the
+            // FIRST single-token draft decode, via the public APIs. Env LLAMA_DUMP_MTP.
+            {
+                static bool g_final_dumped = false;
+                if (getenv("LLAMA_DUMP_MTP") && !g_final_dumped && batch.n_tokens == 1) {
+                    g_final_dumped = true;
+                    #ifdef _WIN32
+                    _mkdir("C:\\Den\\dreya\\mtp\\dump");
+                    #endif
+                    const llama_model * m_dft = llama_get_model(ctx_dft);
+                    const int vocab = llama_vocab_n_tokens(llama_model_get_vocab(m_dft));
+                    const int embd  = llama_model_n_embd_out(m_dft);
+
+                    // full logits for the single draft output token
+                    const float * lg = llama_get_logits_ith(ctx_dft, 0);
+                    {
+                        FILE * f = fopen("C:\\Den\\dreya\\mtp\\dump\\final_logits.f32", "wb");
+                        if (f) {
+                            int64_t dims[4] = { (int64_t) vocab, 1, 1, 1 };
+                            fwrite(dims, sizeof(int64_t), 4, f);
+                            fwrite(lg, sizeof(float), (size_t) vocab, f);
+                            fclose(f);
+                            SPC_INF("MTP DEBUG: dumped final_logits.f32 vocab=%d embd=%d\n", vocab, embd);
+                        }
+                    }
+                    // the MTP head hidden (shared_head_norm output) for this token
+                    const float * h_row = llama_get_embeddings_nextn_ith(ctx_dft, 0);
+                    if (h_row) {
+                        FILE * f = fopen("C:\\Den\\dreya\\mtp\\dump\\final_h_nextn.f32", "wb");
+                        if (f) {
+                            int64_t dims[4] = { (int64_t) embd, 1, 1, 1 };
+                            fwrite(dims, sizeof(int64_t), 4, f);
+                            fwrite(h_row, sizeof(float), (size_t) embd, f);
+                            fclose(f);
+                        }
+                    }
+                    // the input token(s) + position fed to this MTP graph
+                    if (batch.token) {
+                        FILE * f = fopen("C:\\Den\\dreya\\mtp\\dump\\final_input_tokens.bin", "wb");
+                        if (f) {
+                            int64_t nt = batch.n_tokens;
+                            int64_t pos = batch.pos ? batch.pos[0] : -1;
+                            fwrite(&nt, sizeof(int64_t), 1, f);
+                            fwrite(&pos, sizeof(int64_t), 1, f);
+                            fwrite(batch.token, sizeof(llama_token), (size_t) batch.n_tokens, f);
+                            fclose(f);
+                        }
+                    }
+                }
             }
 
             // rebuild the batch for the next step: the growing-KV paths re-add only the

@@ -453,6 +453,7 @@ struct server_task_result_cmpl_partial : server_task_result {
 
 struct server_task_result_embd : server_task_result {
     std::vector<std::vector<float>> embedding;
+    std::vector<std::vector<float>> nextn; // MTP head input hidden (h_nextn) per token, when enabled
 
     int32_t n_tokens;
 
