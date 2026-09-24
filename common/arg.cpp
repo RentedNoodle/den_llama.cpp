@@ -2477,6 +2477,20 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_CACHE_TYPE_V"));
     add_opt(common_arg(
+        {"--kv-high-precision-layers"}, "N",
+        string_format(
+            "number of leading full-attention layers that keep the high-precision -ctk/-ctv KV pair; "
+            "the remaining full-attention layers use NVFP4 (default: %d)",
+            params.kv_high_precision_layers
+        ),
+        [](common_params & params, int value) {
+            if (value < 0) {
+                throw std::invalid_argument("--kv-high-precision-layers must be >= 0");
+            }
+            params.kv_high_precision_layers = value;
+        }
+    ).set_env("LLAMA_ARG_KV_HIGH_PRECISION_LAYERS"));
+    add_opt(common_arg(
         {"--hellaswag"},
         "compute HellaSwag score over random tasks from datafile supplied with -f",
         [](common_params & params) {

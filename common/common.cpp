@@ -1755,6 +1755,7 @@ struct llama_context_params common_context_params_to_llama(const common_params &
 
     cparams.type_k = params.cache_type_k;
     cparams.type_v = params.cache_type_v;
+    cparams.kv_high_precision_layers = params.kv_high_precision_layers;
     cparams.kv_stream_stage_mib = params.kv_stream_stage_mib;
     cparams.ser_min_experts     = params.ser_min_experts;
     cparams.ser_thresh_experts  = params.ser_thresh_experts;

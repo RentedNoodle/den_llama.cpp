@@ -30,6 +30,7 @@ llama_memory_hybrid::llama_memory_hybrid(
                             /* layer filters */
     const layer_filter_cb & filter_attn,
     const layer_filter_cb & filter_recr,
+                    int32_t   kv_high_precision_layers,
                      size_t kv_stream_stage_bytes) :
     hparams(model.hparams),
     mem_attn(new llama_kv_cache(
@@ -52,6 +53,7 @@ llama_memory_hybrid::llama_memory_hybrid(
         nullptr,
         nullptr,
         "",
+        kv_high_precision_layers,
         kv_stream_stage_bytes
     )),
     mem_recr(new llama_memory_recurrent(

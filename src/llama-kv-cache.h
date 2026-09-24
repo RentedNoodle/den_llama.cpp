@@ -115,6 +115,7 @@ public:
         const  layer_share_cb & share,
         // a model can hold more than one cache, so the tensor names have to stay unique
                  const char *   name_tag = "",
+                        int32_t   kv_high_precision_layers = 0,
                          size_t kv_stream_stage_bytes = 0);
 
     ~llama_kv_cache() = default;

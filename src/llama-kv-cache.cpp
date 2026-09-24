@@ -83,6 +83,7 @@ llama_kv_cache::llama_kv_cache(
     const  layer_reuse_cb & reuse,
     const  layer_share_cb & share,
              const char *   name_tag,
+                    int32_t   kv_high_precision_layers,
                      size_t kv_stream_stage_bytes) :
     model(model), hparams(hparams), v_trans(v_trans),
     n_seq_max(n_seq_max), n_stream(unified ? 1 : n_seq_max), n_pad(n_pad), n_swa(n_swa), swa_type(swa_type),
@@ -177,6 +178,7 @@ llama_kv_cache::llama_kv_cache(
         }
     }
 
+    int32_t n_kv_layer_seen = 0;
     for (uint32_t il = 0; il < n_layer; il++) {
         if (!hparams.has_kv(il)) {
             LLAMA_LOG_DEBUG("%s: layer %3d: does not have KV cache\n", __func__, il);
@@ -187,6 +189,15 @@ llama_kv_cache::llama_kv_cache(
             LLAMA_LOG_DEBUG("%s: layer %3d: filtered\n", __func__, il);
             continue;
         }
+
+        // layer-wise split-KV: the first `kv_high_precision_layers` KV (full-attention) layers keep
+        // the user's -ctk/-ctv pair; every later KV layer drops to NVFP4. N=0 => type_*_il == type_*
+        // for all layers, i.e. byte-identical to the previous uniform-precision behaviour.
+        const ggml_type type_k_il = (kv_high_precision_layers > 0 && n_kv_layer_seen >= kv_high_precision_layers)
+            ? GGML_TYPE_NVFP4 : type_k;
+        const ggml_type type_v_il = (kv_high_precision_layers > 0 && n_kv_layer_seen >= kv_high_precision_layers)
+            ? GGML_TYPE_NVFP4 : type_v;
+        ++n_kv_layer_seen;
 
         if (share && other) {
             const int32_t il_share = share(il);
@@ -272,8 +283,8 @@ llama_kv_cache::llama_kv_cache(
                     }
 
                     const size_t page_bytes = 256ULL*(
-                        ggml_row_size(type_k, n_embd_k_gqa) +
-                        ggml_row_size(type_v, n_embd_v_gqa));
+                        ggml_row_size(type_k_il, n_embd_k_gqa) +
+                        ggml_row_size(type_v_il, n_embd_v_gqa));
                     kv_stream_runtime.runtime = runtime_new_fn(
                         dev, kv_stream_stage_bytes, page_bytes, kv_stream_layer_count);
                     kv_stream_runtime.free_fn = runtime_free_fn;
@@ -308,8 +319,8 @@ llama_kv_cache::llama_kv_cache(
         const bool has_k = true;
         const bool has_v = !is_mla;
 
-        ggml_tensor * k = has_k ? ggml_new_tensor_3d(ctx, type_k, n_embd_k_gqa, kv_size, n_stream) : nullptr;
-        ggml_tensor * v = has_v ? ggml_new_tensor_3d(ctx, type_v, n_embd_v_gqa, kv_size, n_stream) : nullptr;
+        ggml_tensor * k = has_k ? ggml_new_tensor_3d(ctx, type_k_il, n_embd_k_gqa, kv_size, n_stream) : nullptr;
+        ggml_tensor * v = has_v ? ggml_new_tensor_3d(ctx, type_v_il, n_embd_v_gqa, kv_size, n_stream) : nullptr;
 
         has_k && ggml_format_name(k, "cache_%sk_l%d", name_tag, il);
         has_v && ggml_format_name(v, "cache_%sv_l%d", name_tag, il);

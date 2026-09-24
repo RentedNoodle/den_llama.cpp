@@ -124,6 +124,7 @@ llama_context::llama_context(
     cparams.mtp_chain               = false;
     cparams.offload_kqv             = params.offload_kqv;
     cparams.kv_stream_stage_mib     = params.kv_stream_stage_mib;
+    cparams.kv_high_precision_layers = params.kv_high_precision_layers;
     cparams.ser_min_experts         = params.ser_min_experts;
     cparams.ser_thresh_experts      = params.ser_thresh_experts;
     cparams.ser_top_p               = params.ser_top_p;
@@ -396,10 +397,15 @@ llama_context::llama_context(
     // init the memory module
     const uint64_t kv_stream_stage_bytes = uint64_t(cparams.kv_stream_stage_mib)*1024ULL*1024ULL;
 
+    if (kv_stream_stage_bytes != 0 && params.kv_high_precision_layers > 0) {
+        throw std::runtime_error("kv_high_precision_layers is not supported together with block KV streaming");
+    }
+
     const llama_memory_params params_mem = {
-        /*.type_k                =*/ params.type_k,
-        /*.type_v                =*/ params.type_v,
-        /*.kv_stream_stage_bytes =*/ kv_stream_stage_bytes,
+        /*.type_k                     =*/ params.type_k,
+        /*.type_v                     =*/ params.type_v,
+        /*.kv_high_precision_layers   =*/ params.kv_high_precision_layers,
+        /*.kv_stream_stage_bytes      =*/ kv_stream_stage_bytes,
         /*.swa_full              =*/ params.swa_full,
         /*.ctx_type              =*/ cparams.ctx_type,
         /*.mem_other             =*/ llama_get_memory(cparams.ctx_other),
@@ -3941,6 +3947,7 @@ llama_context_params llama_context_default_params() {
         /*.cb_eval_user_data           =*/ nullptr,
         /*.type_k                      =*/ GGML_TYPE_F16,
         /*.type_v                      =*/ GGML_TYPE_F16,
+        /*.kv_high_precision_layers    =*/ 0,
         /*.kv_stream_stage_mib         =*/ 0,
         /*.ser_min_experts             =*/ -1,
         /*.ser_thresh_experts          =*/ 0.0f,

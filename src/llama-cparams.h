@@ -56,6 +56,7 @@ struct llama_cparams {
     bool pipeline_parallel;
 
     uint32_t kv_stream_stage_mib;
+    int32_t  kv_high_precision_layers;
 
     int   ser_min_experts;
     float ser_thresh_experts;

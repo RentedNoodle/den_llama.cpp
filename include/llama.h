@@ -388,6 +388,7 @@ extern "C" {
 
         enum ggml_type type_k; // data type for K cache [EXPERIMENTAL]
         enum ggml_type type_v; // data type for V cache [EXPERIMENTAL]
+        int32_t kv_high_precision_layers; // number of leading full-attention layers that keep type_k/type_v; the rest use NVFP4, 0 = off [EXPERIMENTAL]
         uint32_t kv_stream_stage_mib; // block-streaming staging budget, 0 = disabled [EXPERIMENTAL]
 
         int   ser_min_experts;    // smart expert reduction: keep at least this many experts, -1 = disabled

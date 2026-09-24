@@ -18,6 +18,7 @@ struct llama_memory_params {
     // kv cache
     ggml_type type_k;
     ggml_type type_v;
+    int32_t   kv_high_precision_layers;
     uint64_t kv_stream_stage_bytes;
 
     // use full-size SWA cache

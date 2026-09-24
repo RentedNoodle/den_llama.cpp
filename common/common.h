@@ -591,6 +591,7 @@ struct common_params {
 
     ggml_type cache_type_k = GGML_TYPE_F16; // KV cache data type for the K
     ggml_type cache_type_v = GGML_TYPE_F16; // KV cache data type for the V
+    int32_t kv_high_precision_layers = 0;   // leading full-attention layers that keep the -ctk/-ctv pair; the rest use NVFP4 (0 = off) [EXPERIMENTAL]
     uint32_t kv_stream_stage_mib = 0;        // block-streaming staging budget, 0 = disabled [EXPERIMENTAL]
 
     common_conversation_mode conversation_mode = COMMON_CONVERSATION_MODE_AUTO;
