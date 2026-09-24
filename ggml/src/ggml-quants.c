@@ -450,6 +450,40 @@ void quantize_row_nvfp4_ref(const float * GGML_RESTRICT x, block_nvfp4 * GGML_RE
     quantize_row_nvfp4_core(x, y, k, NULL, 0);
 }
 
+// Q4_G64: signed-symmetric INT4, one fp16 scale per 64 values. 34 bytes / 64 els (4.25 bpv).
+// scale = max|v|/7; q = clamp(round(v/scale), -7, 7); nibble = two's complement (q & 0xF);
+// low nibble = element 2j, high nibble = element 2j+1.
+void quantize_row_q4_g64_ref(const float * GGML_RESTRICT x, block_q4_g64 * GGML_RESTRICT y, int64_t k) {
+    static const int qk = QK_Q4_G64;
+
+    assert(k % qk == 0);
+
+    const int nb = k / qk;
+
+    for (int i = 0; i < nb; i++) {
+        const float * xb = x + i*qk;
+
+        float amax = 0.0f;
+        for (int j = 0; j < qk; j++) {
+            amax = MAX(amax, fabsf(xb[j]));
+        }
+
+        float scale = amax / 7.0f;
+        if (scale == 0.0f) {
+            scale = 1.0f;
+        }
+        const float id = 1.0f / scale;
+
+        for (int j = 0; j < qk/2; j++) {
+            const int q0 = MAX(-7, MIN(7, (int) roundf(xb[2*j + 0] * id)));
+            const int q1 = MAX(-7, MIN(7, (int) roundf(xb[2*j + 1] * id)));
+            y[i].qs[j] = (uint8_t) ((q0 & 0x0F) | ((q1 & 0x0F) << 4));
+        }
+
+        y[i].d = GGML_FP32_TO_FP16(scale);
+    }
+}
+
 // half-window of UE4M3 scale codes searched around the amax/6 baseline
 #define NVFP4_SCALE_SEARCH 12
 
@@ -644,6 +678,27 @@ void dequantize_row_nvfp4(const block_nvfp4 * GGML_RESTRICT x, float * GGML_REST
                 yb[j + 0       ] = v0*d;
                 yb[j + qk_sub/2] = v1*d;
             }
+        }
+    }
+}
+
+void dequantize_row_q4_g64(const block_q4_g64 * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k) {
+    static const int qk = QK_Q4_G64;
+
+    assert(k % qk == 0);
+
+    const int nb = k / qk;
+
+    for (int i = 0; i < nb; i++) {
+        const float d = GGML_FP16_TO_FP32(x[i].d);
+
+        for (int j = 0; j < qk/2; j++) {
+            int lo = x[i].qs[j] & 0x0F;
+            int hi = x[i].qs[j] >>   4;
+            lo = (lo >= 8) ? lo - 16 : lo;
+            hi = (hi >= 8) ? hi - 16 : hi;
+            y[i*qk + 2*j + 0] = lo * d;
+            y[i*qk + 2*j + 1] = hi * d;
         }
     }
 }
@@ -5609,6 +5664,10 @@ bool ggml_validate_row_data(enum ggml_type type, const void * data, size_t nbyte
                 // UE4M3 scales are uint8_t — all byte values are valid
                 GGML_UNUSED(data);
                 GGML_UNUSED(nb);
+            } break;
+        case GGML_TYPE_Q4_G64:
+            {
+                VALIDATE_ROW_DATA_D_F16_IMPL(block_q4_g64, data, nb);
             } break;
         case GGML_TYPE_Q2_K:
             {

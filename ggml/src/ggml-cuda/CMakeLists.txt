@@ -126,7 +126,10 @@ if (CUDAToolkit_FOUND)
             template-instances/fattn-vec-instance-nvfp4-nvfp4.cu
             # Mixed-NVFP4 pairs (K-vs-V precision isolation): K=q8_0/V=nvfp4 and K=nvfp4/V=q8_0.
             template-instances/fattn-vec-instance-q8_0-nvfp4.cu
-            template-instances/fattn-vec-instance-nvfp4-q8_0.cu)
+            template-instances/fattn-vec-instance-nvfp4-q8_0.cu
+            template-instances/fattn-vec-instance-q4_g64-q4_g64.cu
+            template-instances/fattn-vec-instance-q8_0-q4_g64.cu
+            template-instances/fattn-vec-instance-q4_g64-q8_0.cu)
     endif()
 
     ggml_add_backend_library(ggml-cuda

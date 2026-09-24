@@ -430,7 +430,8 @@ extern "C" {
         GGML_TYPE_NVFP4   = 40, // NVFP4 (4 blocks, E4M3 scale)
         GGML_TYPE_Q1_0    = 41,
         GGML_TYPE_Q2_0    = 42,
-        GGML_TYPE_COUNT   = 43,
+        GGML_TYPE_Q4_G64  = 43, // signed-symmetric INT4, one FP16 scale per 64 values (KV codec)
+        GGML_TYPE_COUNT   = 44,
     };
 
     // precision

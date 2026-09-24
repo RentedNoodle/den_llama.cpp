@@ -2030,6 +2030,10 @@ static void ggml_cuda_flash_attn_ext_vec(ggml_backend_cuda_context & ctx, ggml_t
     // isolation of the matched NVFP4 case (nvfp4-mixed-pair-limitation.md).
     FATTN_VEC_CASES_ALL_D(GGML_TYPE_Q8_0,  GGML_TYPE_NVFP4)
     FATTN_VEC_CASES_ALL_D(GGML_TYPE_NVFP4, GGML_TYPE_Q8_0)
+
+    FATTN_VEC_CASES_ALL_D(GGML_TYPE_Q4_G64, GGML_TYPE_Q4_G64)
+    FATTN_VEC_CASES_ALL_D(GGML_TYPE_Q8_0,   GGML_TYPE_Q4_G64)
+    FATTN_VEC_CASES_ALL_D(GGML_TYPE_Q4_G64, GGML_TYPE_Q8_0)
 #endif // GGML_CUDA_FA_ALL_QUANTS
 
     GGML_ABORT("fatal error");
@@ -2057,6 +2061,7 @@ static bool ggml_cuda_fattn_kv_type_supported(ggml_type type) {
         case GGML_TYPE_Q4_0:
         case GGML_TYPE_Q8_0:
         case GGML_TYPE_NVFP4:
+        case GGML_TYPE_Q4_G64:
         case GGML_TYPE_BF16:
             return true;
         default:
@@ -2156,7 +2161,9 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
     const bool mixed_pair_ok =
         (K->type == GGML_TYPE_Q8_0  && V->type == GGML_TYPE_Q4_0) ||
         (K->type == GGML_TYPE_Q8_0  && V->type == GGML_TYPE_NVFP4) ||
-        (K->type == GGML_TYPE_NVFP4 && V->type == GGML_TYPE_Q8_0);
+        (K->type == GGML_TYPE_NVFP4 && V->type == GGML_TYPE_Q8_0) ||
+        (K->type == GGML_TYPE_Q8_0  && V->type == GGML_TYPE_Q4_G64) ||
+        (K->type == GGML_TYPE_Q4_G64 && V->type == GGML_TYPE_Q8_0);
     if (K->type != V->type && !mixed_pair_ok) {
         return BEST_FATTN_KERNEL_NONE;
     }

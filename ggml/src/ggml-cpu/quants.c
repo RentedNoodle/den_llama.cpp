@@ -62,6 +62,10 @@ void quantize_row_nvfp4(const float * GGML_RESTRICT x, void * GGML_RESTRICT y, i
     quantize_row_nvfp4_ref(x, y, k);
 }
 
+void quantize_row_q4_g64(const float * GGML_RESTRICT x, void * GGML_RESTRICT y, int64_t k) {
+    quantize_row_q4_g64_ref(x, y, k);
+}
+
 //
 // 2-6 bit quantization in super-blocks
 //
@@ -357,6 +361,46 @@ void ggml_vec_dot_nvfp4_q8_0_generic(int n, float * GGML_RESTRICT s, size_t bs, 
             }
 
             sumf += dy * d * (sumi_lo + sumi_hi);
+        }
+    }
+    *s = sumf;
+}
+
+// Q4_G64: block of 64 elements = 2 q8_0 blocks of 32. Byte j<16 holds elements 2j/2j+1
+// (q8_0 block 2*ib), byte j>=16 holds elements 2*(j-16)/2*(j-16)+1 (q8_0 block 2*ib+1).
+void ggml_vec_dot_q4_g64_q8_0_generic(int n, float * GGML_RESTRICT s, size_t bs, const void * GGML_RESTRICT vx, size_t bx, const void * GGML_RESTRICT vy, size_t by, int nrc) {
+    assert(nrc == 1);
+    UNUSED(nrc);
+    UNUSED(bx);
+    UNUSED(by);
+    UNUSED(bs);
+    assert(n % QK_Q4_G64 == 0);
+
+    const block_q4_g64 * GGML_RESTRICT x = vx;
+    const block_q8_0 * GGML_RESTRICT y = vy;
+
+    const int nb = n / QK_Q4_G64;
+
+    float sumf = 0;
+
+    for (int ib = 0; ib < nb; ++ib) {
+        const float d = GGML_CPU_FP16_TO_FP32(x[ib].d);
+
+        for (int h = 0; h < 2; ++h) {
+            const block_q8_0 * GGML_RESTRICT yb = &y[2*ib + h];
+            const float dy = GGML_CPU_FP16_TO_FP32(yb->d);
+
+            int sumi = 0;
+            for (int j = 0; j < QK_Q4_G64/4; ++j) {
+                const uint8_t qv = x[ib].qs[h*(QK_Q4_G64/4) + j];
+                int lo = qv & 0x0F;
+                int hi = qv >>   4;
+                lo = (lo >= 8) ? lo - 16 : lo;
+                hi = (hi >= 8) ? hi - 16 : hi;
+                sumi += lo * yb->qs[2*j + 0];
+                sumi += hi * yb->qs[2*j + 1];
+            }
+            sumf += d * dy * sumi;
         }
     }
     *s = sumf;

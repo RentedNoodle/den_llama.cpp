@@ -271,6 +271,32 @@ static __device__ void quantize_f32_nvfp4_block(const float * __restrict__ x, bl
     }
 }
 
+// Q4_G64 block quantizer for set_rows / cpy. Bit-exact mirror of quantize_row_q4_g64_ref
+// (ggml-quants.c:456-485): per 64-value block scale = amax/7 (0 -> 1), two's-complement
+// nibble, low nibble = element 2j, high nibble = element 2j+1.
+static __device__ void quantize_f32_q4_g64_block(const float * __restrict__ x, block_q4_g64 * __restrict__ y) {
+    float amax = 0.0f;
+
+    for (int j = 0; j < QK_Q4_G64; ++j) {
+        amax = fmaxf(amax, fabsf(x[j]));
+    }
+
+    float scale = amax / 7.0f;
+    if (scale == 0.0f) {
+        scale = 1.0f;
+    }
+    const float id = 1.0f / scale;
+
+    y->d = scale;
+
+    for (int j = 0; j < QK_Q4_G64/2; ++j) {
+        const int q0 = max(-7, min(7, (int) roundf(x[2*j + 0]*id)));
+        const int q1 = max(-7, min(7, (int) roundf(x[2*j + 1]*id)));
+
+        y->qs[j] = (uint8_t) ((q0 & 0x0F) | ((q1 & 0x0F) << 4));
+    }
+}
+
 // Wrapper functions for cpy.cu compatibility
 static __device__ void cpy_blck_f32_q4_0(const char * cxi, char * cdsti) {
     quantize_f32_q4_0_block((const float *)cxi, (block_q4_0 *)cdsti);

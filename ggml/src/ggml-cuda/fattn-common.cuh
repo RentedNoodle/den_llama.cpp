@@ -6,6 +6,13 @@
 
 #include <cstdint>
 
+// Q4_G64 four-bit values: two's-complement signed, index n -> n >= 8 ? n - 16 : n.
+// Mirrors kvalues_mxfp4 (ggml-common.h:1136); sign-extension LUT for vec_dot_fattn_vec_KQ_q4_g64
+// and dequantize_V_q4_g64. Signed-symmetric, so no zero-point offset is applied.
+GGML_TABLE_BEGIN(int8_t, kvalues_q4_g64, 16)
+    0, 1, 2, 3, 4, 5, 6, 7, -8, -7, -6, -5, -4, -3, -2, -1,
+GGML_TABLE_END()
+
 #define FATTN_KQ_STRIDE       256
 #define HALF_MAX_HALF         __float2half(65504.0f/2) // Use neg. of this instead of -INFINITY to initialize KQ max vals to avoid NaN upon subtraction.
 #define SOFTMAX_FTZ_THRESHOLD -20.0f                   // Softmax exp. of values smaller than this are flushed to zero to avoid NaNs.
@@ -373,6 +380,46 @@ static __device__ __forceinline__ float vec_dot_fattn_vec_KQ_nvfp4(
     return sum;
 }
 
+// FA-VEC K-dot for Q4_G64 K (block_q4_g64, QK=64, one fp16 scale per block). Nibbles are
+// two's-complement signed, so the E2M1-style signed-symmetric path applies: only Q_ds.x is used,
+// no zero-point term. Byte j holds element 2j (low nibble) and element 2j+1 (high nibble), so the
+// four consecutive elements of one int span two bytes; their nibbles are spread one-per-byte and
+// sign-extended via kvalues_q4_g64. Numeric target: dequantize_row_q4_g64 (ggml-quants.c:685).
+template <int D, int nthreads>
+static __device__ __forceinline__ float vec_dot_fattn_vec_KQ_q4_g64(
+    const char * __restrict__ K_c, const void * __restrict__ Q_v, const int * __restrict__ Q_q8, const void * __restrict__ Q_ds_v) {
+
+    const block_q4_g64 * K_q4_g64 = (const block_q4_g64 *) K_c;
+    GGML_UNUSED(Q_v);
+
+    float sum = 0.0f;
+
+#pragma unroll
+    for (int k_KQ_0 = 0; k_KQ_0 < int(D/sizeof(int)); k_KQ_0 += nthreads) {
+        const int k_KQ = k_KQ_0 + (nthreads == WARP_SIZE ? threadIdx.x : threadIdx.x % nthreads);
+
+        const int e0   = 4*k_KQ;                       // first element covered by this int
+        const int ib   = e0 / QK_Q4_G64;               // block index
+        const int byte = (e0 % QK_Q4_G64) / 2;         // first of the two nibble-pair source bytes
+
+        uint16_t w;
+        ggml_cuda_memcpy_1<sizeof(w)>(&w, K_q4_g64[ib].qs + byte);
+        const int kraw = (w & 0x000F) | ((w & 0x00F0) << 4) | ((w & 0x0F00) << 8) | ((w & 0xF000) << 12);
+
+        const int2 v = get_int_from_table_16(kraw, kvalues_q4_g64);
+        const int  u = Q_q8[k_KQ_0/nthreads];
+
+        const int sumi = ggml_cuda_dp4a(v.x, u, 0);
+
+        const float  d_K  = __half2float(K_q4_g64[ib].d);
+        const float2 Q_ds = ((const float2 *) Q_ds_v)[k_KQ_0/nthreads];
+
+        sum += d_K * Q_ds.x * float(sumi);
+    }
+
+    return sum;
+}
+
 template <typename Tds, int ni>
 static __device__ __forceinline__ void quantize_q8_1_to_shared(
     const float * __restrict__ x, const float scale, int * __restrict__ yq32, void * __restrict__ yds) {
@@ -711,6 +758,55 @@ static __device__ __forceinline__ void dequantize_V_nvfp4(const void * __restric
     }
 }
 
+// FA-VEC V-dequant for Q4_G64 V. Mirrors dequantize_V_q4_0's shape, but block_q4_g64 packs
+// element 2j (low nibble) and element 2j+1 (high nibble) into byte j, so ne consecutive elements
+// come from ne/2 bytes. Nibbles are spread one-per-byte and sign-extended via kvalues_q4_g64
+// (two's-complement, no zero-point). Single fp16 scale d per 64-value block.
+// CONTRACT: i0 is a multiple of ne; ne=4 (V_rows_per_thread) is the live path, ne=2 compiles.
+template <typename T, int ne>
+static __device__ __forceinline__ void dequantize_V_q4_g64(const void * __restrict__ vx, void * __restrict__ dst, const int64_t i0) {
+    const block_q4_g64 * x = (const block_q4_g64 *) vx;
+
+    static_assert(ne == 2 || ne == 4, "bad ne");
+
+    const int64_t ib   =  i0          /  QK_Q4_G64;
+    const int     byte = (i0 % QK_Q4_G64) / 2;   // first source byte (i0 is even)
+
+    int q;
+    if constexpr (ne == 4) {
+        uint16_t w;
+        ggml_cuda_memcpy_1<sizeof(w)>(&w, x[ib].qs + byte);
+        q = (w & 0x000F) | ((w & 0x00F0) << 4) | ((w & 0x0F00) << 8) | ((w & 0xF000) << 12);
+    } else {
+        const uint8_t b = x[ib].qs[byte];
+        q = (b & 0x0F) | ((b & 0xF0) << 4);
+    }
+
+    const int2     q8i = get_int_from_table_16(q, kvalues_q4_g64);
+    const int8_t * q8  = (const int8_t *) &q8i.x;
+
+    const float d = __half2float(x[ib].d);
+
+#ifdef FP16_AVAILABLE
+    if constexpr (std::is_same<T, half>::value) {
+        const half2 d2 = __half2half2(__float2half(d));
+
+#pragma unroll
+        for (int l0 = 0; l0 < ne; l0 += 2) {
+            ((half2 *) dst)[l0/2] = d2 * make_half2(q8[l0 + 0], q8[l0 + 1]);
+        }
+    } else
+#endif // FP16_AVAILABLE
+    if constexpr (std::is_same<T, float>::value) {
+#pragma unroll
+        for (int l = 0; l < ne; ++l) {
+            ((float *) dst)[l] = d * float(q8[l]);
+        }
+    } else {
+        static_assert(std::is_same_v<T, void>, "unsupported type");
+    }
+}
+
 template <ggml_type type_K, int D, int nthreads>
 constexpr __device__ vec_dot_KQ_t get_vec_dot_KQ() {
     if constexpr (type_K == GGML_TYPE_F16) {
@@ -729,6 +825,8 @@ constexpr __device__ vec_dot_KQ_t get_vec_dot_KQ() {
         return vec_dot_fattn_vec_KQ_bf16<D, nthreads>;
     } else if constexpr (type_K == GGML_TYPE_NVFP4) {
         return vec_dot_fattn_vec_KQ_nvfp4<D, nthreads>;
+    } else if constexpr (type_K == GGML_TYPE_Q4_G64) {
+        return vec_dot_fattn_vec_KQ_q4_g64<D, nthreads>;
     } else {
         static_assert(type_K == -1, "bad type");
         return nullptr;
@@ -753,6 +851,8 @@ constexpr __device__ dequantize_V_t get_dequantize_V() {
         return dequantize_V_bf16<float, ne>;
     } else if constexpr (type_V == GGML_TYPE_NVFP4) {
         return dequantize_V_nvfp4<T, ne>;
+    } else if constexpr (type_V == GGML_TYPE_Q4_G64) {
+        return dequantize_V_q4_g64<T, ne>;
     } else {
         static_assert(type_V == -1, "bad type");
         return nullptr;

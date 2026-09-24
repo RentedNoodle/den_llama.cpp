@@ -313,6 +313,7 @@ const std::vector<ggml_type> kv_cache_types = {
     GGML_TYPE_Q5_0,
     GGML_TYPE_Q5_1,
     GGML_TYPE_NVFP4, // NVFP4 KV cache (36 B / 64 els); name resolved via ggml_type_name -> "nvfp4"
+    GGML_TYPE_Q4_G64, // Q4_G64 KV cache (34 B / 64 els); name resolved via ggml_type_name -> "q4_g64"
 };
 
 static ggml_type kv_cache_type_from_str(const std::string & s) {
