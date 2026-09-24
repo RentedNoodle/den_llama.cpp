@@ -390,6 +390,11 @@ extern "C" {
         enum ggml_type type_v; // data type for V cache [EXPERIMENTAL]
         uint32_t kv_stream_stage_mib; // block-streaming staging budget, 0 = disabled [EXPERIMENTAL]
 
+        int   ser_min_experts;    // smart expert reduction: keep at least this many experts, -1 = disabled
+        float ser_thresh_experts; // drop experts below this fraction of max router weight, 0 = disabled
+        float ser_top_p;          // nucleus mass over router weights to keep, 0 = disabled
+        float ser_ramp;           // scale thresh by (1 + ramp*il/n_layer), 0 = flat
+
         // Abort callback
         // if it returns true, execution of llama_decode() will be aborted
         // currently works only with CPU execution
@@ -519,6 +524,8 @@ extern "C" {
               struct llama_model_params   params);
 
     // Load a model from an open FILE pointer
+    // The GGUF is read from the current position, so it can be embedded in a larger file
+    // mmap needs the GGUF data section at a file offset to be aligned to the CPU tensor alignment (32 bytes)
     LLAMA_API struct llama_model * llama_model_load_from_file_ptr(
                                    FILE * file,
               struct llama_model_params   params);
@@ -681,6 +688,11 @@ extern "C" {
     LLAMA_API struct llama_adapter_lora * llama_adapter_lora_init(
             struct llama_model * model,
             const char * path_lora);
+
+    // Load a LoRA adapter from an open FILE pointer, reading from its current position
+    LLAMA_API struct llama_adapter_lora * llama_adapter_lora_init_from_file_ptr(
+            struct llama_model * model,
+            FILE * file);
 
     // Functions to access the adapter's GGUF metadata scalar values
     // - The functions return the length of the string on success, or -1 on failure

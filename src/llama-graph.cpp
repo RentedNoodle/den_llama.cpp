@@ -2051,10 +2051,25 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
         cb(selection_probs, "ffn_moe_probs_masked", il);
     }
 
-    // select experts
+    // select experts (SER: smart expert reduction, default-off preserves legacy path)
     ggml_tensor * selected_experts = selected_experts_in;
     if (selected_experts == nullptr) {
-        selected_experts = ggml_argsort_top_k(ctx0, selection_probs, n_expert_used); // [n_expert_used, n_tokens]
+        if (cparams.ser_min_experts >= 0 &&
+                (cparams.ser_thresh_experts > 0.0f || cparams.ser_top_p > 0.0f)) {
+            // KNOWN ISSUE (2026-09-24): the thresh mask path faults (CUDA illegal access)
+            // while min-only and top-p drops are proven safe. Thresh forced off until the
+            // mask is fixed under a unit harness; min + top-p deliver the SER value now.
+            static bool ser_thresh_warned = false;
+            if (cparams.ser_thresh_experts > 0.0f && !ser_thresh_warned) {
+                ser_thresh_warned = true;
+                LLAMA_LOG_INFO("%s: ser thresh mask disabled (known fault); using min/top-p only\n", __func__);
+            }
+            const float thresh_il = 0.0f;
+            selected_experts = ggml_argsort_top_k_thresh(ctx0, selection_probs, n_expert_used,
+                    cparams.ser_min_experts, thresh_il, cparams.ser_top_p); // [n_expert_used, n_tokens]
+        } else {
+            selected_experts = ggml_argsort_top_k(ctx0, selection_probs, n_expert_used); // [n_expert_used, n_tokens]
+        }
         cb(selected_experts->src[0], "ffn_moe_argsort", il);
     }
     cb(selected_experts, "ffn_moe_topk", il);

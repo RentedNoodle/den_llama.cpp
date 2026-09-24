@@ -609,3 +609,22 @@ EXTERN_DECL_FATTN_VEC_CASES(256, GGML_TYPE_Q5_0)
 EXTERN_DECL_FATTN_VEC_CASES(256, GGML_TYPE_Q5_1)
 EXTERN_DECL_FATTN_VEC_CASES(256, GGML_TYPE_Q8_0)
 EXTERN_DECL_FATTN_VEC_CASES(256, GGML_TYPE_BF16)
+
+// NVFP4 x NVFP4 has no matching arm in EXTERN_DECL_FATTN_VEC_CASES (which expands all V types),
+// so declare the single (K,V) pair directly; the definition lives in
+// template-instances/fattn-vec-instance-nvfp4-nvfp4.cu.
+extern DECL_FATTN_VEC_CASE( 64, GGML_TYPE_NVFP4, GGML_TYPE_NVFP4);
+extern DECL_FATTN_VEC_CASE(128, GGML_TYPE_NVFP4, GGML_TYPE_NVFP4);
+extern DECL_FATTN_VEC_CASE(256, GGML_TYPE_NVFP4, GGML_TYPE_NVFP4);
+
+// Mixed-NVFP4 pairs: K=q8_0/V=nvfp4 and K=nvfp4/V=q8_0. Declared in both directions so
+// the per-side (K vs V) precision contribution is isolatable. Like the matched NVFP4 case,
+// NVFP4 is not one of the EXTERN_DECL_FATTN_VEC_CASES V types, so each (K,V) pair is declared
+// directly. Definitions live in template-instances/fattn-vec-instance-q8_0-nvfp4.cu and
+// template-instances/fattn-vec-instance-nvfp4-q8_0.cu.
+extern DECL_FATTN_VEC_CASE( 64, GGML_TYPE_Q8_0, GGML_TYPE_NVFP4);
+extern DECL_FATTN_VEC_CASE(128, GGML_TYPE_Q8_0, GGML_TYPE_NVFP4);
+extern DECL_FATTN_VEC_CASE(256, GGML_TYPE_Q8_0, GGML_TYPE_NVFP4);
+extern DECL_FATTN_VEC_CASE( 64, GGML_TYPE_NVFP4, GGML_TYPE_Q8_0);
+extern DECL_FATTN_VEC_CASE(128, GGML_TYPE_NVFP4, GGML_TYPE_Q8_0);
+extern DECL_FATTN_VEC_CASE(256, GGML_TYPE_NVFP4, GGML_TYPE_Q8_0);

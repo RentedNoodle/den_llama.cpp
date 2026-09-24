@@ -186,6 +186,91 @@ static __device__ void quantize_f32_iq4_nl_block(const float * __restrict__ x, b
     y->d = sumq2 > 0 ? sumqx/sumq2 : d;
 }
 
+// Portable UE4M3 encoder. Bit-for-bit port of the CPU ggml_fp32_to_ue4m3 (ggml-impl.h:517-553).
+// Must NOT call common.cuh:869 ggml_cuda_fp32_to_ue4m3, which is Blackwell-gated (NO_DEVICE_CODE
+// elsewhere). Returns a raw UE4M3 byte; decode with ggml_cuda_ue4m3_to_fp32 (which halves it).
+static __device__ __forceinline__ uint8_t ggml_cuda_fp32_to_ue4m3_portable(float x) {
+    if (!(x > 0.0f)) {
+        return 0;
+    }
+    if (x > 448.0f) {
+        x = 448.0f;
+    }
+    uint32_t bits;
+    memcpy(&bits, &x, sizeof(bits));
+    const int fp32_exp = int((bits >> 23) & 0xFF) - 127;
+    const int fp32_man = int((bits >> 20) & 0x7);
+    int ue4m3_exp = fp32_exp + 7;
+    if (ue4m3_exp <= 0) {
+        // subnormal: value = man * 2^-9, man = round(x * 2^9)
+        int man = int(x * 512.0f + 0.5f);
+        if (man > 7) {
+            man = 7;
+        }
+        if (man < 1) {
+            return 0;
+        }
+        return (uint8_t) man;
+    }
+    if (ue4m3_exp >= 15) {
+        return 0x7E;
+    }
+    const int round_bit = int((bits >> 19) & 1);
+    int ue4m3_man = fp32_man + round_bit;
+    if (ue4m3_man > 7) {
+        ue4m3_man = 0;
+        ue4m3_exp++;
+        if (ue4m3_exp >= 15) {
+            return 0x7E;
+        }
+    }
+    return (uint8_t) ((ue4m3_exp << 3) | ue4m3_man);
+}
+
+// Nearest E2M1 index against scaled kvalues_mxfp4 (= 2 * E2M1). Mirror of CPU best_index_mxfp4
+// (ggml-quants.c:337-347), the bit-exact authority for quantize_row_nvfp4_ref.
+static __device__ __forceinline__ int ggml_cuda_best_index_mxfp4(float x, float e) {
+    int   best_index = 0;
+    float best_err   = fabsf(kvalues_mxfp4[0]*e - x);
+#pragma unroll
+    for (int i = 1; i < 16; ++i) {
+        const float err = fabsf(kvalues_mxfp4[i]*e - x);
+        if (err < best_err) {
+            best_err   = err;
+            best_index = i;
+        }
+    }
+    return best_index;
+}
+
+// NVFP4 block quantizer for set_rows / cpy. Bit-exact mirror of quantize_row_nvfp4_ref
+// (ggml-quants.c:384-417): per 16-value sub-block scale = enc(amax/6), low nibble first.
+static __device__ void quantize_f32_nvfp4_block(const float * __restrict__ x, block_nvfp4 * __restrict__ y) {
+    constexpr int n_sub = QK_NVFP4 / QK_NVFP4_SUB;
+
+    for (int s = 0; s < n_sub; ++s) {
+        const float * xb = x + s*QK_NVFP4_SUB;
+
+        float amax = 0.0f;
+        for (int j = 0; j < QK_NVFP4_SUB; ++j) {
+            if (amax < fabsf(xb[j])) {
+                amax = fabsf(xb[j]);
+            }
+        }
+
+        const uint8_t ue = ggml_cuda_fp32_to_ue4m3_portable(amax / 6.0f);
+        y->d[s] = ue;
+        const float d = ggml_cuda_ue4m3_to_fp32(ue);
+
+        for (int j = 0; j < QK_NVFP4_SUB/2; ++j) {
+            const uint8_t x0 = ggml_cuda_best_index_mxfp4(xb[0              + j], d);
+            const uint8_t x1 = ggml_cuda_best_index_mxfp4(xb[QK_NVFP4_SUB/2 + j], d);
+
+            y->qs[s*(QK_NVFP4_SUB/2) + j] = x0 | (x1 << 4);
+        }
+    }
+}
+
 // Wrapper functions for cpy.cu compatibility
 static __device__ void cpy_blck_f32_q4_0(const char * cxi, char * cdsti) {
     quantize_f32_q4_0_block((const float *)cxi, (block_q4_0 *)cdsti);

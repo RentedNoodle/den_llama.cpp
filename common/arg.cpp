@@ -25,6 +25,7 @@
 #include <algorithm>
 #include <cinttypes>
 #include <climits>
+#include <cstdio>
 #include <cmath>
 #include <cstdarg>
 #include <filesystem>
@@ -311,6 +312,7 @@ const std::vector<ggml_type> kv_cache_types = {
     GGML_TYPE_IQ4_NL,
     GGML_TYPE_Q5_0,
     GGML_TYPE_Q5_1,
+    GGML_TYPE_NVFP4, // NVFP4 KV cache (36 B / 64 els); name resolved via ggml_type_name -> "nvfp4"
 };
 
 static ggml_type kv_cache_type_from_str(const std::string & s) {
@@ -2813,6 +2815,37 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
             llm_add_n_cpu_ffn_overrides(value, LLM_FFN_EXPS_REGEX, params.tensor_buft_overrides);
         }
     ).set_env("LLAMA_ARG_N_CPU_MOE"));
+    add_opt(common_arg(
+        {"-ser", "--smart-expert-reduction"}, "MIN,THRESH",
+        "smart expert reduction: keep at least MIN experts, drop experts below THRESH fraction of max router weight (-1,0 = disabled)",
+        [](common_params & params, const std::string & value) {
+            int min_experts = -1;
+            float thresh_experts = 0.0f;
+            if (sscanf(value.c_str(), "%d,%f", &min_experts, &thresh_experts) != 2) {
+                throw std::invalid_argument("invalid value, expected MIN,THRESH");
+            }
+            params.ser_min_experts = min_experts;
+            params.ser_thresh_experts = thresh_experts;
+        }
+    ).set_env("LLAMA_ARG_SER"));
+    add_opt(common_arg(
+        {"-ser-top-p", "--ser-top-p"}, "P",
+        "smart expert reduction nucleus: keep experts covering P mass of router weights (0 = disabled)",
+        [](common_params & params, const std::string & value) {
+            const float top_p = std::stof(value);
+            if (top_p < 0.0f || top_p > 1.0f) {
+                throw std::invalid_argument("invalid value");
+            }
+            params.ser_top_p = top_p;
+        }
+    ).set_env("LLAMA_ARG_SER_TOP_P"));
+    add_opt(common_arg(
+        {"-ser-ramp", "--ser-ramp"}, "R",
+        "scale the SER threshold by (1 + R*il/n_layer) across depth (0 = flat)",
+        [](common_params & params, const std::string & value) {
+            params.ser_ramp = std::stof(value);
+        }
+    ).set_env("LLAMA_ARG_SER_RAMP"));
     add_opt(common_arg(
         {"-ncffn", "--n-cpu-ffn"}, "N",
         "keep the dense FFN weights of the first N layers in the CPU\n"

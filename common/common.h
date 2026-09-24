@@ -526,6 +526,11 @@ struct common_params {
     std::vector<llama_model_kv_override> kv_overrides;
     std::vector<llama_model_tensor_buft_override> tensor_buft_overrides;
 
+    int   ser_min_experts    = -1;   // smart expert reduction: keep at least this many experts, -1 = disabled
+    float ser_thresh_experts = 0.0f; // drop experts below this fraction of max router weight, 0 = disabled
+    float ser_top_p          = 0.0f; // nucleus mass over router weights to keep, 0 = disabled
+    float ser_ramp           = 0.0f; // scale thresh by (1 + ramp*il/n_layer), 0 = flat
+
     bool lora_init_without_apply = false; // only load lora to memory, but do not apply it to ctx (user can manually apply lora later using llama_adapter_lora_apply)
     std::vector<common_adapter_lora_info> lora_adapters; // lora adapter path with user defined scale
 

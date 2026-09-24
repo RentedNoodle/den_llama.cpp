@@ -5,7 +5,7 @@
 template<int qk, int qr, dequantize_kernel_t dequantize_kernel, typename dst_t>
 static __global__ void k_get_rows(
         const void * __restrict__ src0, const int32_t * __restrict__ src1, dst_t * __restrict__ dst,
-        const int64_t ne00, /*const int64_t ne01, const int64_t ne02, const int64_t ne03,*/
+        const int64_t ne00, const int64_t ne01, /*const int64_t ne02, const int64_t ne03,*/
         /*const int64_t ne10,*/ const int64_t ne11, const uint3 ne12_fdv, /*const int64_t ne13,*/
         /*const size_t s0,*/ const size_t s1, const size_t s2, const size_t s3,
         /*const size_t nb00,*/ const size_t nb01, const size_t nb02, const size_t nb03,
@@ -23,7 +23,6 @@ static __global__ void k_get_rows(
             const int i01 = src1[i10*s10 + i11*s11 + i12*s12];
 
             dst_t * dst_row = dst + i10*s1 + i11*s2 + i12*s3;
-            const void * src0_row = (const char *) src0 + i01*nb01 + i11*nb02 + i12*nb03;
 
             const int ib   =  i00/qk;      // block index
             const int iqs  = (i00%qk)/qr;  // quant index
@@ -32,7 +31,13 @@ static __global__ void k_get_rows(
 
             // dequantize
             float2 v;
-            dequantize_kernel(src0_row, ib, iqs, v);
+            if (i01 >= 0 && i01 < ne01) {
+                const void * src0_row = (const char *) src0 + i01*nb01 + i11*nb02 + i12*nb03;
+                dequantize_kernel(src0_row, ib, iqs, v);
+            } else {
+                v.x = 0.0f;
+                v.y = 0.0f;
+            }
 
             dst_row[iybs + iqs + 0]        = ggml_cuda_cast<dst_t>(v.x);
             dst_row[iybs + iqs + y_offset] = ggml_cuda_cast<dst_t>(v.y);
@@ -43,7 +48,7 @@ static __global__ void k_get_rows(
 template<typename dst_t, dequantize_kq_t<dst_t> dequantize_kq>
 static __global__ void k_get_rows_kq(
         const void * __restrict__ src0, const int32_t * __restrict__ src1, dst_t * __restrict__ dst,
-        const int64_t ne00, /*const int64_t ne01, const int64_t ne02, const int64_t ne03,*/
+        const int64_t ne00, const int64_t ne01, /*const int64_t ne02, const int64_t ne03,*/
         /*const int64_t ne10,*/ const int64_t ne11, const uint3 ne12_fdv, /*const int64_t ne13,*/
         /*const size_t s0,*/ const size_t s1, const size_t s2, const size_t s3,
         /*const size_t nb00,*/ const size_t nb01, const size_t nb02, const size_t nb03,
@@ -62,9 +67,16 @@ static __global__ void k_get_rows_kq(
 
         dst_t * dst_row = dst + i10*s1 + i11*s2 + i12*s3;
         const void * src0_row = (const char *) src0 + i01*nb01 + i11*nb02 + i12*nb03;
+        const bool in_range = i01 >= 0 && i01 < ne01;
 
         for (int64_t ib = blockIdx.y; ib < nsb; ib += gridDim.y) {
-            dequantize_kq(src0_row, ib, dst_row + ib*QK_K, threadIdx.x);
+            if (in_range) {
+                dequantize_kq(src0_row, ib, dst_row + ib*QK_K, threadIdx.x);
+            } else {
+                for (int64_t j = threadIdx.x; j < QK_K; j += blockDim.x) {
+                    dst_row[ib*QK_K + j] = ggml_cuda_cast<dst_t>(0.0f);
+                }
+            }
         }
     }
 }
@@ -72,7 +84,7 @@ static __global__ void k_get_rows_kq(
 template<typename src0_t, typename dst_t>
 static __global__ void k_get_rows_float(
         const src0_t * src0_ptr, const int32_t * src1_ptr, dst_t * dst_ptr,
-        const int64_t ne00, /*const int64_t ne01, const int64_t ne02, const int64_t ne03,*/
+        const int64_t ne00, const int64_t ne01, /*const int64_t ne02, const int64_t ne03,*/
         /*const int64_t ne10,*/ const int64_t ne11, const uint3 ne12_fdv, /*const int64_t ne13,*/
         /*const size_t s0,*/ const size_t s1, const size_t s2, const size_t s3,
         /*const size_t nb00,*/ const size_t nb01, const size_t nb02, const size_t nb03,
@@ -93,10 +105,16 @@ static __global__ void k_get_rows_float(
         const int i01 = src1[i10*s10 + i11*s11 + i12*s12];
 
         dst_t * GGML_CUDA_RESTRICT dst_row = dst + i10*s1 + i11*s2 + i12*s3;
-        const src0_t * GGML_CUDA_RESTRICT src0_row = (const src0_t *)((const char *) src0 + i01*nb01 + i11*nb02 + i12*nb03);
 
-        for (int64_t i00 = blockIdx.y*blockDim.x + threadIdx.x; i00 < ne00; i00 += gridDim.y*blockDim.x) {
-            dst_row[i00] = ggml_cuda_cast<dst_t>(src0_row[i00]);
+        if (i01 >= 0 && i01 < ne01) {
+            const src0_t * GGML_CUDA_RESTRICT src0_row = (const src0_t *)((const char *) src0 + i01*nb01 + i11*nb02 + i12*nb03);
+            for (int64_t i00 = blockIdx.y*blockDim.x + threadIdx.x; i00 < ne00; i00 += gridDim.y*blockDim.x) {
+                dst_row[i00] = ggml_cuda_cast<dst_t>(src0_row[i00]);
+            }
+        } else {
+            for (int64_t i00 = blockIdx.y*blockDim.x + threadIdx.x; i00 < ne00; i00 += gridDim.y*blockDim.x) {
+                dst_row[i00] = ggml_cuda_cast<dst_t>(0.0f);
+            }
         }
     }
 }
@@ -104,7 +122,7 @@ static __global__ void k_get_rows_float(
 template<typename dst_t>
 static __global__ void k_get_rows_float_vec(
         const dst_t * src0_ptr, const int32_t * src1_ptr, dst_t * dst_ptr,
-        const int64_t ne00v,
+        const int64_t ne00v, const int64_t ne01,
         const int64_t ne11, const uint3 ne12_fdv,
         const size_t s1, const size_t s2, const size_t s3,
         const size_t nb01, const size_t nb02, const size_t nb03,
@@ -121,10 +139,13 @@ static __global__ void k_get_rows_float_vec(
         const int i01 = src1_ptr[i10*s10 + i11*s11 + i12*s12];
 
         int4       * GGML_CUDA_RESTRICT dst_row  = (int4 *)      (dst_ptr + i10*s1 + i11*s2 + i12*s3);
-        const int4 * GGML_CUDA_RESTRICT src0_row = (const int4 *)((const char *) src0_ptr + i01*nb01 + i11*nb02 + i12*nb03);
+        const bool in_range = i01 >= 0 && i01 < ne01;
+        const int4 * GGML_CUDA_RESTRICT src0_row = in_range
+            ? (const int4 *)((const char *) src0_ptr + i01*nb01 + i11*nb02 + i12*nb03)
+            : (const int4 *) nullptr;
 
         for (int64_t i = blockIdx.y*blockDim.x + threadIdx.x; i < ne00v; i += gridDim.y*blockDim.x) {
-            dst_row[i] = src0_row[i];
+            dst_row[i] = in_range ? src0_row[i] : make_int4(0, 0, 0, 0);
         }
     }
 }
@@ -159,7 +180,7 @@ static __global__ void k_get_rows_back_float(
 template<int qk, int qr, dequantize_kernel_t dq, typename dst_t>
 static void get_rows_cuda_q(
         const void * src0_d, const int32_t * src1_d, dst_t * dst_d,
-        const int64_t ne00, const size_t nb01, const size_t nb02, const size_t nb03,
+        const int64_t ne00, const int64_t ne01, const size_t nb01, const size_t nb02, const size_t nb03,
         const int64_t ne10, const int64_t ne11, const int64_t ne12, const size_t nb10, const size_t nb11, const size_t nb12,
         const size_t nb1, const size_t nb2, const size_t nb3,
         cudaStream_t stream) {
@@ -186,7 +207,7 @@ static void get_rows_cuda_q(
 
     k_get_rows<qk, qr, dq><<<block_nums, block_dims, 0, stream>>>(
         src0_d, src1_d, dst_d,
-        ne00, /*ne01, ne02, ne03,*/
+        ne00, ne01, /*ne02, ne03,*/
         /*ne10,*/ ne11, ne12_fdv, /*ne13,*/
         /* s0,*/ s1, s2, s3,
         /* nb00,*/ nb01, nb02, nb03,
@@ -196,7 +217,7 @@ static void get_rows_cuda_q(
 template<int block_dim, typename dst_t, dequantize_kq_t<dst_t> dequantize_kq>
 static void get_rows_cuda_kq(
         const void * src0_d, const int32_t * src1_d, dst_t * dst_d,
-        const int64_t ne00, const size_t nb01, const size_t nb02, const size_t nb03,
+        const int64_t ne00, const int64_t ne01, const size_t nb01, const size_t nb02, const size_t nb03,
         const int64_t ne10, const int64_t ne11, const int64_t ne12, const size_t nb10, const size_t nb11, const size_t nb12,
         const size_t nb1, const size_t nb2, const size_t nb3,
         cudaStream_t stream) {
@@ -223,7 +244,7 @@ static void get_rows_cuda_kq(
 
     k_get_rows_kq<dst_t, dequantize_kq><<<block_nums, block_dims, 0, stream>>>(
         src0_d, src1_d, dst_d,
-        ne00, /*ne01, ne02, ne03,*/
+        ne00, ne01, /*ne02, ne03,*/
         /*ne10,*/ ne11, ne12_fdv, /*ne13,*/
         /* s0,*/ s1, s2, s3,
         /* nb00,*/ nb01, nb02, nb03,
@@ -233,7 +254,7 @@ static void get_rows_cuda_kq(
 template<typename src0_t, typename dst_t>
 static void get_rows_cuda_float(
         const src0_t * src0_d, const int32_t * src1_d, dst_t * dst_d,
-        const int64_t ne00, const size_t nb01, const size_t nb02, const size_t nb03,
+        const int64_t ne00, const int64_t ne01, const size_t nb01, const size_t nb02, const size_t nb03,
         const int64_t ne10, const int64_t ne11, const int64_t ne12, const size_t nb10, const size_t nb11, const size_t nb12,
         const size_t nb1, const size_t nb2, const size_t nb3,
         cudaStream_t stream) {
@@ -271,7 +292,7 @@ static void get_rows_cuda_float(
             const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params{block_nums, block_dims, 0, stream};
             ggml_cuda_kernel_launch(k_get_rows_float_vec<dst_t>, launch_params,
                 (const dst_t *) src0_d, src1_d, dst_d,
-                ne00v, ne11, ne12_fdv,
+                ne00v, ne01, ne11, ne12_fdv,
                 s1, s2, s3,
                 nb01, nb02, nb03,
                 s10, s11, s12);
@@ -285,7 +306,7 @@ static void get_rows_cuda_float(
     const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params{block_nums, block_dims, 0, stream};
     ggml_cuda_kernel_launch(k_get_rows_float<src0_t, dst_t>, launch_params,
         src0_d, src1_d, dst_d,
-        ne00, /*ne01, ne02, ne03,*/
+        ne00, ne01, /*ne02, ne03,*/
         /*ne10,*/ ne11, ne12_fdv, /*ne13,*/
         /* s0,*/ s1, s2, s3,
         /* nb00,*/ nb01, nb02, nb03,
@@ -295,114 +316,114 @@ static void get_rows_cuda_float(
 template <typename dst_t>
 static void ggml_cuda_get_rows_switch_src0_type(
         const void * src0_d, const ggml_type src0_type, const int32_t * src1_d, dst_t * dst_d,
-        const int64_t ne00, const size_t nb01, const size_t nb02, const size_t nb03,
+        const int64_t ne00, const int64_t ne01, const size_t nb01, const size_t nb02, const size_t nb03,
         const int64_t ne10, const int64_t ne11, const int64_t ne12, const size_t nb10, const size_t nb11, const size_t nb12,
         const size_t nb1, const size_t nb2, const size_t nb3,
         cudaStream_t stream) {
     switch (src0_type) {
         case GGML_TYPE_F16:
             get_rows_cuda_float((const half *) src0_d, src1_d, dst_d,
-                ne00, nb01, nb02, nb03, ne10, ne11, ne12, nb10, nb11, nb12, nb1, nb2, nb3, stream);
+                ne00, ne01, nb01, nb02, nb03, ne10, ne11, ne12, nb10, nb11, nb12, nb1, nb2, nb3, stream);
             break;
         case GGML_TYPE_F32:
             get_rows_cuda_float((const float *) src0_d, src1_d, dst_d,
-                ne00, nb01, nb02, nb03, ne10, ne11, ne12, nb10, nb11, nb12, nb1, nb2, nb3, stream);
+                ne00, ne01, nb01, nb02, nb03, ne10, ne11, ne12, nb10, nb11, nb12, nb1, nb2, nb3, stream);
             break;
         case GGML_TYPE_I32:
             get_rows_cuda_float((const int32_t *) src0_d, src1_d, dst_d,
-                ne00, nb01, nb02, nb03, ne10, ne11, ne12, nb10, nb11, nb12, nb1, nb2, nb3, stream);
+                ne00, ne01, nb01, nb02, nb03, ne10, ne11, ne12, nb10, nb11, nb12, nb1, nb2, nb3, stream);
             break;
         case GGML_TYPE_BF16:
             get_rows_cuda_float((const nv_bfloat16 *) src0_d, src1_d, dst_d,
-                ne00, nb01, nb02, nb03, ne10, ne11, ne12, nb10, nb11, nb12, nb1, nb2, nb3, stream);
+                ne00, ne01, nb01, nb02, nb03, ne10, ne11, ne12, nb10, nb11, nb12, nb1, nb2, nb3, stream);
             break;
         case GGML_TYPE_Q1_0:
             get_rows_cuda_q<QK1_0, QR1_0, dequantize_q1_0>(src0_d, src1_d, dst_d,
-                ne00, nb01, nb02, nb03, ne10, ne11, ne12, nb10, nb11, nb12, nb1, nb2, nb3, stream);
+                ne00, ne01, nb01, nb02, nb03, ne10, ne11, ne12, nb10, nb11, nb12, nb1, nb2, nb3, stream);
             break;
         case GGML_TYPE_Q2_0:
             get_rows_cuda_q<QK2_0, QR2_0, dequantize_q2_0>(src0_d, src1_d, dst_d,
-                ne00, nb01, nb02, nb03, ne10, ne11, ne12, nb10, nb11, nb12, nb1, nb2, nb3, stream);
+                ne00, ne01, nb01, nb02, nb03, ne10, ne11, ne12, nb10, nb11, nb12, nb1, nb2, nb3, stream);
             break;
         case GGML_TYPE_Q4_0:
             get_rows_cuda_q<QK4_0, QR4_0, dequantize_q4_0>(src0_d, src1_d, dst_d,
-                ne00, nb01, nb02, nb03, ne10, ne11, ne12, nb10, nb11, nb12, nb1, nb2, nb3, stream);
+                ne00, ne01, nb01, nb02, nb03, ne10, ne11, ne12, nb10, nb11, nb12, nb1, nb2, nb3, stream);
             break;
         case GGML_TYPE_Q4_1:
             get_rows_cuda_q<QK4_1, QR4_1, dequantize_q4_1>(src0_d, src1_d, dst_d,
-                ne00, nb01, nb02, nb03, ne10, ne11, ne12, nb10, nb11, nb12, nb1, nb2, nb3, stream);
+                ne00, ne01, nb01, nb02, nb03, ne10, ne11, ne12, nb10, nb11, nb12, nb1, nb2, nb3, stream);
             break;
         case GGML_TYPE_Q5_0:
             get_rows_cuda_q<QK5_0, QR5_0, dequantize_q5_0>(src0_d, src1_d, dst_d,
-                ne00, nb01, nb02, nb03, ne10, ne11, ne12, nb10, nb11, nb12, nb1, nb2, nb3, stream);
+                ne00, ne01, nb01, nb02, nb03, ne10, ne11, ne12, nb10, nb11, nb12, nb1, nb2, nb3, stream);
             break;
         case GGML_TYPE_Q5_1:
             get_rows_cuda_q<QK5_1, QR5_1, dequantize_q5_1>(src0_d, src1_d, dst_d,
-                ne00, nb01, nb02, nb03, ne10, ne11, ne12, nb10, nb11, nb12, nb1, nb2, nb3, stream);
+                ne00, ne01, nb01, nb02, nb03, ne10, ne11, ne12, nb10, nb11, nb12, nb1, nb2, nb3, stream);
             break;
         case GGML_TYPE_Q8_0:
             get_rows_cuda_q<QK8_0, QR8_0, dequantize_q8_0>(src0_d, src1_d, dst_d,
-                ne00, nb01, nb02, nb03, ne10, ne11, ne12, nb10, nb11, nb12, nb1, nb2, nb3, stream);
+                ne00, ne01, nb01, nb02, nb03, ne10, ne11, ne12, nb10, nb11, nb12, nb1, nb2, nb3, stream);
             break;
         case GGML_TYPE_Q2_K:
             get_rows_cuda_kq<64, dst_t, dequantize_q2_K<dst_t>>(src0_d, src1_d, dst_d,
-                ne00, nb01, nb02, nb03, ne10, ne11, ne12, nb10, nb11, nb12, nb1, nb2, nb3, stream);
+                ne00, ne01, nb01, nb02, nb03, ne10, ne11, ne12, nb10, nb11, nb12, nb1, nb2, nb3, stream);
             break;
         case GGML_TYPE_Q3_K:
             get_rows_cuda_kq<64, dst_t, dequantize_q3_K<dst_t>>(src0_d, src1_d, dst_d,
-                ne00, nb01, nb02, nb03, ne10, ne11, ne12, nb10, nb11, nb12, nb1, nb2, nb3, stream);
+                ne00, ne01, nb01, nb02, nb03, ne10, ne11, ne12, nb10, nb11, nb12, nb1, nb2, nb3, stream);
             break;
         case GGML_TYPE_Q4_K:
             get_rows_cuda_kq<32, dst_t, dequantize_q4_K<dst_t>>(src0_d, src1_d, dst_d,
-                ne00, nb01, nb02, nb03, ne10, ne11, ne12, nb10, nb11, nb12, nb1, nb2, nb3, stream);
+                ne00, ne01, nb01, nb02, nb03, ne10, ne11, ne12, nb10, nb11, nb12, nb1, nb2, nb3, stream);
             break;
         case GGML_TYPE_Q5_K:
             get_rows_cuda_kq<64, dst_t, dequantize_q5_K<dst_t>>(src0_d, src1_d, dst_d,
-                ne00, nb01, nb02, nb03, ne10, ne11, ne12, nb10, nb11, nb12, nb1, nb2, nb3, stream);
+                ne00, ne01, nb01, nb02, nb03, ne10, ne11, ne12, nb10, nb11, nb12, nb1, nb2, nb3, stream);
             break;
         case GGML_TYPE_Q6_K:
             get_rows_cuda_kq<64, dst_t, dequantize_q6_K<dst_t>>(src0_d, src1_d, dst_d,
-                ne00, nb01, nb02, nb03, ne10, ne11, ne12, nb10, nb11, nb12, nb1, nb2, nb3, stream);
+                ne00, ne01, nb01, nb02, nb03, ne10, ne11, ne12, nb10, nb11, nb12, nb1, nb2, nb3, stream);
             break;
         case GGML_TYPE_IQ2_XXS:
             get_rows_cuda_kq<32, dst_t, dequantize_iq2_xxs<dst_t>>(src0_d, src1_d, dst_d,
-                ne00, nb01, nb02, nb03, ne10, ne11, ne12, nb10, nb11, nb12, nb1, nb2, nb3, stream);
+                ne00, ne01, nb01, nb02, nb03, ne10, ne11, ne12, nb10, nb11, nb12, nb1, nb2, nb3, stream);
             break;
         case GGML_TYPE_IQ2_XS:
             get_rows_cuda_kq<32, dst_t, dequantize_iq2_xs<dst_t>>(src0_d, src1_d, dst_d,
-                ne00, nb01, nb02, nb03, ne10, ne11, ne12, nb10, nb11, nb12, nb1, nb2, nb3, stream);
+                ne00, ne01, nb01, nb02, nb03, ne10, ne11, ne12, nb10, nb11, nb12, nb1, nb2, nb3, stream);
             break;
         case GGML_TYPE_IQ2_S:
             get_rows_cuda_kq<32, dst_t, dequantize_iq2_s<dst_t>>(src0_d, src1_d, dst_d,
-                ne00, nb01, nb02, nb03, ne10, ne11, ne12, nb10, nb11, nb12, nb1, nb2, nb3, stream);
+                ne00, ne01, nb01, nb02, nb03, ne10, ne11, ne12, nb10, nb11, nb12, nb1, nb2, nb3, stream);
             break;
         case GGML_TYPE_IQ3_XXS:
             get_rows_cuda_kq<32, dst_t, dequantize_iq3_xxs<dst_t>>(src0_d, src1_d, dst_d,
-                ne00, nb01, nb02, nb03, ne10, ne11, ne12, nb10, nb11, nb12, nb1, nb2, nb3, stream);
+                ne00, ne01, nb01, nb02, nb03, ne10, ne11, ne12, nb10, nb11, nb12, nb1, nb2, nb3, stream);
             break;
         case GGML_TYPE_IQ3_S:
             get_rows_cuda_kq<32, dst_t, dequantize_iq3_s<dst_t>>(src0_d, src1_d, dst_d,
-                ne00, nb01, nb02, nb03, ne10, ne11, ne12, nb10, nb11, nb12, nb1, nb2, nb3, stream);
+                ne00, ne01, nb01, nb02, nb03, ne10, ne11, ne12, nb10, nb11, nb12, nb1, nb2, nb3, stream);
             break;
         case GGML_TYPE_IQ1_S:
             get_rows_cuda_kq<32, dst_t, dequantize_iq1_s<dst_t>>(src0_d, src1_d, dst_d,
-                ne00, nb01, nb02, nb03, ne10, ne11, ne12, nb10, nb11, nb12, nb1, nb2, nb3, stream);
+                ne00, ne01, nb01, nb02, nb03, ne10, ne11, ne12, nb10, nb11, nb12, nb1, nb2, nb3, stream);
             break;
         case GGML_TYPE_IQ1_M:
             get_rows_cuda_kq<32, dst_t, dequantize_iq1_m<dst_t>>(src0_d, src1_d, dst_d,
-                ne00, nb01, nb02, nb03, ne10, ne11, ne12, nb10, nb11, nb12, nb1, nb2, nb3, stream);
+                ne00, ne01, nb01, nb02, nb03, ne10, ne11, ne12, nb10, nb11, nb12, nb1, nb2, nb3, stream);
             break;
         case GGML_TYPE_IQ4_NL:
             get_rows_cuda_kq<32, dst_t, dequantize_iq4_nl<dst_t>>(src0_d, src1_d, dst_d,
-                ne00, nb01, nb02, nb03, ne10, ne11, ne12, nb10, nb11, nb12, nb1, nb2, nb3, stream);
+                ne00, ne01, nb01, nb02, nb03, ne10, ne11, ne12, nb10, nb11, nb12, nb1, nb2, nb3, stream);
             break;
         case GGML_TYPE_IQ4_XS:
             get_rows_cuda_kq<32, dst_t, dequantize_iq4_xs<dst_t>>(src0_d, src1_d, dst_d,
-                ne00, nb01, nb02, nb03, ne10, ne11, ne12, nb10, nb11, nb12, nb1, nb2, nb3, stream);
+                ne00, ne01, nb01, nb02, nb03, ne10, ne11, ne12, nb10, nb11, nb12, nb1, nb2, nb3, stream);
             break;
         case GGML_TYPE_MXFP4:
             get_rows_cuda_kq<32, dst_t, dequantize_mxfp4<dst_t>>(src0_d, src1_d, dst_d,
-                ne00, nb01, nb02, nb03, ne10, ne11, ne12, nb10, nb11, nb12, nb1, nb2, nb3, stream);
+                ne00, ne01, nb01, nb02, nb03, ne10, ne11, ne12, nb10, nb11, nb12, nb1, nb2, nb3, stream);
             break;
         default:
             GGML_ABORT("%s: unsupported src0 type: %s\n", __func__, ggml_type_name(src0_type));
@@ -412,26 +433,26 @@ static void ggml_cuda_get_rows_switch_src0_type(
 
 void get_rows_cuda(
         const void * src0_d, ggml_type src0_type, const int32_t * src1_d, void * dst_d, ggml_type dst_type,
-        int64_t ne00, size_t nb01, size_t nb02, size_t nb03,
+        int64_t ne00, int64_t ne01, size_t nb01, size_t nb02, size_t nb03,
         int64_t ne10, int64_t ne11, int64_t ne12, size_t nb10, size_t nb11, size_t nb12,
         size_t nb1, size_t nb2, size_t nb3,
         cudaStream_t stream) {
     switch (dst_type) {
         case GGML_TYPE_F32:
             ggml_cuda_get_rows_switch_src0_type(src0_d, src0_type, src1_d, (float *) dst_d,
-                ne00, nb01, nb02, nb03, ne10, ne11, ne12, nb10, nb11, nb12, nb1, nb2, nb3, stream);
+                ne00, ne01, nb01, nb02, nb03, ne10, ne11, ne12, nb10, nb11, nb12, nb1, nb2, nb3, stream);
             break;
         case GGML_TYPE_I32:
             ggml_cuda_get_rows_switch_src0_type(src0_d, src0_type, src1_d, (int32_t *) dst_d,
-                ne00, nb01, nb02, nb03, ne10, ne11, ne12, nb10, nb11, nb12, nb1, nb2, nb3, stream);
+                ne00, ne01, nb01, nb02, nb03, ne10, ne11, ne12, nb10, nb11, nb12, nb1, nb2, nb3, stream);
             break;
         case GGML_TYPE_F16:
             ggml_cuda_get_rows_switch_src0_type(src0_d, src0_type, src1_d, (half *) dst_d,
-                ne00, nb01, nb02, nb03, ne10, ne11, ne12, nb10, nb11, nb12, nb1, nb2, nb3, stream);
+                ne00, ne01, nb01, nb02, nb03, ne10, ne11, ne12, nb10, nb11, nb12, nb1, nb2, nb3, stream);
             break;
         case GGML_TYPE_BF16:
             ggml_cuda_get_rows_switch_src0_type(src0_d, src0_type, src1_d, (nv_bfloat16 *) dst_d,
-                ne00, nb01, nb02, nb03, ne10, ne11, ne12, nb10, nb11, nb12, nb1, nb2, nb3, stream);
+                ne00, ne01, nb01, nb02, nb03, ne10, ne11, ne12, nb10, nb11, nb12, nb1, nb2, nb3, stream);
             break;
         default:
             GGML_ABORT("%s: unsupported dst type: %s\n", __func__, ggml_type_name(dst_type));
@@ -455,7 +476,7 @@ void ggml_cuda_op_get_rows(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     GGML_ASSERT(dst->nb[0]  == ggml_type_size(dst->type));
 
     get_rows_cuda(src0->data, src0->type, (const int32_t *) src1->data, dst->data, dst->type,
-        ne00, nb01, nb02, nb03, ne10, ne11, ne12, nb10, nb11, nb12, nb1, nb2, nb3, stream);
+        ne00, ne01, nb01, nb02, nb03, ne10, ne11, ne12, nb10, nb11, nb12, nb1, nb2, nb3, stream);
 }
 
 void ggml_cuda_op_get_rows_back(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {

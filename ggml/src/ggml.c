@@ -1061,6 +1061,7 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "ARANGE",
     "TIMESTEP_EMBEDDING",
     "ARGSORT",
+    "ARGSORT_THRESH",
     "TOP_K",
     "LEAKY_RELU",
     "TRI",
@@ -1100,7 +1101,7 @@ static const char * GGML_OP_NAME[GGML_OP_COUNT] = {
     "GLU",
 };
 
-static_assert(GGML_OP_COUNT == 101, "GGML_OP_COUNT != 101");
+static_assert(GGML_OP_COUNT == 102, "GGML_OP_COUNT != 102");
 
 static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "none",
@@ -1176,6 +1177,7 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "arange(start, stop, step)",
     "timestep_embedding(timesteps, dim, max_period)",
     "argsort(x)",
+    "argsort_thresh(x)",
     "top_k(x)",
     "leaky_relu(x)",
     "tri(x)",
@@ -1215,7 +1217,7 @@ static const char * GGML_OP_SYMBOL[GGML_OP_COUNT] = {
     "glu(x)",
 };
 
-static_assert(GGML_OP_COUNT == 101, "GGML_OP_COUNT != 101");
+static_assert(GGML_OP_COUNT == 102, "GGML_OP_COUNT != 102");
 
 static_assert(GGML_OP_POOL_COUNT == 2, "GGML_OP_POOL_COUNT != 2");
 
@@ -5373,6 +5375,28 @@ struct ggml_tensor * ggml_argsort(
     return result;
 }
 
+// ggml_argsort_thresh
+
+struct ggml_tensor * ggml_argsort_thresh(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * a,
+        int                   min_entries,
+        float                 threshold,
+        float                 top_p) {
+    GGML_ASSERT(a->ne[0] <= INT32_MAX);
+
+    struct ggml_tensor * result = ggml_new_tensor(ctx, GGML_TYPE_I32, GGML_MAX_DIMS, a->ne);
+
+    ggml_set_op_params_i32(result, 0, (int32_t) min_entries);
+    ggml_set_op_params_f32(result, 1, threshold);
+    ggml_set_op_params_f32(result, 2, top_p);
+
+    result->op     = GGML_OP_ARGSORT_THRESH;
+    result->src[0] = a;
+
+    return result;
+}
+
 // ggml_argsort_top_k
 
 struct ggml_tensor * ggml_argsort_top_k(
@@ -5382,6 +5406,32 @@ struct ggml_tensor * ggml_argsort_top_k(
     GGML_ASSERT(a->ne[0] >= k);
 
     struct ggml_tensor * result = ggml_argsort(ctx, a, GGML_SORT_ORDER_DESC);
+
+    result = ggml_view_4d(ctx, result,
+                k, result->ne[1], result->ne[2], result->ne[3],
+                   result->nb[1], result->nb[2], result->nb[3],
+                0);
+
+    return result;
+}
+
+// ggml_argsort_top_k_thresh
+
+struct ggml_tensor * ggml_argsort_top_k_thresh(
+        struct ggml_context * ctx,
+        struct ggml_tensor  * a,
+        int                   k,
+        int                   min_entries,
+        float                 threshold,
+        float                 top_p) {
+    GGML_ASSERT(a->ne[0] >= k);
+
+    struct ggml_tensor * result;
+    if (min_entries <= 0 || (threshold <= 0.0f && top_p <= 0.0f)) {
+        result = ggml_argsort(ctx, a, GGML_SORT_ORDER_DESC);
+    } else {
+        result = ggml_argsort_thresh(ctx, a, min_entries, threshold, top_p);
+    }
 
     result = ggml_view_4d(ctx, result,
                 k, result->ne[1], result->ne[2], result->ne[3],

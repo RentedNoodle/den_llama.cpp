@@ -248,6 +248,76 @@ void argsort_f32_i32_cuda_bitonic(const float *   x,
     }
 }
 
+static __global__ void k_argsort_apply_thresh(const float * x, int * dst, const int ncols,
+        const int min_entries, const float thresh, const float top_p) {
+    const int row = blockIdx.x;
+    const float * x_row = x   + (int64_t) row * ncols;
+    int         * dst_row = dst + (int64_t) row * ncols;
+
+    // single thread per row
+    const float max_value = x_row[dst_row[0]];
+
+    // nucleus (top-p): keep the smallest prefix whose cumulative probability reaches top_p
+    int keep_nucleus = ncols;
+    if (top_p > 0.0f) {
+        float cum = 0.0f;
+        for (int j = 0; j < ncols; j++) {
+            cum += x_row[dst_row[j]];
+            if (cum >= top_p) {
+                keep_nucleus = j + 1;
+                break;
+            }
+        }
+    }
+
+    const int  keep       = min_entries > keep_nucleus ? min_entries : keep_nucleus;
+    const bool use_thresh = thresh > 0.0f;
+
+    for (int j = 0; j < ncols; j++) {
+        if (j >= keep || (use_thresh && j >= min_entries && x_row[dst_row[j]] < max_value*thresh)) {
+            dst_row[j] = -1;
+        }
+    }
+}
+
+// fill dst with the argsort result (no threshold applied)
+static void argsort_f32_i32_cuda_run(
+        ggml_backend_cuda_context & ctx,
+        const float * src0_d,
+        int *         dst_d,
+        const int     ncols,
+        const int     nrows,
+        const size_t  nb1,
+        ggml_sort_order order,
+        cudaStream_t  stream) {
+#ifdef GGML_CUDA_USE_CUB
+    const int    ncols_pad      = next_power_of_2(ncols);
+    const size_t shared_mem     = ncols_pad * sizeof(int);
+    const size_t max_shared_mem = ggml_cuda_info().devices[ggml_cuda_get_device()].smpb;
+
+    // early return if we can use bitonic argsort
+    if (shared_mem <= max_shared_mem && ncols <= 1024) {
+        argsort_f32_i32_cuda_bitonic(src0_d, dst_d, ncols, nrows, order, stream);
+        return;
+    }
+
+    const int chunk_nrows = argsort_f32_i32_cuda_cub_chunk_nrows(nb1, nrows);
+
+    ggml_cuda_pool & pool = ctx.pool();
+
+    for (int64_t i = 0; i < nrows; i += chunk_nrows) {
+        const int iter_nrows = std::min((int64_t) chunk_nrows, (int64_t) nrows - i);
+
+        argsort_f32_i32_cuda_cub(pool, src0_d, dst_d, ncols, iter_nrows, order, stream);
+
+        src0_d += (int64_t) ncols * iter_nrows;
+        dst_d  += (int64_t) ncols * iter_nrows;
+    }
+#else
+    argsort_f32_i32_cuda_bitonic(src0_d, dst_d, ncols, nrows, order, stream);
+#endif
+}
+
 void ggml_cuda_op_argsort(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
     const ggml_tensor * src0 = dst->src[0];
     const float * src0_d = (const float *)src0->data;
@@ -263,30 +333,35 @@ void ggml_cuda_op_argsort(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
 
     enum ggml_sort_order order = (enum ggml_sort_order) dst->op_params[0];
 
-#ifdef GGML_CUDA_USE_CUB
-    const int    ncols_pad      = next_power_of_2(ncols);
-    const size_t shared_mem     = ncols_pad * sizeof(int);
-    const size_t max_shared_mem = ggml_cuda_info().devices[ggml_cuda_get_device()].smpb;
+    argsort_f32_i32_cuda_run(ctx, src0_d, (int *) dst_d, ncols, nrows, src0->nb[1], order, stream);
+}
 
-    // early return if we can use bitonic argsort
-    if (shared_mem <= max_shared_mem && ncols <= 1024) {
-        argsort_f32_i32_cuda_bitonic(src0_d, (int *) dst_d, ncols, nrows, order, stream);
-        return;
+void ggml_cuda_op_argsort_thresh(ggml_backend_cuda_context & ctx, ggml_tensor * dst) {
+    const ggml_tensor * src0 = dst->src[0];
+    const float * src0_d = (const float *)src0->data;
+    int * dst_d = (int *)dst->data;
+    cudaStream_t stream = ctx.stream();
+
+    GGML_ASSERT(src0->type == GGML_TYPE_F32);
+    GGML_ASSERT( dst->type == GGML_TYPE_I32);
+    GGML_ASSERT(ggml_is_contiguous(src0));
+
+    const int64_t ncols = src0->ne[0];
+    const int64_t nrows = ggml_nrows(src0);
+
+    const int   min_entries = dst->op_params[0];
+    float       thresh;
+    float       top_p;
+    memcpy(&thresh, dst->op_params + 1, sizeof(float));
+    memcpy(&top_p,  dst->op_params + 2, sizeof(float));
+
+    // sort descending, then mark the reduced experts -1
+    argsort_f32_i32_cuda_run(ctx, src0_d, dst_d, ncols, nrows, src0->nb[1], GGML_SORT_ORDER_DESC, stream);
+
+    if (ncols > 0 && nrows > 0) {
+        const dim3 block_dims(1, 1, 1);
+        const dim3 block_nums(nrows, 1, 1);
+        k_argsort_apply_thresh<<<block_nums, block_dims, 0, stream>>>(
+            src0_d, dst_d, ncols, min_entries, thresh, top_p);
     }
-
-    const int chunk_nrows = argsort_f32_i32_cuda_cub_chunk_nrows(src0->nb[1], nrows);
-
-    ggml_cuda_pool & pool = ctx.pool();
-
-    for (int64_t i = 0; i < nrows; i += chunk_nrows) {
-        int iter_nrows = std::min((int64_t) chunk_nrows, nrows - i);
-
-        argsort_f32_i32_cuda_cub(pool, src0_d, (int *) dst_d, ncols, iter_nrows, order, stream);
-
-        src0_d += ncols * iter_nrows;
-        dst_d  += ncols * iter_nrows;
-    }
-#else
-    argsort_f32_i32_cuda_bitonic(src0_d, (int *) dst_d, ncols, nrows, order, stream);
-#endif
 }

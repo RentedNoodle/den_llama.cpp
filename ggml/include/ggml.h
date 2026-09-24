@@ -552,6 +552,7 @@ extern "C" {
         GGML_OP_ARANGE,
         GGML_OP_TIMESTEP_EMBEDDING,
         GGML_OP_ARGSORT,
+        GGML_OP_ARGSORT_THRESH,
         GGML_OP_TOP_K,
         GGML_OP_LEAKY_RELU,
         GGML_OP_TRI,
@@ -2404,6 +2405,28 @@ extern "C" {
             struct ggml_context * ctx,
             struct ggml_tensor  * a,
             int                   k);
+
+    // argsort (descending) with smart expert reduction:
+    //  - the first min_entries indices are always kept
+    //  - entries whose value is below `threshold` * max_value are marked -1
+    //  - if top_p > 0, only the smallest prefix whose cumulative probability
+    //    reaches top_p is kept (nucleus); the rest are marked -1
+    // op_params: [0] = min_entries (i32), [1] = threshold (f32), [2] = top_p (f32)
+    GGML_API struct ggml_tensor * ggml_argsort_thresh(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * a,
+            int                   min_entries,
+            float                 threshold,
+            float                 top_p);
+
+    // similar to ggml_argsort_top_k but with the smart expert reduction applied
+    GGML_API struct ggml_tensor * ggml_argsort_top_k_thresh(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * a,
+            int                   k,
+            int                   min_entries,
+            float                 threshold,
+            float                 top_p);
 
     // top k elements per row
     // note: the resulting top k indices are in no particular order

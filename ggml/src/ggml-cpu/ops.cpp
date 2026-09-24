@@ -4879,7 +4879,10 @@ static void ggml_compute_forward_get_rows_q(
         const int64_t i10 = (i - i12*ne11*ne10 - i11*ne10);
         const int64_t i01 = *(int32_t *) ((char *) src1->data + i10*nb10 + i11*nb11 + i12*nb12);
 
-        GGML_ASSERT(i01 >= 0 && i01 < ne01);
+        if (i01 < 0 || i01 >= ne01) {
+            memset((char *) dst->data + i10*nb1 + i11*nb2 + i12*nb3, 0, nc*sizeof(float));
+            continue;
+        }
 
         dequantize_row_q(
                 (const void *) ((char *) src0->data + i01*nb01 + i11*nb02 + i12*nb03),
@@ -4920,7 +4923,10 @@ static void ggml_compute_forward_get_rows_f16(
         const int64_t i10 = (i - i12*ne11*ne10 - i11*ne10);
         const int64_t i01 = *(int32_t *) ((char *) src1->data + i10*nb10 + i11*nb11 + i12*nb12);
 
-        GGML_ASSERT(i01 >= 0 && i01 < ne01);
+        if (i01 < 0 || i01 >= ne01) {
+            memset((char *) dst->data + i10*nb1 + i11*nb2 + i12*nb3, 0, nc*sizeof(float));
+            continue;
+        }
 
         ggml_cpu_fp16_to_fp32(
             (const ggml_fp16_t*) ((char *) src0->data + i01*nb01 + i11*nb02 + i12*nb03),
@@ -4961,7 +4967,10 @@ static void ggml_compute_forward_get_rows_bf16(
         const int64_t i10 = (i - i12*ne11*ne10 - i11*ne10);
         const int64_t i01 = *(int32_t *) ((char *) src1->data + i10*nb10 + i11*nb11 + i12*nb12);
 
-        GGML_ASSERT(i01 >= 0 && i01 < ne01);
+        if (i01 < 0 || i01 >= ne01) {
+            memset((char *) dst->data + i10*nb1 + i11*nb2 + i12*nb3, 0, nc*sizeof(float));
+            continue;
+        }
 
         ggml_cpu_bf16_to_fp32(
             (const ggml_bf16_t *) ((char *) src0->data + i01*nb01 + i11*nb02 + i12*nb03),
@@ -5002,7 +5011,10 @@ static void ggml_compute_forward_get_rows_f32(
         const int64_t i10 = (i - i12*ne11*ne10 - i11*ne10);
         const int64_t i01 = *(int32_t *) ((char *) src1->data + i10*nb10 + i11*nb11 + i12*nb12);
 
-        GGML_ASSERT(i01 >= 0 && i01 < ne01);
+        if (i01 < 0 || i01 >= ne01) {
+            memset((char *) dst->data + i10*nb1 + i11*nb2 + i12*nb3, 0, nc*sizeof(float));
+            continue;
+        }
 
         ggml_vec_cpy_f32(nc,
                 (float *) ((char *)  dst->data + i10*nb1  + i11*nb2  + i12*nb3),
@@ -8404,6 +8416,81 @@ void ggml_compute_forward_argsort(
         case GGML_TYPE_F32:
             {
                 ggml_compute_forward_argsort_f32(params, dst);
+            } break;
+        default:
+            {
+                GGML_ABORT("fatal error");
+            }
+    }
+}
+
+// ggml_compute_forward_argsort_thresh
+
+static void ggml_compute_forward_argsort_thresh_f32(
+    const ggml_compute_params * params,
+    ggml_tensor * dst) {
+
+    const ggml_tensor * src0 = dst->src[0];
+
+    GGML_TENSOR_UNARY_OP_LOCALS
+
+    GGML_ASSERT(nb0 == sizeof(float));
+
+    const int ith = params->ith;
+    const int nth = params->nth;
+
+    const int64_t nr = ggml_nrows(src0);
+
+    const int   min_entries = ggml_get_op_params_i32(dst, 0);
+    const float thresh      = ggml_get_op_params_f32(dst, 1);
+    const float top_p       = ggml_get_op_params_f32(dst, 2);
+
+    for (int64_t i = ith; i < nr; i += nth) {
+        const float   * src_data = (const float   *)((char *) src0->data + i*nb01);
+              int32_t * dst_data = (      int32_t *)((char *) dst->data  + i*nb1);
+
+        for (int64_t j = 0; j < ne0; j++) {
+            dst_data[j] = j;
+        }
+
+        std::sort(dst_data, dst_data + ne0, cmp_argsort<GGML_SORT_ORDER_DESC>{src_data});
+
+        const float max_value = src_data[dst_data[0]];
+
+        // nucleus (top-p): keep the smallest prefix whose cumulative probability reaches top_p
+        int64_t keep_nucleus = ne0;
+        if (top_p > 0.0f) {
+            float cum = 0.0f;
+            for (int64_t j = 0; j < ne0; j++) {
+                cum += src_data[dst_data[j]];
+                if (cum >= top_p) {
+                    keep_nucleus = j + 1;
+                    break;
+                }
+            }
+        }
+
+        const int64_t keep      = std::max<int64_t>(min_entries, keep_nucleus);
+        const bool    use_thresh = thresh > 0.0f;
+
+        for (int64_t j = 0; j < ne0; j++) {
+            if (j >= keep || (use_thresh && j >= min_entries && src_data[dst_data[j]] < max_value*thresh)) {
+                dst_data[j] = -1;
+            }
+        }
+    }
+}
+
+void ggml_compute_forward_argsort_thresh(
+    const ggml_compute_params * params,
+    ggml_tensor * dst) {
+
+    const ggml_tensor * src0 = dst->src[0];
+
+    switch (src0->type) {
+        case GGML_TYPE_F32:
+            {
+                ggml_compute_forward_argsort_thresh_f32(params, dst);
             } break;
         default:
             {

@@ -2022,8 +2022,14 @@ static void ggml_cuda_flash_attn_ext_vec(ggml_backend_cuda_context & ctx, ggml_t
 #else
     FATTN_VEC_CASES_ALL_D(GGML_TYPE_F16,  GGML_TYPE_F16)
     FATTN_VEC_CASES_ALL_D(GGML_TYPE_Q4_0, GGML_TYPE_Q4_0)
+    FATTN_VEC_CASES_ALL_D(GGML_TYPE_Q8_0, GGML_TYPE_Q4_0)
     FATTN_VEC_CASES_ALL_D(GGML_TYPE_Q8_0, GGML_TYPE_Q8_0)
     FATTN_VEC_CASES_ALL_D(GGML_TYPE_BF16, GGML_TYPE_BF16)
+    FATTN_VEC_CASES_ALL_D(GGML_TYPE_NVFP4, GGML_TYPE_NVFP4)
+    // Mixed-NVFP4 pairs (K=q8_0/V=nvfp4 and K=nvfp4/V=q8_0) for K-vs-V precision
+    // isolation of the matched NVFP4 case (nvfp4-mixed-pair-limitation.md).
+    FATTN_VEC_CASES_ALL_D(GGML_TYPE_Q8_0,  GGML_TYPE_NVFP4)
+    FATTN_VEC_CASES_ALL_D(GGML_TYPE_NVFP4, GGML_TYPE_Q8_0)
 #endif // GGML_CUDA_FA_ALL_QUANTS
 
     GGML_ABORT("fatal error");
@@ -2050,6 +2056,7 @@ static bool ggml_cuda_fattn_kv_type_supported(ggml_type type) {
 #endif // GGML_CUDA_FA_ALL_QUANTS
         case GGML_TYPE_Q4_0:
         case GGML_TYPE_Q8_0:
+        case GGML_TYPE_NVFP4:
         case GGML_TYPE_BF16:
             return true;
         default:
@@ -2142,7 +2149,15 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
     }
 
 #ifndef GGML_CUDA_FA_ALL_QUANTS
-    if (K->type != V->type) {
+    // Only these mixed KV pairs are compiled in the default (non-ALL_QUANTS) build; see
+    // CMakeLists.txt + the vec case table above. q8_0-K/q4_0-V is the legacy pair; the two
+    // NVFP4 pairs (K=q8_0/V=nvfp4 and K=nvfp4/V=q8_0) expose K-vs-V precision isolation for
+    // the matched NVFP4 case (nvfp4-mixed-pair-limitation.md).
+    const bool mixed_pair_ok =
+        (K->type == GGML_TYPE_Q8_0  && V->type == GGML_TYPE_Q4_0) ||
+        (K->type == GGML_TYPE_Q8_0  && V->type == GGML_TYPE_NVFP4) ||
+        (K->type == GGML_TYPE_NVFP4 && V->type == GGML_TYPE_Q8_0);
+    if (K->type != V->type && !mixed_pair_ok) {
         return BEST_FATTN_KERNEL_NONE;
     }
 #endif // GGML_CUDA_FA_ALL_QUANTS

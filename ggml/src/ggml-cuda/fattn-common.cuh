@@ -328,6 +328,51 @@ static __device__ __forceinline__ float vec_dot_fattn_vec_KQ_q8_0(
     return sum;
 }
 
+// FA-VEC K-dot for NVFP4 K (block_nvfp4, QK=64 = 4 sub-blocks of 16, low-nibble-first layout).
+// One int (4 int8 Q values) covers 4 consecutive elements that always stay inside a single
+// 16-value sub-block, so each lane resolves d_K[sub] for its own int directly (no deferred scale,
+// no Q-layout change). Q_ds.x is the q8_1 scale of the enclosing 32-value group. E2M1 is
+// signed-symmetric, so unlike q4_0 there is no zero-point term (only Q_ds.x is used).
+// Numeric target: ggml_vec_dot_nvfp4_q8_0_generic (ggml-cpu/quants.c:330-363).
+template <int D, int nthreads>
+static __device__ __forceinline__ float vec_dot_fattn_vec_KQ_nvfp4(
+    const char * __restrict__ K_c, const void * __restrict__ Q_v, const int * __restrict__ Q_q8, const void * __restrict__ Q_ds_v) {
+
+    static_assert(D % QK_NVFP4_SUB == 0, "D must be divisible by the NVFP4 sub-block size");
+
+    const block_nvfp4 * K_nvfp4 = (const block_nvfp4 *) K_c;
+    GGML_UNUSED(Q_v);
+
+    float sum = 0.0f;
+
+#pragma unroll
+    for (int k_KQ_0 = 0; k_KQ_0 < int(D/sizeof(int)); k_KQ_0 += nthreads) {
+        const int k_KQ = k_KQ_0 + (nthreads == WARP_SIZE ? threadIdx.x : threadIdx.x % nthreads);
+
+        const int e0 = 4*k_KQ;                               // first element index of this int
+        const int ib = e0 / QK_NVFP4;                        // NVFP4 block index
+        const int s  = (e0 % QK_NVFP4) / QK_NVFP4_SUB;       // sub-block index within the block
+        const int j  = e0 % QK_NVFP4_SUB;                    // element offset within the sub-block (0/4/8/12)
+        const int b  = j % (QK_NVFP4_SUB/2);                 // byte offset within the sub-block (0 or 4)
+
+        int kraw;
+        ggml_cuda_memcpy_1<sizeof(int)>(&kraw, K_nvfp4[ib].qs + s*(QK_NVFP4_SUB/2) + b);
+        kraw = (j < QK_NVFP4_SUB/2) ? (kraw & 0x0F0F0F0F) : ((kraw >> 4) & 0x0F0F0F0F);
+
+        const int2 v = get_int_from_table_16(kraw, kvalues_mxfp4);
+        const int  u = Q_q8[k_KQ_0/nthreads];
+
+        const int sumi = ggml_cuda_dp4a(v.x, u, 0);
+
+        const float  d_K  = ggml_cuda_ue4m3_to_fp32(K_nvfp4[ib].d[s]);
+        const float2 Q_ds = ((const float2 *) Q_ds_v)[k_KQ_0/nthreads];
+
+        sum += d_K * Q_ds.x * float(sumi);
+    }
+
+    return sum;
+}
+
 template <typename Tds, int ni>
 static __device__ __forceinline__ void quantize_q8_1_to_shared(
     const float * __restrict__ x, const float scale, int * __restrict__ yq32, void * __restrict__ yds) {
@@ -617,6 +662,55 @@ static __device__ __forceinline__ void dequantize_V_q8_0(const void * __restrict
     }
 }
 
+// FA-VEC V-dequant for NVFP4 V. Per-16 sub-block UE4M3 scale + low-nibble-first E2M1 LUT
+// (see block_nvfp4). ne must divide QK_NVFP4_SUB so a call never straddles a sub-block.
+// CONTRACT: only ne=4 is validated (all live call sites use V_rows_per_thread=4). The ne=2
+// arm compiles but is UNVERIFIED — future ne=2/ne=8 callers must prove their path before use.
+// Single packed word load + uniform shift/mask + table-free expand, mirroring the q4_0 path:
+// the caller steps i0 by V_rows_per_thread=4, so i0 % QK_NVFP4_SUB is a multiple of 4 and the
+// 8-element nibble half stays uniform across the call (iqs in {0,4}, shift in {0,1}).
+template <typename T, int ne>
+static __device__ __forceinline__ void dequantize_V_nvfp4(const void * __restrict__ vx, void * __restrict__ dst, const int64_t i0) {
+    const block_nvfp4 * x = (const block_nvfp4 *) vx;
+
+    static_assert(ne == 2 || ne == 4, "bad ne");
+    static_assert(QK_NVFP4_SUB % ne == 0, "ne must divide the NVFP4 sub-block size");
+
+    const int64_t ib    =  i0                 /  QK_NVFP4;
+    const int     isub  = (i0 % QK_NVFP4)     /  QK_NVFP4_SUB;
+    const int     iqs   = (i0 % QK_NVFP4_SUB) % (QK_NVFP4_SUB/2);   // byte offset within the sub-block (0 or 4)
+    const int     shift = (i0 % QK_NVFP4_SUB) / (QK_NVFP4_SUB/2);   // nibble half within the sub-block (0 or 1)
+
+    int q;
+    ggml_cuda_memcpy_1<ne>(&q, x[ib].qs + isub*(QK_NVFP4_SUB/2) + iqs);
+    q >>= 4*shift;
+    q &= 0x0F0F0F0F;
+
+    const int2     q8i = get_int_from_table_16(q, kvalues_mxfp4);
+    const int8_t * q8  = (const int8_t *) &q8i.x;
+
+    const float d = ggml_cuda_ue4m3_to_fp32(x[ib].d[isub]);
+
+#ifdef FP16_AVAILABLE
+    if constexpr (std::is_same<T, half>::value) {
+        const half2 d2 = __half2half2(__float2half(d));
+
+#pragma unroll
+        for (int l0 = 0; l0 < ne; l0 += 2) {
+            ((half2 *) dst)[l0/2] = d2 * make_half2(q8[l0 + 0], q8[l0 + 1]);
+        }
+    } else
+#endif // FP16_AVAILABLE
+    if constexpr (std::is_same<T, float>::value) {
+#pragma unroll
+        for (int l = 0; l < ne; ++l) {
+            ((float *) dst)[l] = d * float(q8[l]);
+        }
+    } else {
+        static_assert(std::is_same_v<T, void>, "unsupported type");
+    }
+}
+
 template <ggml_type type_K, int D, int nthreads>
 constexpr __device__ vec_dot_KQ_t get_vec_dot_KQ() {
     if constexpr (type_K == GGML_TYPE_F16) {
@@ -633,6 +727,8 @@ constexpr __device__ vec_dot_KQ_t get_vec_dot_KQ() {
         return vec_dot_fattn_vec_KQ_q8_0<D, nthreads>;
     } else if constexpr (type_K == GGML_TYPE_BF16) {
         return vec_dot_fattn_vec_KQ_bf16<D, nthreads>;
+    } else if constexpr (type_K == GGML_TYPE_NVFP4) {
+        return vec_dot_fattn_vec_KQ_nvfp4<D, nthreads>;
     } else {
         static_assert(type_K == -1, "bad type");
         return nullptr;
@@ -655,6 +751,8 @@ constexpr __device__ dequantize_V_t get_dequantize_V() {
         return dequantize_V_q8_0<T, ne>;
     } else if constexpr (type_V == GGML_TYPE_BF16) {
         return dequantize_V_bf16<float, ne>;
+    } else if constexpr (type_V == GGML_TYPE_NVFP4) {
+        return dequantize_V_nvfp4<T, ne>;
     } else {
         static_assert(type_V == -1, "bad type");
         return nullptr;
