@@ -289,6 +289,20 @@ static void common_params_fit_impl(
         }
     }
 
+    // MoE models: the expert-offload optimum sits closer to the device limit than the dense case
+    // (partial CPU+GPU expert execution overlaps, so a tighter reserve is faster and still avoids the
+    // ceiling-thrash cliff). Measured on gemma-4-26B-A4B Q4_K_M on a 16 GB card:
+    //   fit-target 1024 MiB -> 71 t/s, 512 -> 77, 256 -> 81.5; manual -ncmoe 4 (tighter) -> 94.
+    // Cap the reserve for MoE so --fit lands in the fast zone without a manual flag.
+    if (hp_nex > 0) {
+        constexpr int64_t moe_margin_max = 256*1024*1024;
+        for (auto & m : margins) {
+            if (m > moe_margin_max) {
+                m = moe_margin_max;
+            }
+        }
+    }
+
     std::vector<std::string> dev_names;
     {
         dev_names.reserve(nd);
