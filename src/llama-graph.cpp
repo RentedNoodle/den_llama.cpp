@@ -2056,15 +2056,12 @@ ggml_tensor * llm_graph_context::build_moe_ffn(
     if (selected_experts == nullptr) {
         if (cparams.ser_min_experts >= 0 &&
                 (cparams.ser_thresh_experts > 0.0f || cparams.ser_top_p > 0.0f)) {
-            // KNOWN ISSUE (2026-09-24): the thresh mask path faults (CUDA illegal access)
-            // while min-only and top-p drops are proven safe. Thresh forced off until the
-            // mask is fixed under a unit harness; min + top-p deliver the SER value now.
-            static bool ser_thresh_warned = false;
-            if (cparams.ser_thresh_experts > 0.0f && !ser_thresh_warned) {
-                ser_thresh_warned = true;
-                LLAMA_LOG_INFO("%s: ser thresh mask disabled (known fault); using min/top-p only\n", __func__);
-            }
-            const float thresh_il = 0.0f;
+            // PIONEER FIX (2026-09-24): dropped slots are remapped round-robin to kept
+            // experts by ggml_cuda_sanitize_moe_ids, keeping the CUDA layout dense, so
+            // thresh-dropped slots are safe. NOTE: this is an allocation/quality tool,
+            // not a speed lever (all slots still compute); true sparse is v3.
+            const float thresh_il = cparams.ser_thresh_experts *
+                (1.0f + cparams.ser_ramp * float(il) / float(hparams.n_layer()));
             selected_experts = ggml_argsort_top_k_thresh(ctx0, selection_probs, n_expert_used,
                     cparams.ser_min_experts, thresh_il, cparams.ser_top_p); // [n_expert_used, n_tokens]
         } else {

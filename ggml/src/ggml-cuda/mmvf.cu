@@ -3,6 +3,7 @@
 #include "unary.cuh"
 #include "mmvf.cuh"
 #include "convert.cuh"
+#include "mmid.cuh"
 
 template <typename T, typename type_acc, int ncols_dst, int block_size, bool has_fusion = false, bool is_multi_token_id = false>
 static __global__ void mul_mat_vec_f(
@@ -696,7 +697,22 @@ void ggml_cuda_mul_mat_vec_f(ggml_backend_cuda_context & ctx, const ggml_tensor 
     const int64_t stride_channel_dst = ids ? s1   : s2;
     const int64_t stride_channel_y   = ids ? s11  : s12;
 
-    const int64_t ids_stride = ids ? ids->nb[1] / ggml_type_size(ids->type) : 0;
+    int64_t ids_stride = ids ? ids->nb[1] / ggml_type_size(ids->type) : 0;
+
+    // SER: dropped MoE slots carry expert id -1. This decode path indexes ids as a UINT32
+    // channel index (mul_mat_vec_f / multi-token MoE path), so -1 (0xFFFFFFFF) reads out
+    // of bounds. Sanitize a dense int32 copy (-1 -> a kept expert of the same token) and
+    // hand the kernel that copy; being dense, its row stride is n_expert_used.
+    ggml_cuda_pool_alloc<int32_t> ids_sanitized_dev;
+    if (ids) {
+        const int64_t n_expert_used = ids->ne[0];
+        const int64_t n_tokens      = ids->ne[1];
+        ids_sanitized_dev.alloc(ctx.pool(), n_tokens * n_expert_used);
+        ggml_cuda_sanitize_moe_ids(ids_d, ids_sanitized_dev.get(),
+            static_cast<int>(n_tokens), static_cast<int>(n_expert_used), static_cast<int>(ids_stride), ctx.stream());
+        ids_d = ids_sanitized_dev.get();
+        ids_stride = n_expert_used;
+    }
 
     switch (src0->type) {
         case GGML_TYPE_F32: {

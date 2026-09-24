@@ -39,23 +39,27 @@ static __global__ void mm_ids_helper(
     int it_compact = 0; // Running index for the compact slice of this expert.
 
     if constexpr (n_expert_used_template == 0) {
-        // Generic implementation:
+        // Generic implementation.
+        // SER pioneer: match slots are assigned per-THREAD ballot ranks, not one per
+        // token: sanitized ids repeat one expert many times per token, so several
+        // threads can match the same (token, expert) and need distinct compact slots.
+        // Loop trip counts are uniform so __ballot_sync never diverges.
+        const int nsteps = (n_expert_used + warp_size - 1) / warp_size;
         for (int it = 0; it < n_tokens; ++it) {
-            int iex_used = -1; // The index at which the expert is used, if any.
             for (int iex = threadIdx.x; iex < n_expert_used; iex += warp_size) {
                 const int expert_used = ids[it*si1 + iex];
                 nex_prev += expert_used < expert;
-                if (expert_used == expert) {
-                    iex_used = iex;
+            }
+            for (int s = 0; s < nsteps; ++s) {
+                const int iex = threadIdx.x + s*warp_size;
+                const bool match = iex < n_expert_used && ids[it*si1 + iex] == expert;
+                const unsigned match_ballot = __ballot_sync(0xFFFFFFFFu, match);
+                const unsigned lane = (unsigned) threadIdx.x;
+                const unsigned lane_lt = lane == 0 ? 0u : ((1u << lane) - 1u);
+                if (match) {
+                    store[it_compact + (int) __popc(match_ballot & lane_lt)] = mm_ids_helper_store(it, iex);
                 }
-            }
-
-            if (iex_used != -1) {
-                store[it_compact] = mm_ids_helper_store(it, iex_used);
-            }
-
-            if (warp_reduce_any<warp_size>(iex_used != -1)) {
-                it_compact++;
+                it_compact += (int) __popc(match_ballot);
             }
         }
     } else {
@@ -71,25 +75,18 @@ static __global__ void mm_ids_helper(
             const int iex_used = expert_used == expert ? iex : -1;
             nex_prev += expert_used < expert;
 
-            // Whether the threads at this token position have used the expert:
-            const int it_compact_add_self = warp_reduce_any<neu_padded>(iex_used != -1);
-
-            // Do a scan over threads at lower token positions in warp to get the correct index for writing data:
-            int it_compact_add_lower = 0;
-#pragma unroll
-            for (int offset = neu_padded; offset < warp_size; offset += neu_padded) {
-                const int tmp = __shfl_up_sync(0xFFFFFFFF, it_compact_add_self, offset, warp_size);
-                if (threadIdx.x >= static_cast<unsigned int>(offset)) {
-                    it_compact_add_lower += tmp;
-                }
-            }
-
+            // SER pioneer: per-thread ballot rank gives every matching thread a distinct
+            // compact slot. The legacy per-token-group scan assumed one match per token
+            // per expert, which sanitized ids (repeated expert per token) violate.
+            static_assert(warp_size <= 32, "ballot mask assumes warp <= 32 lanes");
+            const unsigned match_ballot = __ballot_sync(0xFFFFFFFFu, iex_used != -1);
+            const unsigned lane = (unsigned) threadIdx.x;
+            const unsigned lane_lt = lane == 0 ? 0u : ((1u << lane) - 1u);
+            const int rank_in_warp = (int) __popc(match_ballot & lane_lt);
             if (iex_used != -1) {
-                store[it_compact + it_compact_add_lower] = mm_ids_helper_store(it, iex_used);
+                store[it_compact + rank_in_warp] = mm_ids_helper_store(it, iex_used);
             }
-
-            // The thread with the highest index in the warp always has the sum over the whole warp, use it to increment all threads:
-            it_compact += __shfl_sync(0xFFFFFFFF, it_compact_add_lower + it_compact_add_self, warp_size - 1, warp_size);
+            it_compact += (int) __shfl_sync(0xFFFFFFFFu, __popc(match_ballot), warp_size - 1, warp_size);
         }
     }
     nex_prev = warp_reduce_sum<warp_size>(nex_prev);
@@ -134,10 +131,51 @@ static void launch_mm_ids_helper(
 
     const dim3 num_blocks(n_experts, 1, 1);
     const dim3 block_size(warp_size, 1, 1);
-    const size_t nbytes_shared = n_tokens*sizeof(mm_ids_helper_store);
+    // SER note: sanitized ids can repeat one expert many times per token (dropped slots
+    // remap to expert 0), so one expert may own up to n_tokens*n_expert_used rows here.
+    // The legacy n_tokens sizing assumed distinct experts per token and overflows otherwise.
+    const size_t nbytes_shared = ((size_t) n_tokens) * n_expert_used_var * sizeof(mm_ids_helper_store);
     GGML_ASSERT(nbytes_shared <= smpbo);
     mm_ids_helper<n_expert_used_template><<<num_blocks, block_size, nbytes_shared, stream>>>
         (ids, ids_src1, ids_dst, expert_bounds, n_tokens, n_expert_used_var, nchannels_y, si1, sis1, write_inverse);
+}
+
+// SER SoT pioneer: remap dropped slots (id -1) to expert 0 so every downstream
+// MoE path (helper maps, quantize scatter, fused match loop) keeps its denseployer
+// invariant: all slots valid, all outputs written and finite. The weights path keeps
+// the original -1 ids (get_rows zero-fills them), so dropped slots contribute exactly 0.
+static __global__ void k_sanitize_moe_ids(const int32_t * __restrict__ ids_in, int32_t * __restrict__ ids_out,
+        const int n_tokens, const int n_expert_used, const int si1) {
+    // One thread per token: remap dropped slots (-1) round-robin over the token's
+    // KEPT experts (hot rows, balanced load). Falls back to expert 0 if none kept.
+    // All experts named here are active this token, hence GPU-resident by definition.
+    const int it = blockIdx.x * blockDim.x + threadIdx.x;
+    if (it >= n_tokens) {
+        return;
+    }
+    int kept[64];
+    int n_kept = 0;
+    for (int iex = 0; iex < n_expert_used && n_kept < 64; ++iex) {
+        const int v = ids_in[it * si1 + iex];
+        if (v >= 0) {
+            kept[n_kept++] = v;
+        }
+    }
+    for (int iex = 0; iex < n_expert_used; ++iex) {
+        const int v = ids_in[it * si1 + iex];
+        ids_out[it * n_expert_used + iex] = v >= 0 ? v : (n_kept > 0 ? kept[iex % n_kept] : 0);
+    }
+}
+
+void ggml_cuda_sanitize_moe_ids(const int32_t * ids_in, int32_t * ids_out,
+        const int n_tokens, const int n_expert_used, const int si1, cudaStream_t stream) {
+    if (n_tokens <= 0 || n_expert_used <= 0) {
+        return;
+    }
+    GGML_ASSERT(n_expert_used <= 64);
+    constexpr int block_size = 256;
+    const int num_blocks = (n_tokens + block_size - 1) / block_size;
+    k_sanitize_moe_ids<<<num_blocks, block_size, 0, stream>>>(ids_in, ids_out, n_tokens, n_expert_used, si1);
 }
 
 void ggml_cuda_launch_mm_ids_helper(

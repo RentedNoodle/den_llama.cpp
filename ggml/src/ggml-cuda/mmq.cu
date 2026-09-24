@@ -197,10 +197,21 @@ void ggml_cuda_mul_mat_q(
         const int si1  = ids->nb[1] / ggml_element_size(ids);
         const int sis1 = nb12 / nb11;
 
-        ggml_cuda_launch_mm_ids_helper((const int32_t *) ids->data, ids_src1.get(), ids_dst.get(), expert_bounds.get(),
-            ne02, ne12, n_expert_used, ne11, si1, sis1, /*write_inverse =*/ dedup_bcast, stream);
+        // SER: sanitize a copy of ids (-1 -> 0) for the expert path so the compact
+        // layout stays dense; the weights path keeps the original -1 ids (zero-fill).
+        ggml_cuda_pool_alloc<int32_t> ids_sanitized(ctx.pool(), ne_get_rows);
+        ggml_cuda_sanitize_moe_ids((const int32_t *) ids->data, ids_sanitized.get(),
+            (int) ne12, (int) n_expert_used, si1, stream);
+
+        ggml_cuda_launch_mm_ids_helper(ids_sanitized.get(), ids_src1.get(), ids_dst.get(), expert_bounds.get(),
+            ne02, ne12, n_expert_used, ne11, (int) n_expert_used, sis1, /*write_inverse =*/ dedup_bcast, stream);
         CUDA_CHECK(cudaGetLastError());
     }
+
+    // SER: slots dropped to id -1 have no compact rows, so their expert-output rows are
+    // never written by the main kernel. Zero them up front: weights for dropped slots are
+    // already zero, and 0 * 0 is finite, while 0 * stale-pool-garbage can be NaN (#415 class).
+    CUDA_CHECK(cudaMemsetAsync(dst_d, 0, ggml_nbytes(dst), stream));
 
     const size_t nbytes_src1_q8_1 = ne12*n_expert_used*ne10_padded * y_block_size/y_values_per_block +
         ggml_cuda_mmq_get_J_max(src0->type, fallback, cc, ne11) * sizeof(block_q8_1_mmq);
