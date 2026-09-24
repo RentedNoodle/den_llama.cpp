@@ -44,13 +44,14 @@ void ggml_cuda_mul_mat_f(ggml_backend_cuda_context & ctx, const ggml_tensor * sr
     const int64_t s3  =  dst->nb[3] / ts_dst;
 
     const int64_t ids_s0 = ids ? ids->nb[0] / ggml_type_size(ids->type) : 0;
-    const int64_t ids_s1 = ids ? ids->nb[1] / ggml_type_size(ids->type) : 0;
+    int64_t ids_s1 = ids ? ids->nb[1] / ggml_type_size(ids->type) : 0;
 
     mmf_ids_data ids_info{};
     mmf_ids_data * ids_info_ptr = nullptr;
     ggml_cuda_pool_alloc<int32_t> ids_src_compact_dev;
     ggml_cuda_pool_alloc<int32_t> ids_dst_compact_dev;
     ggml_cuda_pool_alloc<int32_t> expert_bounds_dev;
+    ggml_cuda_pool_alloc<int32_t> ids_sanitized_dev;
 
     // For MUL_MAT_ID the memory layout is different than for MUL_MAT:
     const int64_t ncols_dst          = ids ? ne2  : ne1;
@@ -69,6 +70,18 @@ void ggml_cuda_mul_mat_f(ggml_backend_cuda_context & ctx, const ggml_tensor * sr
         nchannels_y      = ids->ne[0];
     }
 
+    // SER: sanitize a copy of ids (-1 dropped slots -> a kept expert) so BOTH the compact
+    // path and the small-batch fused path see only valid expert ids. Cheap identity copy
+    // when SER is off (no -1 present); avoids the raw -1 / stale-garbage NaN class.
+    if (ids) {
+        const int64_t n_expert_used = ids->ne[0];
+        ids_sanitized_dev.alloc(ctx.pool(), ne12 * n_expert_used);
+        ggml_cuda_sanitize_moe_ids(ids_d, ids_sanitized_dev.get(),
+            static_cast<int>(ne12), static_cast<int>(n_expert_used), static_cast<int>(ids_s1), ctx.stream());
+        ids_d  = ids_sanitized_dev.get();
+        ids_s1 = n_expert_used;
+    }
+
     if (ids && ncols_dst > 16) {
         const int64_t n_expert_used = ids->ne[0];
         const int64_t n_experts     = ne02;
@@ -84,8 +97,11 @@ void ggml_cuda_mul_mat_f(ggml_backend_cuda_context & ctx, const ggml_tensor * sr
 
         GGML_ASSERT(sis1 > 0);
 
+        // ids already sanitized above; si1 for the (dense) sanitized copy is n_expert_used.
+        (void) si1;
+
         ggml_cuda_launch_mm_ids_helper(ids_d, ids_src_compact_dev.get(), ids_dst_compact_dev.get(), expert_bounds_dev.get(),
-            static_cast<int>(n_experts), static_cast<int>(n_tokens), static_cast<int>(n_expert_used), static_cast<int>(ne11), si1, sis1, /*write_inverse =*/ false, ctx.stream());
+            static_cast<int>(n_experts), static_cast<int>(n_tokens), static_cast<int>(n_expert_used), static_cast<int>(ne11), static_cast<int>(n_expert_used), sis1, /*write_inverse =*/ false, ctx.stream());
         CUDA_CHECK(cudaGetLastError());
 
         ids_info.ids_src_compact   = ids_src_compact_dev.get();
