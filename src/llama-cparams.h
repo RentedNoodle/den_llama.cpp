@@ -58,6 +58,13 @@ struct llama_cparams {
     uint32_t kv_stream_stage_mib;
     int32_t  kv_high_precision_layers;
 
+    int32_t  kv_headroom_warn_mib;
+    int32_t  kv_headroom_block_mib;
+    bool     kv_headroom_force;
+
+    ggml_type type_k; // reported by the KV headroom guard
+    ggml_type type_v;
+
     int   ser_min_experts;
     float ser_thresh_experts;
     float ser_top_p;

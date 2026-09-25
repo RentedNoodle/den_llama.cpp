@@ -391,6 +391,10 @@ extern "C" {
         int32_t kv_high_precision_layers; // number of leading full-attention layers that keep type_k/type_v; the rest use NVFP4, 0 = off [EXPERIMENTAL]
         uint32_t kv_stream_stage_mib; // block-streaming staging budget, 0 = disabled [EXPERIMENTAL]
 
+        int32_t kv_headroom_warn_mib;  // warn at ctx creation if projected free device memory < this many MiB, 0 = disabled
+        int32_t kv_headroom_block_mib; // refuse to start if projected free device memory < this many MiB, 0 = disabled
+        bool    kv_headroom_force;     // continue even if projected free device memory < kv_headroom_block_mib (warn only)
+
         int   ser_min_experts;    // smart expert reduction: keep at least this many experts, -1 = disabled
         float ser_thresh_experts; // drop experts below this fraction of max router weight, 0 = disabled
         float ser_top_p;          // nucleus mass over router weights to keep, 0 = disabled

@@ -2492,6 +2492,41 @@ common_params_context common_params_parser_init(common_params & params, llama_ex
         }
     ).set_env("LLAMA_ARG_KV_HIGH_PRECISION_LAYERS"));
     add_opt(common_arg(
+        {"--kv-headroom-warn"}, "MIB",
+        string_format(
+            "warn at context creation if the projected free device memory after the model, KV cache "
+            "and compute buffers is below this many MiB (0 = disabled, default: %d)",
+            params.kv_headroom_warn_mib
+        ),
+        [](common_params & params, int value) {
+            if (value < 0) {
+                throw std::invalid_argument("--kv-headroom-warn must be >= 0");
+            }
+            params.kv_headroom_warn_mib = value;
+        }
+    ).set_env("LLAMA_ARG_KV_HEADROOM_WARN"));
+    add_opt(common_arg(
+        {"--kv-headroom-block"}, "MIB",
+        string_format(
+            "refuse to start if the projected free device memory after the model, KV cache and "
+            "compute buffers is below this many MiB; override with --kv-headroom-force (0 = disabled, default: %d)",
+            params.kv_headroom_block_mib
+        ),
+        [](common_params & params, int value) {
+            if (value < 0) {
+                throw std::invalid_argument("--kv-headroom-block must be >= 0");
+            }
+            params.kv_headroom_block_mib = value;
+        }
+    ).set_env("LLAMA_ARG_KV_HEADROOM_BLOCK"));
+    add_opt(common_arg(
+        {"--kv-headroom-force"},
+        "continue even if the projected free device memory is below --kv-headroom-block (warn only)",
+        [](common_params & params) {
+            params.kv_headroom_force = true;
+        }
+    ).set_env("LLAMA_ARG_KV_HEADROOM_FORCE"));
+    add_opt(common_arg(
         {"--hellaswag"},
         "compute HellaSwag score over random tasks from datafile supplied with -f",
         [](common_params & params) {

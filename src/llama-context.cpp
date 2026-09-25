@@ -84,6 +84,119 @@ static const llm_fused_op_probe llm_fused_op_dsv4_hc_post_probe = {
     /*.n_tokens_per_seq =*/ 1,
 };
 
+// KV headroom guard: surface the silent VRAM-ceiling cliff at high context sizes.
+// Purely observational add - it never alters allocation; it only logs and, below the
+// configured block threshold, refuses to start (unless --kv-headroom-force).
+static void llama_kv_headroom_check(
+        const llama_model & model,
+        const llama_cparams & cparams,
+        const llama_memory_i * memory,
+        const std::vector<size_t> & compute_buf_sizes) {
+    const auto & hparams = model.hparams;
+
+    // the device that holds the KV cache: first KV layer, falling back to the first model device
+    ggml_backend_dev_t dev = nullptr;
+    for (uint32_t il = 0; il < hparams.n_layer_all; ++il) {
+        if (hparams.has_kv(il)) {
+            dev = model.dev_layer(il);
+            break;
+        }
+    }
+    if (dev == nullptr && !model.devices.empty()) {
+        dev = model.devices[0].dev;
+    }
+    if (dev == nullptr || ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_CPU) {
+        return; // no VRAM ceiling on CPU
+    }
+
+    // actual KV allocation, as laid out by the memory module
+    size_t kv_bytes = 0;
+    for (const auto & [buft, size] : memory->memory_breakdown()) {
+        kv_bytes += size;
+    }
+
+    // analytic K:V ratio (scaled to the actual total below) so they can be reported separately
+    size_t kv_k_ratio = 0;
+    size_t kv_v_ratio = 0;
+    {
+        int32_t n_kv_seen = 0;
+        for (uint32_t il = 0; il < hparams.n_layer_all; ++il) {
+            if (!hparams.has_kv(il)) {
+                continue;
+            }
+            const ggml_type type_k_il = (cparams.kv_high_precision_layers > 0 && n_kv_seen >= cparams.kv_high_precision_layers)
+                ? GGML_TYPE_NVFP4 : cparams.type_k;
+            const ggml_type type_v_il = (cparams.kv_high_precision_layers > 0 && n_kv_seen >= cparams.kv_high_precision_layers)
+                ? GGML_TYPE_NVFP4 : cparams.type_v;
+            ++n_kv_seen;
+            kv_k_ratio += ggml_row_size(type_k_il, hparams.n_embd_k_gqa(il));
+            kv_v_ratio += ggml_row_size(type_v_il, hparams.n_embd_v_gqa(il));
+        }
+    }
+
+    const size_t kv_k_bytes = (kv_k_ratio + kv_v_ratio) > 0 ? kv_bytes * kv_k_ratio / (kv_k_ratio + kv_v_ratio) : 0;
+    const size_t kv_v_bytes = kv_bytes - kv_k_bytes;
+
+    size_t compute_bytes = 0;
+    for (const size_t size : compute_buf_sizes) {
+        compute_bytes += size;
+    }
+
+    const size_t model_bytes = model.size();
+
+    size_t dev_free  = 0;
+    size_t dev_total = 0;
+    ggml_backend_dev_memory(dev, &dev_free, &dev_total);
+
+    const size_t total_projected = model_bytes + kv_bytes + compute_bytes;
+    // free memory once model + KV + compute are resident
+    const size_t projected_free = dev_total > 0
+        ? (dev_total > total_projected ? dev_total - total_projected : 0)
+        : dev_free;
+
+    const double mib = 1024.0 * 1024.0;
+
+    LLAMA_LOG_INFO("%s: KV headroom: ctx = %u, K type = %s, V type = %s | model = %.2f MiB, "
+            "KV (K = %.2f MiB, V = %.2f MiB), compute = %.2f MiB, total = %.2f MiB | "
+            "device total = %.2f MiB, projected free = %.2f MiB\n",
+            __func__, cparams.n_ctx, ggml_type_name(cparams.type_k), ggml_type_name(cparams.type_v),
+            model_bytes / mib, kv_k_bytes / mib, kv_v_bytes / mib, compute_bytes / mib, total_projected / mib,
+            dev_total / mib, projected_free / mib);
+
+    const size_t warn_bytes  = (size_t) std::max<int32_t>(cparams.kv_headroom_warn_mib,  0) * 1024ULL * 1024ULL;
+    const size_t block_bytes = (size_t) std::max<int32_t>(cparams.kv_headroom_block_mib, 0) * 1024ULL * 1024ULL;
+
+    // max ctx that would still leave the warn headroom, scaling the KV bytes linearly in ctx
+    uint32_t ctx_max_warn = 0;
+    if (kv_bytes > 0 && projected_free + kv_bytes > warn_bytes) {
+        ctx_max_warn = (uint32_t) ((double) cparams.n_ctx *
+                (double) (projected_free + kv_bytes - warn_bytes) / (double) kv_bytes);
+    }
+
+    if (block_bytes > 0 && projected_free < block_bytes) {
+        if (!cparams.kv_headroom_force) {
+            throw std::runtime_error(format(
+                    "KV headroom: projected free device memory %.2f MiB is below --kv-headroom-block %.2f MiB "
+                    "(ctx = %u, K = %s, V = %s, model = %.2f MiB, KV = %.2f MiB, compute = %.2f MiB, device total = %.2f MiB). "
+                    "Lower -c, use a smaller KV cache type (-ctk/-ctv), or pass --kv-headroom-force to override",
+                    projected_free / mib, block_bytes / mib, cparams.n_ctx,
+                    ggml_type_name(cparams.type_k), ggml_type_name(cparams.type_v),
+                    model_bytes / mib, kv_bytes / mib, compute_bytes / mib, dev_total / mib));
+        }
+        LLAMA_LOG_WARN("%s: KV headroom: projected free device memory %.2f MiB is below --kv-headroom-block %.2f MiB, "
+                "continuing because --kv-headroom-force is set\n",
+                __func__, projected_free / mib, block_bytes / mib);
+    }
+
+    if (warn_bytes > 0 && projected_free < warn_bytes) {
+        LLAMA_LOG_WARN("%s: KV headroom: projected free device memory %.2f MiB is below --kv-headroom-warn %.2f MiB "
+                "(ctx = %u, K = %s, V = %s, KV = %.2f MiB); reduce ctx to <= %u to keep the %.2f MiB headroom\n",
+                __func__, projected_free / mib, warn_bytes / mib, cparams.n_ctx,
+                ggml_type_name(cparams.type_k), ggml_type_name(cparams.type_v), kv_bytes / mib,
+                ctx_max_warn, warn_bytes / mib);
+    }
+}
+
 llama_context::llama_context(
         const llama_model & model,
               llama_context_params params) :
@@ -125,6 +238,11 @@ llama_context::llama_context(
     cparams.offload_kqv             = params.offload_kqv;
     cparams.kv_stream_stage_mib     = params.kv_stream_stage_mib;
     cparams.kv_high_precision_layers = params.kv_high_precision_layers;
+    cparams.kv_headroom_warn_mib    = params.kv_headroom_warn_mib;
+    cparams.kv_headroom_block_mib   = params.kv_headroom_block_mib;
+    cparams.kv_headroom_force       = params.kv_headroom_force;
+    cparams.type_k                  = params.type_k;
+    cparams.type_v                  = params.type_v;
     cparams.ser_min_experts         = params.ser_min_experts;
     cparams.ser_thresh_experts      = params.ser_thresh_experts;
     cparams.ser_top_p               = params.ser_top_p;
@@ -798,6 +916,12 @@ void llama_context::sched_reserve() {
 
     LLAMA_LOG_INFO("%s: reserve took %.2f ms, sched copies = %d\n",
             __func__, (t_end_us - t_start_us)/1000.0, ggml_backend_sched_get_n_copies(sched.get()));
+
+    // KV headroom guard: now that the KV cache and compute buffers are allocated, surface the
+    // VRAM-ceiling cliff (a silent prefill collapse today) before the first request.
+    if (!model.hparams.vocab_only && memory) {
+        llama_kv_headroom_check(model, cparams, memory.get(), backend_buf_exp_size);
+    }
 }
 
 void llama_context::synchronize() {
@@ -3949,6 +4073,9 @@ llama_context_params llama_context_default_params() {
         /*.type_v                      =*/ GGML_TYPE_F16,
         /*.kv_high_precision_layers    =*/ 0,
         /*.kv_stream_stage_mib         =*/ 0,
+        /*.kv_headroom_warn_mib        =*/ 1536,
+        /*.kv_headroom_block_mib       =*/ 512,
+        /*.kv_headroom_force           =*/ false,
         /*.ser_min_experts             =*/ -1,
         /*.ser_thresh_experts          =*/ 0.0f,
         /*.ser_top_p                   =*/ 0.0f,
