@@ -1,6 +1,6 @@
 # den_llama.cpp
 
-A llama.cpp fork tuned for one job: **Qwen3.8-27B at up to 196K context with native MTP speculative decoding on a single 16 GB GPU** (RTX 5070 Ti, Blackwell GB203) — plus a MoE serving lane (gemma-4-26B-A4B) that runs on the same card via partial CPU+GPU expert offload. See **Build layering** below: this repo hosts both the immutable golden engine (`build2`) and the developing one (`build3`).
+A llama.cpp fork tuned for one job: **Qwen3.8-27B at up to 196K context with native MTP speculative decoding on a single 16 GB GPU** (RTX 5070 Ti, Blackwell GB203) — plus a MoE serving lane (gemma-4-26B-A4B) that runs on the same card via partial CPU+GPU expert offload. This repo hosts a frozen reference engine (`build2`) and the development engine (`build3`).
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
 [![Hugging Face](https://img.shields.io/badge/Hugging%20Face-Qwen3.8--27B%20GSQ--RCO%20IQ3__XXS-yellow)](https://huggingface.co/RentedNoodle/Qwen3.8-27B-OrcaRouter-GSQ-RCO-IQ3_XXS-Uncensored)
@@ -10,16 +10,13 @@ A llama.cpp fork tuned for one job: **Qwen3.8-27B at up to 196K context with nat
 
 Part of [Project Den](https://github.com/RentedNoodle/Project_Den) — a framework for persistent AI companions; this repo is its neural execution engine.
 
-## Build layering
+## Builds
 
 | Tree | Role |
 |---|---|
-| **`build2`** (`abd589d4c`) | Immutable **golden backup** engine — the ≤128K default. Never modified. |
-| **`build3`** (`build3` branch) | The **working/developing** engine: golden lineage + the advances below. |
-| `build-fa` | Dev twin of build3 (`I:\llama-fa`, same content). |
-
-`build3` is an **overall upgrade** over `build2`: same lineage, plus the FA fix, quantized-KV codecs,
-expert-reduction work, the MoE placement fix, and the KV headroom guard.
+| `build2` (`abd589d4c`) | Frozen reference engine. Read-only. |
+| `build3` (`build3` branch) | Development engine — `build2` plus the FA fix, the quantized-KV codecs, SER, the MoE placement fix, and the KV headroom guard. |
+| `build-fa` | Dev twin of `build3` (`I:\llama-fa`). |
 
 ## What this fork is
 
@@ -173,7 +170,7 @@ Branches:
 | Branch | Role |
 |---|---|
 | `main` | Golden master HEAD `abd589d4c` ("MTP carryover fix + server MTP/reasoning plumbing + delta-net fixes + build repro doc"). |
-| `build3` | **Working/developing engine** (`a22b5fea0`) — golden lineage + FA fix + NVFP4/Q4_G64 KV + split-KV + SER + `--fit` MoE fix + KV headroom guard. Tag `build3-golden-20260924`. |
+| `build3` | Development engine (`a22b5fea0`) — FA fix + NVFP4/Q4_G64 KV + split-KV + SER + `--fit` MoE fix + KV headroom guard. Tag `build3-golden-20260924`. |
 | `feat/q4-g64-kv` | Build3 + the `GGML_TYPE_Q4_G64` codec + the KV headroom guard (`9cd4febbb`). |
 | `archive/stage1-nvfp4-abd589d4c` | Pre-consolidation archive (`42bf457d5`). |
 | `den-legacy` | Retired engine history (`a99ff8f9…`). |
