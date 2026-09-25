@@ -595,7 +595,7 @@ struct common_params {
     uint32_t kv_stream_stage_mib = 0;        // block-streaming staging budget, 0 = disabled [EXPERIMENTAL]
 
     int32_t kv_headroom_warn_mib  = 1536;   // warn at ctx creation if projected free device memory < this many MiB (0 = disabled)
-    int32_t kv_headroom_block_mib = 512;    // refuse to start if projected free device memory < this many MiB (0 = disabled)
+    int32_t kv_headroom_block_mib = 0;      // refuse to start if projected free device memory < this many MiB (0 = disabled, warn-only)
     bool    kv_headroom_force     = false;  // continue even if projected free device memory < --kv-headroom-block (warn only)
 
     common_conversation_mode conversation_mode = COMMON_CONVERSATION_MODE_AUTO;

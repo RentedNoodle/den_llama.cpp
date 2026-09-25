@@ -142,17 +142,31 @@ static void llama_kv_headroom_check(
         compute_bytes += size;
     }
 
-    const size_t model_bytes = model.size();
+    // GPU-resident model bytes only: model.size() is the WHOLE model, so for an offloaded MoE
+    // (some experts on CPU) it over-counts and would produce a false warning/block.
+    size_t model_bytes = 0;
+    for (const auto & tn : model.tensors_by_name) {
+        const ggml_tensor * t = tn.second;
+        if (t->buffer == nullptr) {
+            continue;
+        }
+        ggml_backend_dev_t tdev = ggml_backend_buft_get_device(ggml_backend_buffer_get_type(t->buffer));
+        if (tdev == dev) {
+            model_bytes += ggml_nbytes(t);
+        }
+    }
 
     size_t dev_free  = 0;
     size_t dev_total = 0;
     ggml_backend_dev_memory(dev, &dev_free, &dev_total);
 
     const size_t total_projected = model_bytes + kv_bytes + compute_bytes;
-    // free memory once model + KV + compute are resident
-    const size_t projected_free = dev_total > 0
-        ? (dev_total > total_projected ? dev_total - total_projected : 0)
-        : dev_free;
+    // Actual free device memory measured now that model + KV + compute are allocated. This is the
+    // authoritative figure: model.size() is the WHOLE model, so for an offloaded MoE it over-counts
+    // the GPU-resident part and the analytic figure would false-block a valid split.
+    const size_t projected_free = dev_free > 0
+        ? dev_free
+        : (dev_total > total_projected ? dev_total - total_projected : 0);
 
     const double mib = 1024.0 * 1024.0;
 
@@ -4074,7 +4088,7 @@ llama_context_params llama_context_default_params() {
         /*.kv_high_precision_layers    =*/ 0,
         /*.kv_stream_stage_mib         =*/ 0,
         /*.kv_headroom_warn_mib        =*/ 1536,
-        /*.kv_headroom_block_mib       =*/ 512,
+        /*.kv_headroom_block_mib       =*/ 0,
         /*.kv_headroom_force           =*/ false,
         /*.ser_min_experts             =*/ -1,
         /*.ser_thresh_experts          =*/ 0.0f,
