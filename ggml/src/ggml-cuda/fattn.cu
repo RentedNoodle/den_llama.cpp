@@ -2022,8 +2022,10 @@ static void ggml_cuda_flash_attn_ext_vec(ggml_backend_cuda_context & ctx, ggml_t
 #else
     FATTN_VEC_CASES_ALL_D(GGML_TYPE_F16,  GGML_TYPE_F16)
     FATTN_VEC_CASES_ALL_D(GGML_TYPE_Q4_0, GGML_TYPE_Q4_0)
+    FATTN_VEC_CASES_ALL_D(GGML_TYPE_Q8_0, GGML_TYPE_Q4_0)
     FATTN_VEC_CASES_ALL_D(GGML_TYPE_Q8_0, GGML_TYPE_Q8_0)
     FATTN_VEC_CASES_ALL_D(GGML_TYPE_BF16, GGML_TYPE_BF16)
+    FATTN_VEC_CASES_ALL_D(GGML_TYPE_NVFP4, GGML_TYPE_NVFP4)
 #endif // GGML_CUDA_FA_ALL_QUANTS
 
     GGML_ABORT("fatal error");
@@ -2050,6 +2052,7 @@ static bool ggml_cuda_fattn_kv_type_supported(ggml_type type) {
 #endif // GGML_CUDA_FA_ALL_QUANTS
         case GGML_TYPE_Q4_0:
         case GGML_TYPE_Q8_0:
+        case GGML_TYPE_NVFP4:
         case GGML_TYPE_BF16:
             return true;
         default:
@@ -2142,7 +2145,8 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
     }
 
 #ifndef GGML_CUDA_FA_ALL_QUANTS
-    if (K->type != V->type) {
+    // q8_0-K / q4_0-V is compiled in the default (non-ALL_QUANTS) build; see CMakeLists.txt + vec cases above.
+    if (K->type != V->type && !(K->type == GGML_TYPE_Q8_0 && V->type == GGML_TYPE_Q4_0)) {
         return BEST_FATTN_KERNEL_NONE;
     }
 #endif // GGML_CUDA_FA_ALL_QUANTS
@@ -2167,6 +2171,12 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
                     return BEST_FATTN_KERNEL_VEC;
                 }
             } else {
+                // TEMPORARY GUARD (parent T2 / T6 step 7): skip the VEC force for FP4 KV so the
+                // MMA→F16 fallback is reachable while the native NVFP4 VEC kernel is validated.
+                // Remove this block once the NVFP4 VEC instance is promoted.
+                if (K->type == GGML_TYPE_NVFP4 || V->type == GGML_TYPE_NVFP4) {
+                    return BEST_FATTN_KERNEL_MMA_F16;
+                }
                 if (cc >= GGML_CUDA_CC_ADA_LOVELACE) {
                     if (Q->ne[1] <= 2) {
                         return BEST_FATTN_KERNEL_VEC;

@@ -413,6 +413,28 @@ static void dequantize_row_nvfp4_cuda(
     const int nb = k / QK_NVFP4;
     dequantize_block_nvfp4<<<nb, 32, 0, stream>>>(vx, y, k);
 }
+
+// dequantize_kernel_t adapter for block_nvfp4. The generic dequantize_block<qk=64, qr=2> kernel
+// pairs element iqs with element iqs + qk/2 (= 32), so this returns those two decoded values.
+static __device__ __forceinline__ void dequantize_qnvfp4(const void * vx, const int64_t ib, const int iqs, float2 & v) {
+    const block_nvfp4 * x = (const block_nvfp4 *) vx;
+    const block_nvfp4 & xb = x[ib];
+
+    const int j    = iqs % QK_NVFP4_SUB;         // 0..15 (element offset within the sub-block)
+    const int byte = j % (QK_NVFP4_SUB/2);       // 0..7  (byte offset within the sub-block)
+    const int sub0 = iqs / QK_NVFP4_SUB;         // 0..1
+    const int sub1 = sub0 + 2;                   // element iqs + QK_NVFP4/2
+
+    const uint8_t q0 = xb.qs[sub0*(QK_NVFP4_SUB/2) + byte];
+    const uint8_t q1 = xb.qs[sub1*(QK_NVFP4_SUB/2) + byte];
+
+    const uint8_t n0 = (j < QK_NVFP4_SUB/2) ? (q0 & 0x0F) : (q0 >> 4);
+    const uint8_t n1 = (j < QK_NVFP4_SUB/2) ? (q1 & 0x0F) : (q1 >> 4);
+
+    v.x = ggml_cuda_ue4m3_to_fp32(xb.d[sub0]) * kvalues_mxfp4[n0];
+    v.y = ggml_cuda_ue4m3_to_fp32(xb.d[sub1]) * kvalues_mxfp4[n1];
+}
+
 template <typename src_t, typename dst_t>
 static __global__ void convert_unary(
         const void * __restrict__ vx, dst_t * __restrict__ y, const int64_t ne00, const int64_t ne01,
@@ -647,6 +669,8 @@ to_fp16_nc_cuda_t ggml_get_to_fp16_nc_cuda(ggml_type type) {
             return dequantize_block_cuda<QK5_1, QR5_1, dequantize_q5_1>;
         case GGML_TYPE_Q8_0:
             return dequantize_block_cuda<QK8_0, QR8_0, dequantize_q8_0>;
+        case GGML_TYPE_NVFP4:
+            return dequantize_block_cuda<QK_NVFP4, QR_NVFP4, dequantize_qnvfp4>;
         case GGML_TYPE_BF16:
             return convert_unary_cuda<nv_bfloat16>;
         default:
@@ -672,6 +696,8 @@ to_bf16_nc_cuda_t ggml_get_to_bf16_nc_cuda(ggml_type type) {
             return dequantize_block_cuda<QK5_1, QR5_1, dequantize_q5_1>;
         case GGML_TYPE_Q8_0:
             return dequantize_block_cuda<QK8_0, QR8_0, dequantize_q8_0>;
+        case GGML_TYPE_NVFP4:
+            return dequantize_block_cuda<QK_NVFP4, QR_NVFP4, dequantize_qnvfp4>;
         case GGML_TYPE_F16:
             return convert_unary_cuda<half, nv_bfloat16>;
         default:
