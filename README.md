@@ -63,6 +63,18 @@ Only golden-build (`build2`) numbers with recorded conditions are listed. FA-qua
 ¹⁰ KV×MoE record (`…/2026-09-24-kv-moe-interaction.md`).
 ¹¹ Headroom-guard commits `c1a0fa815` + `9cd4febbb`.
 
+Notes from building these:
+
+- **V precision vs MTP acceptance is context-state dependent, not a fixed property.** With a fixed prompt
+  and seed on a fresh short context the figure is stable (q4_0 V 0.7563 vs q8_0 V 0.7417, identical
+  across runs), but after a long-context ingest the direction flips (q8_0 V 0.819 vs q4_0 V 0.742). Pick
+  V precision per deployment by measuring; q8_0 V fits ≤64K, q4_0 V for long context.
+- **MoE + CUDA graphs is high-risk** (dynamic expert destinations break capture / replay stale pointers).
+  Capture dense-lane graphs only, if at all.
+- **Thread count does not move the MoE offload path** (114–117 t/s across `-t 4/8/16`).
+- **Each of these results was reproduced on the same card**; numbers without recorded conditions are not
+  listed.
+
 ¹ Model card (Hugging Face / ModelScope).
 ² Project perplexity log (build2 `llama-perplexity.exe`, 40×512-chunk run on the ship file).
 ³ Project A/B record: model file at run time was `…v2.0-s1-orcaim.gguf`, later consolidated into `v2.0.gguf`; short-ctx KV type was not recorded in the AB source.
