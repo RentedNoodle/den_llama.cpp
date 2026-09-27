@@ -136,6 +136,16 @@ if (LLAMA_SUBPROCESS)
     target_compile_definitions(${TARGET} PUBLIC LLAMA_SUBPROCESS)
 endif()
 
+# n-gram cache fast paths (jadidbourbaki PRs 2/5/7/10/12). Default OFF: flag-off keeps the original
+# std::unordered_map behaviour byte-for-byte so the two can be A/B'd. Acceptance-neutral by design.
+option(DEN_NGRAM_FAST "use the fast n-gram cache structures (ankerl::unordered_dense + Lemire constmap)" OFF)
+if (DEN_NGRAM_FAST)
+    target_link_libraries     (${TARGET} PUBLIC vendor::unordered_dense)
+    target_link_libraries     (${TARGET} PRIVATE vendor::constmap)
+    target_compile_definitions(${TARGET} PUBLIC DEN_NGRAM_FAST=1)
+    message(STATUS "DEN_NGRAM_FAST: ON (fast n-gram cache)")
+endif()
+
 if (BUILD_SHARED_LIBS)
     set_target_properties(${TARGET} PROPERTIES POSITION_INDEPENDENT_CODE ON)
 

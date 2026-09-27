@@ -2404,7 +2404,11 @@ struct common_speculative_impl_ngram_cache : public common_speculative_impl {
 
         common_ngram_cache ngram_cache_context;
         common_ngram_cache ngram_cache_dynamic;
+#ifdef DEN_NGRAM_FAST
+        std::shared_ptr<const common_ngram_cache_static> ngram_cache_static;
+#else
         common_ngram_cache ngram_cache_static;
+#endif
     };
 
     std::vector<seq_info> sinfos;
@@ -2433,7 +2437,11 @@ struct common_speculative_impl_ngram_cache : public common_speculative_impl {
 
         if (!path_static.empty()) {
             try {
+#ifdef DEN_NGRAM_FAST
+                auto ngram_cache_static = common_ngram_cache_static_load(path_static);
+#else
                 auto ngram_cache_static = common_ngram_cache_load(path_static);
+#endif
 
                 for (auto & sinfo : sinfos) {
                     sinfo.ngram_cache_static = ngram_cache_static;
@@ -2499,7 +2507,11 @@ struct common_speculative_impl_ngram_cache : public common_speculative_impl {
                 inp, result, n_draft, LLAMA_NGRAM_MIN, LLAMA_NGRAM_MAX,
                 sinfo.ngram_cache_context,
                 sinfo.ngram_cache_dynamic,
+#ifdef DEN_NGRAM_FAST
+                sinfo.ngram_cache_static.get());
+#else
                 sinfo.ngram_cache_static);
+#endif
 
         if (result.size() > 0) {
             // delete first token in result (which is the id_last token)
