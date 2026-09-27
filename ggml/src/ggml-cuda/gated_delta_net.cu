@@ -166,6 +166,152 @@ gated_delta_net_cuda(const float * q,
     }
 }
 
+
+// DEN_GDN_MULTICOL: process C columns per warp. Every column keeps the exact per-column arithmetic
+// order of the original kernel (same summation over i, same op order), which the MTP head is calibrated
+// against. The win is that k/q registers and the gate expf are indexed by the state ROW (shared by all
+// columns), so C columns amortise those loads/expf by C and give C independent FMA chains (ILP).
+#ifdef DEN_GDN_MULTICOL
+template <int C, int S_v, bool KDA, bool keep_rs_t>
+__global__ void __launch_bounds__((ggml_cuda_get_physical_warp_size() < S_v ? ggml_cuda_get_physical_warp_size() : S_v) * 4, 2)
+gated_delta_net_cuda_mc(const float * q, const float * k, const float * v, const float * g, const float * beta,
+                        const float * curr_state, float * dst, float * state,
+                        int64_t H, int64_t n_tokens, int64_t n_seqs,
+                        int64_t sq1, int64_t sq2, int64_t sq3,
+                        int64_t sv1, int64_t sv2, int64_t sv3,
+                        int64_t sb1, int64_t sb2, int64_t sb3,
+                        const uint3 neqk1_magic, const uint3 rq3_magic,
+                        float scale, int64_t state_slot_stride, int K) {
+    const uint32_t h_idx    = blockIdx.x;
+    const uint32_t sequence = blockIdx.y;
+    const int      lane     = threadIdx.x;
+    const int      col0     = (blockIdx.z * blockDim.y + threadIdx.y) * C;
+
+    const uint32_t iq1 = fastmodulo(h_idx, neqk1_magic);
+    const uint32_t iq3 = fastdiv(sequence, rq3_magic);
+
+    float * attn_data = dst;
+
+    const int64_t state_in_offset  = sequence * H * S_v * S_v + h_idx * S_v * S_v;
+    const int64_t state_out_offset = (sequence * H + h_idx) * S_v * S_v;
+    state += state_out_offset;
+    curr_state += state_in_offset + (int64_t) col0 * S_v;
+    attn_data += (sequence * n_tokens * H + h_idx) * S_v;
+
+    constexpr int warp_size     = ggml_cuda_get_physical_warp_size() < S_v ? ggml_cuda_get_physical_warp_size() : S_v;
+    static_assert(S_v % warp_size == 0, "S_v must be a multiple of warp_size");
+    constexpr int rows_per_lane = (S_v + warp_size - 1) / warp_size;
+
+    float s_shard[C][rows_per_lane];
+
+    ggml_cuda_pdl_sync();
+#pragma unroll
+    for (int c = 0; c < C; c++) {
+#pragma unroll
+        for (int r = 0; r < rows_per_lane; r++) {
+            const int i = r * warp_size + lane;
+            s_shard[c][r] = curr_state[c * S_v + i];
+        }
+    }
+
+    for (int t = 0; t < n_tokens; t++) {
+        const float * q_t = q + iq3 * sq3 + t * sq2 + iq1 * sq1;
+        const float * k_t = k + iq3 * sq3 + t * sq2 + iq1 * sq1;
+        const float * v_t = v + sequence * sv3 + t * sv2 + h_idx * sv1;
+
+        const int64_t gb_offset = sequence * sb3 + t * sb2 + h_idx * sb1;
+        const float * beta_t = beta + gb_offset;
+        const float * g_t    = g    + gb_offset * (KDA ? S_v : 1);
+        const float beta_val = *beta_t;
+
+        // k/q and the gate are shared by all C columns (indexed by state row i)
+        float k_reg[rows_per_lane];
+        float q_reg[rows_per_lane];
+#pragma unroll
+        for (int r = 0; r < rows_per_lane; r++) {
+            const int i = r * warp_size + lane;
+            k_reg[r] = k_t[i];
+            q_reg[r] = q_t[i];
+        }
+        const float g_val = KDA ? 0.0f : expf(*g_t);
+
+#pragma unroll
+        for (int c = 0; c < C; c++) {
+            if constexpr (!KDA) {
+                float kv_shard = 0.0f;
+#pragma unroll
+                for (int r = 0; r < rows_per_lane; r++) {
+                    kv_shard += s_shard[c][r] * k_reg[r];
+                }
+                float kv_col = warp_reduce_sum<warp_size>(kv_shard);
+
+                float delta_col = (v_t[col0 + c] - g_val * kv_col) * beta_val;
+
+                float attn_partial = 0.0f;
+#pragma unroll
+                for (int r = 0; r < rows_per_lane; r++) {
+                    s_shard[c][r] = g_val * s_shard[c][r] + k_reg[r] * delta_col;
+                    attn_partial += s_shard[c][r] * q_reg[r];
+                }
+                float attn_col = warp_reduce_sum<warp_size>(attn_partial);
+                if (lane == 0) {
+                    attn_data[col0 + c] = attn_col * scale;
+                }
+            } else {
+                float kv_shard = 0.0f;
+#pragma unroll
+                for (int r = 0; r < rows_per_lane; r++) {
+                    const int i = r * warp_size + lane;
+                    kv_shard += expf(g_t[i]) * s_shard[c][r] * k_reg[r];
+                }
+                float kv_col = warp_reduce_sum<warp_size>(kv_shard);
+                float delta_col = (v_t[col0 + c] - kv_col) * beta_val;
+
+                float attn_partial = 0.0f;
+#pragma unroll
+                for (int r = 0; r < rows_per_lane; r++) {
+                    const int i = r * warp_size + lane;
+                    s_shard[c][r] = expf(g_t[i]) * s_shard[c][r] + k_reg[r] * delta_col;
+                    attn_partial += s_shard[c][r] * q_reg[r];
+                }
+                float attn_col = warp_reduce_sum<warp_size>(attn_partial);
+                if (lane == 0) {
+                    attn_data[col0 + c] = attn_col * scale;
+                }
+            }
+        }
+
+        attn_data += S_v * H;
+
+        if constexpr (keep_rs_t) {
+            const int target_slot = (int) n_tokens - 1 - t;
+            if (target_slot >= 0 && target_slot < K) {
+                float * cs = state + target_slot * state_slot_stride;
+#pragma unroll
+                for (int c = 0; c < C; c++) {
+#pragma unroll
+                    for (int r = 0; r < rows_per_lane; r++) {
+                        const int i = r * warp_size + lane;
+                        cs[(col0 + c) * S_v + i] = s_shard[c][r];
+                    }
+                }
+            }
+        }
+    }
+
+    if constexpr (!keep_rs_t) {
+#pragma unroll
+        for (int c = 0; c < C; c++) {
+#pragma unroll
+            for (int r = 0; r < rows_per_lane; r++) {
+                const int i = r * warp_size + lane;
+                state[(col0 + c) * S_v + i] = s_shard[c][r];
+            }
+        }
+    }
+}
+#endif // DEN_GDN_MULTICOL
+
 template <bool KDA, bool keep_rs_t>
 static void launch_gated_delta_net(
         const float * q_d, const float * k_d, const float * v_d,
@@ -180,13 +326,36 @@ static void launch_gated_delta_net(
     //TODO: Add chunked kernel for even faster pre-fill
     const int warp_size = ggml_cuda_info().devices[ggml_cuda_get_device()].warp_size;
     const int num_warps = 4;
+#ifdef DEN_GDN_MULTICOL
+    constexpr int GDN_COLS = 4;
+    dim3      grid_dims(H, n_seqs, (S_v + num_warps*GDN_COLS - 1) / (num_warps*GDN_COLS));
+#else
     dim3      grid_dims(H, n_seqs, (S_v + num_warps - 1) / num_warps);
+#endif
     dim3      block_dims(warp_size <= S_v ? warp_size : S_v, num_warps, 1);
 
     const uint3 neqk1_magic = init_fastdiv_values(neqk1);
     const uint3 rq3_magic   = init_fastdiv_values(rq3);
 
     const ggml_cuda_kernel_launch_params launch_params = ggml_cuda_kernel_launch_params(grid_dims, block_dims, 0, stream);
+#ifdef DEN_GDN_MULTICOL
+    switch (S_v) {
+        case 64:
+            ggml_cuda_kernel_launch(gated_delta_net_cuda_mc<GDN_COLS, 64, KDA, keep_rs_t>, launch_params,
+                q_d, k_d, v_d, g_d, b_d, s_d, dst_d, state_d, H,
+                n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,
+                sb1, sb2, sb3, neqk1_magic, rq3_magic, scale, state_slot_stride, K);
+            return;
+        case 128:
+            ggml_cuda_kernel_launch(gated_delta_net_cuda_mc<GDN_COLS, 128, KDA, keep_rs_t>, launch_params,
+                q_d, k_d, v_d, g_d, b_d, s_d, dst_d, state_d, H,
+                n_tokens, n_seqs, sq1, sq2, sq3, sv1, sv2, sv3,
+                sb1, sb2, sb3, neqk1_magic, rq3_magic, scale, state_slot_stride, K);
+            return;
+        default:
+            break; // fall through to the single-column kernel
+    }
+#endif
     switch (S_v) {
         case 16:
             ggml_cuda_kernel_launch(gated_delta_net_cuda<16, KDA, keep_rs_t>, launch_params,
