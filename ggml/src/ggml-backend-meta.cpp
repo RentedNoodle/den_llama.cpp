@@ -158,6 +158,23 @@ static bool ggml_backend_meta_device_supports_op(ggml_backend_dev_t dev, const g
         [op](ggml_backend_dev_t simple_dev) { return ggml_backend_dev_supports_op(simple_dev, op); });
 }
 
+// Op offload (host-resident weights executed on the device) for the tensor split.  The meta backend
+// is a first-class host of such ops: it runs the op on every device, and each device uploads its own
+// share of the weights.  Every device has to accept the op on its own, since the meta backend cannot
+// run a node that only some of its devices can.  Without this hook `ggml_backend_dev_offload_op()` is
+// false here (the device interface defaults to no offload), so
+// `ggml_backend_sched_backend_id_from_cur()` never places an offloaded node on this backend and the
+// weights are executed on the CPU instead of being offloaded to the devices.
+static bool ggml_backend_meta_device_offload_op(ggml_backend_dev_t dev, const ggml_tensor * op) {
+    GGML_ASSERT(ggml_backend_dev_is_meta(dev));
+    const ggml_backend_meta_device_context * meta_dev_ctx = (const ggml_backend_meta_device_context *) dev->context;
+    if (meta_dev_ctx->simple_devs.empty()) {
+        return false;
+    }
+    return std::all_of(meta_dev_ctx->simple_devs.begin(), meta_dev_ctx->simple_devs.end(),
+        [op](ggml_backend_dev_t simple_dev) { return ggml_backend_dev_offload_op(simple_dev, op); });
+}
+
 static bool ggml_backend_meta_device_supports_buft(ggml_backend_dev_t dev, ggml_backend_buffer_type_t buft) {
     GGML_ASSERT(ggml_backend_dev_is_meta(dev));
     ggml_backend_dev_t dev_buft = ggml_backend_buft_get_device(buft);
@@ -189,7 +206,7 @@ static const ggml_backend_device_i ggml_backend_meta_device_iface = {
     /* .buffer_from_host_ptr = */ nullptr,
     /* .supports_op          = */ ggml_backend_meta_device_supports_op,
     /* .supports_buft        = */ ggml_backend_meta_device_supports_buft,
-    /* .offload_op           = */ nullptr,
+    /* .offload_op           = */ ggml_backend_meta_device_offload_op,
     /* .event_new            = */ nullptr,
     /* .event_free           = */ nullptr,
     /* .event_synchronize    = */ nullptr,
@@ -1866,12 +1883,26 @@ static void ggml_backend_meta_free(ggml_backend_t backend) {
 
 static void ggml_backend_meta_set_tensor_async(ggml_backend_t backend, ggml_tensor * tensor, const void * data, size_t offset, size_t size) {
     const size_t n_backends = ggml_backend_meta_n_backends(backend);
-    GGML_ASSERT(offset == 0);
-    GGML_ASSERT(ggml_is_contiguous(tensor));
 
     const ggml_backend_meta_split_state split_state = ggml_backend_meta_get_split_state(tensor, /*assume_sync =*/ false);
     GGML_ASSERT(split_state.n_segments == 1);
     GGML_ASSERT(split_state.nr[0]      == 1);
+
+    if (split_state.axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED) {
+        // A mirrored tensor holds the same bytes on every device, so no chunk arithmetic is needed and
+        // an arbitrary byte range can be forwarded as-is.  The scheduler's used-expert pruning uploads
+        // just the experts a ubatch uses -- a range at a non-zero offset that need not be a whole-chunk
+        // multiple -- which is what makes op-offload under -sm tensor reachable at all.
+        for (size_t j = 0; j < n_backends; j++) {
+            ggml_backend_tensor_set_async(
+                ggml_backend_meta_simple_backend(backend, j), ggml_backend_meta_buffer_simple_tensor(tensor, j), data, offset, size);
+        }
+        return;
+    }
+
+    // The partial split exploits contiguity to splice the tensor across the devices as whole chunks.
+    GGML_ASSERT(offset == 0);
+    GGML_ASSERT(ggml_is_contiguous(tensor));
 
     switch (split_state.axis) {
         case GGML_BACKEND_SPLIT_AXIS_0:
@@ -1897,12 +1928,6 @@ static void ggml_backend_meta_set_tensor_async(ggml_backend_t backend, ggml_tens
             }
             GGML_ASSERT(offset_j == chunk_size_full);
         } break;
-        case GGML_BACKEND_SPLIT_AXIS_MIRRORED: {
-            for (size_t j = 0; j < n_backends; j++) {
-                ggml_backend_tensor_set_async(
-                    ggml_backend_meta_simple_backend(backend, j), ggml_backend_meta_buffer_simple_tensor(tensor, j), data, offset, size);
-            }
-        } break;
         default: {
             GGML_ABORT("fatal error");
         }
@@ -1911,12 +1936,24 @@ static void ggml_backend_meta_set_tensor_async(ggml_backend_t backend, ggml_tens
 
 static void ggml_backend_meta_get_tensor_async(ggml_backend_t backend, const ggml_tensor * tensor, void * data, size_t offset, size_t size) {
     const size_t n_backends = ggml_backend_meta_n_backends(backend);
-    GGML_ASSERT(offset == 0);
-    GGML_ASSERT(ggml_is_contiguous(tensor));
 
     const ggml_backend_meta_split_state split_state = ggml_backend_meta_get_split_state(tensor, /*assume_sync =*/ false);
     GGML_ASSERT(split_state.n_segments == 1);
     GGML_ASSERT(split_state.nr[0]      == 1);
+
+    if (split_state.axis == GGML_BACKEND_SPLIT_AXIS_MIRRORED) {
+        // A mirrored tensor is the same on every device; any device can serve an arbitrary byte range,
+        // including a strided view's raw span (the scheduler's used-expert pruning reads the router's
+        // ids that way, and their layout is indexed with the view's own strides).
+        // TODO other simple backend may be better
+        ggml_backend_t simple_backend = ggml_backend_meta_simple_backend(backend, 0);
+        const ggml_tensor * simple_tensor = ggml_backend_meta_buffer_simple_tensor(tensor, 0);
+        ggml_backend_tensor_get_async(simple_backend, simple_tensor, data, offset, size);
+        return;
+    }
+
+    GGML_ASSERT(offset == 0);
+    GGML_ASSERT(ggml_is_contiguous(tensor));
 
     switch (split_state.axis) {
         case GGML_BACKEND_SPLIT_AXIS_0:
@@ -1941,12 +1978,6 @@ static void ggml_backend_meta_get_tensor_async(ggml_backend_t backend, const ggm
                 offset_j += chunk_size_j;
             }
             GGML_ASSERT(offset_j == chunk_size_full);
-        } break;
-        case GGML_BACKEND_SPLIT_AXIS_MIRRORED: {
-            // TODO other simple backend may be better
-            ggml_backend_t simple_backend = ggml_backend_meta_simple_backend(backend, 0);
-            const ggml_tensor * simple_tensor = ggml_backend_meta_buffer_simple_tensor(tensor, 0);
-            ggml_backend_tensor_get_async(simple_backend, simple_tensor, data, offset, size);
         } break;
         default: {
             GGML_ABORT("fatal error");
