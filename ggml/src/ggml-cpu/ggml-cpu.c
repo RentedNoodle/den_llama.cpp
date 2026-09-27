@@ -14,6 +14,7 @@
 #include "ops.h"
 #include "ggml.h"
 #include "common.h"
+#include "tiled/tiled.h"
 
 #if defined(_MSC_VER) || defined(__MINGW32__)
 #include <malloc.h> // using malloc.h with MSC/MINGW
@@ -1270,6 +1271,10 @@ void ggml_compute_forward_mul_mat(
         return;
     }
 
+    if (ggml_compute_forward_mul_mat_tiled(params, dst)) {
+        return;
+    }
+
     GGML_TENSOR_BINARY_OP_LOCALS
 
     const int ith = params->ith;
@@ -1586,6 +1591,10 @@ static void ggml_compute_forward_mul_mat_id(
     char (*atomic_current_chunk)[CACHE_LINE_SIZE] = // [n_as]
         incr_ptr_aligned(&wdata_cur, CACHE_LINE_SIZE * n_as, CACHE_LINE_SIZE);
 
+    // Tiled matmul (see tiled.h); per-thread work buffers, 0 bytes when disabled. The
+    // reservation is unconditional, the per expert eligibility is decided at dispatch time
+    char * tiled_scratch = incr_ptr_aligned(&wdata_cur, ggml_tiled_wdata_size(nth, dst), 64);
+
     GGML_ASSERT(params->wsize >= (size_t)((char *) wdata_cur - (char *) params->wdata));
 
     if (src1->type != vec_dot_type) {
@@ -1655,6 +1664,12 @@ static void ggml_compute_forward_mul_mat_id(
         const int64_t cne1 = matrix_row_counts[cur_a];
 
         if (cne1 == 0) {
+            continue;
+        }
+
+        // tiled takes over if profitable for this expert (see tiled.h)
+        if (ggml_compute_forward_mul_mat_id_tiled(params, dst, cur_a, cne1,
+                                                  (const int32_t *) &MMID_MATRIX_ROW(cur_a, 0), tiled_scratch)) {
             continue;
         }
 
@@ -2869,6 +2884,9 @@ struct ggml_cplan ggml_graph_plan(
                         if (node->src[1]->type != vec_dot_type) {
                             cur = ggml_row_size(vec_dot_type, ggml_nelements(node->src[1]));
                         }
+                        // Workspace for tiled (see tiled.h)
+                        cur = GGML_PAD(cur, 64);
+                        cur += ggml_tiled_wdata_size(n_tasks, node);
                     } break;
                 case GGML_OP_MUL_MAT_ID:
                     {
@@ -2888,6 +2906,9 @@ struct ggml_cplan ggml_graph_plan(
                         cur += n_as*ids->ne[0]*ids->ne[1]*sizeof(struct mmid_row_mapping) + sizeof(int64_t);
                         // atomic_current_chunk
                         cur += CACHE_LINE_SIZE*n_as + CACHE_LINE_SIZE;
+                        // Workspace for tiled (see tiled.h)
+                        cur = GGML_PAD(cur, 64);
+                        cur += ggml_tiled_wdata_size(n_tasks, node);
                     } break;
                 case GGML_OP_OUT_PROD:
                     {
