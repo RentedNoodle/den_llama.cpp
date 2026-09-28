@@ -147,12 +147,13 @@ if (CUDAToolkit_FOUND)
         add_compile_definitions(GGML_CUDA_FORCE_MMQ)
     endif()
 
-    # DEN_GDN_MULTICOL: process 4 columns per warp in the gated-delta-net kernel (ILP, order-preserving).
+    # DEN_GDN_MULTICOL: process N columns per warp in the gated-delta-net kernel (ILP, order-preserving).
     # Default OFF; the single-column kernel is untouched when off.
-    option(DEN_GDN_MULTICOL "enable 4-columns-per-warp GDN kernel" OFF)
+    set(DEN_GDN_COLS "4" CACHE STRING "columns per warp for the multi-column GDN kernel")
+    option(DEN_GDN_MULTICOL "enable multi-columns-per-warp GDN kernel" OFF)
     if (DEN_GDN_MULTICOL)
-        add_compile_definitions(DEN_GDN_MULTICOL)
-        message(STATUS "DEN_GDN_MULTICOL: ON")
+        add_compile_definitions(DEN_GDN_MULTICOL DEN_GDN_COLS=${DEN_GDN_COLS})
+        message(STATUS "DEN_GDN_MULTICOL: ON (cols=${DEN_GDN_COLS})")
     endif()
 
     if (GGML_CUDA_FORCE_CUBLAS)

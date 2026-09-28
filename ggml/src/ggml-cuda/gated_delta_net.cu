@@ -327,7 +327,10 @@ static void launch_gated_delta_net(
     const int warp_size = ggml_cuda_info().devices[ggml_cuda_get_device()].warp_size;
     const int num_warps = 4;
 #ifdef DEN_GDN_MULTICOL
-    constexpr int GDN_COLS = 4;
+#ifndef DEN_GDN_COLS
+#define DEN_GDN_COLS 4
+#endif
+    constexpr int GDN_COLS = DEN_GDN_COLS;
     dim3      grid_dims(H, n_seqs, (S_v + num_warps*GDN_COLS - 1) / (num_warps*GDN_COLS));
 #else
     dim3      grid_dims(H, n_seqs, (S_v + num_warps - 1) / num_warps);
