@@ -6073,7 +6073,22 @@ static int64_t get_op_batch_size(const ggml_tensor * op) {
 static bool ggml_backend_cuda_device_offload_op(ggml_backend_dev_t dev, const ggml_tensor * op) {
     ggml_backend_cuda_device_context * dev_ctx = (ggml_backend_cuda_device_context *) dev->context;
 
-    return get_op_batch_size(op) >= dev_ctx->op_offload_min_batch_size;
+    int64_t min_batch = dev_ctx->op_offload_min_batch_size;
+
+    // MoE expert fan-out scaling (ik_llama.cpp PR 520). For a MoE matmul the same expert weights are
+    // reused across the batch, so a small batch does not amortise the RAM->VRAM copy: the break-even
+    // batch scales with N_tot / N_A (total experts / experts used). Without this, a batch that is fine
+    // for a dense matmul is offloaded for MoE and thrashes.
+    // Gated by GGML_MOE_OFFLOAD_SCALE (default off) so it can be A/B'd live without a rebuild.
+    if (op->op == GGML_OP_MUL_MAT_ID && getenv("GGML_MOE_OFFLOAD_SCALE") != nullptr) {
+        const int64_t n_experts = op->src[0] ? op->src[0]->ne[2] : 0; // total experts
+        const int64_t n_active  = op->ne[1];                          // experts used per token
+        if (n_experts > 0 && n_active > 0 && n_experts > n_active) {
+            min_batch = min_batch * n_experts / n_active;
+        }
+    }
+
+    return get_op_batch_size(op) >= min_batch;
 }
 
 static ggml_backend_event_t ggml_backend_cuda_device_event_new(ggml_backend_dev_t dev) {
