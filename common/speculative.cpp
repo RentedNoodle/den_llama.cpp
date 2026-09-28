@@ -2152,7 +2152,7 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         }
 
         const int depth_before = adaptive_ctrl[seq_id].n_cur;
-        adaptive_ctrl[seq_id].update(n_last[seq_id], n_accepted, params.n_max, params.n_min_adaptive);
+        adaptive_ctrl[seq_id].update(n_accepted, params.n_max, params.n_min_adaptive);
         if (adaptive_ctrl[seq_id].n_cur != depth_before) {
             SPC_DBG("adaptive draft depth seq %d: %d -> %d (n_draft=%d, n_accepted=%d)\n",
                     (int) seq_id, depth_before, adaptive_ctrl[seq_id].n_cur, n_last[seq_id], n_accepted);
