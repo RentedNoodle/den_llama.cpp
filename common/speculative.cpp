@@ -179,6 +179,11 @@ struct common_speculative_impl {
 
     virtual void accept(llama_seq_id seq_id, uint16_t n_accepted, bool is_other) = 0;
 
+    // optional: report a partial acceptance that the context could not apply (checkpoint-restore path);
+    // accept() will not be called for that round, so implementations with cross-round state (the adaptive
+    // MTP depth controller) get the feedback here instead.
+    virtual void accept_partial(llama_seq_id /*seq_id*/, uint16_t /*n_accepted*/) {}
+
     // (optional) serialize/restore per-seq internal state (e.g. eagle3's deferred boundary).
     virtual bool get_state(llama_seq_id /*seq_id*/, std::vector<uint8_t> & /*data*/) const { return false; }
     virtual void set_state(llama_seq_id /*seq_id*/, const std::vector<uint8_t> & /*data*/) {}
@@ -2161,6 +2166,17 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         n_last[seq_id] = 0;
     }
 
+    // partial acceptance on a context that cannot roll back: the rejected draft suffix is
+    // checkpoint-restored and replayed next round, so the acceptance feedback is delivered here
+    // instead of in accept()
+    void accept_partial(llama_seq_id seq_id, uint16_t n_accepted) override {
+        if (seq_id < 0 || seq_id >= (llama_seq_id) n_seq) {
+            return;
+        }
+
+        adaptive_feedback(seq_id, n_accepted);
+    }
+
     void accept(llama_seq_id seq_id, uint16_t n_accepted, bool is_other) override {
         if (seq_id < 0 || seq_id >= (llama_seq_id) n_seq) {
             return;
@@ -3360,6 +3376,22 @@ void common_speculative_accept(common_speculative * spec, llama_seq_id seq_id, u
             impl_other->accept(seq_id, n_accepted, true);
         }
     }
+}
+
+// report a partial acceptance that the context could not apply (checkpoint-restore path); the full
+// accept() will not be called for this round, so implementations with cross-round state (the adaptive
+// MTP depth controller) get the feedback here instead.
+void common_speculative_accept_partial(common_speculative * spec, llama_seq_id seq_id, uint16_t n_accepted) {
+    if (spec == nullptr) {
+        return;
+    }
+
+    common_speculative_impl * impl = spec->impl_last[seq_id];
+    if (impl == nullptr) {
+        return;
+    }
+
+    impl->accept_partial(seq_id, n_accepted);
 }
 
 // TODO: support the case of more than one speculative implementations having a state
