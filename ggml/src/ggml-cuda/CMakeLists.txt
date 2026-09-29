@@ -148,9 +148,10 @@ if (CUDAToolkit_FOUND)
     endif()
 
     # DEN_GDN_MULTICOL: process N columns per warp in the gated-delta-net kernel (ILP, order-preserving).
-    # Default OFF; the single-column kernel is untouched when off.
+    # PROMOTED to default ON 2026-09-28: verified BIT-EXACT (llama-perplexity PPL 1.0036 both ways;
+    # mtp_accept unchanged at 0.897) and gate PASS (+2.4% prefill at 32K, up to +4.3% raw). Set OFF to revert.
     set(DEN_GDN_COLS "4" CACHE STRING "columns per warp for the multi-column GDN kernel")
-    option(DEN_GDN_MULTICOL "enable multi-columns-per-warp GDN kernel" OFF)
+    option(DEN_GDN_MULTICOL "enable multi-columns-per-warp GDN kernel" ON)
     if (DEN_GDN_MULTICOL)
         add_compile_definitions(DEN_GDN_MULTICOL DEN_GDN_COLS=${DEN_GDN_COLS})
         message(STATUS "DEN_GDN_MULTICOL: ON (cols=${DEN_GDN_COLS})")
