@@ -284,6 +284,10 @@ llama_context::llama_context(
 
     cparams.ctx_other = nullptr;
 
+    if (params.ctx_type == LLAMA_CONTEXT_TYPE_MTP) {
+        cparams.ctx_other = params.ctx_other;
+    }
+
     // TODO: more generic
     if (model.arch == LLM_ARCH_GEMMA4_ASSISTANT) {
         if (params.ctx_other == nullptr) {

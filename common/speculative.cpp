@@ -1488,7 +1488,10 @@ struct common_speculative_impl_draft_mtp : public common_speculative_impl {
         llama_set_embeddings_nextn(ctx_tgt, true, /*masked*/ false);
         llama_set_embeddings_nextn(ctx_dft, true, /*masked*/ true);
 
-        is_mem_shared = llama_get_ctx_other(ctx_dft) == ctx_tgt;
+        // ctx_other is also set for Qwen MTP so the KVMem factory can follow
+        // the target slot-pool. Shared-KV (Gemma4) is the same memory object.
+        is_mem_shared = llama_get_ctx_other(ctx_dft) == ctx_tgt
+                && llama_get_memory(ctx_dft) == llama_get_memory(ctx_tgt);
         chain_heads   = n_mtp_layers > 1 && !is_mem_shared;
 
         // experimental: draft all n_max tokens with one chained decode (in-graph argmax
