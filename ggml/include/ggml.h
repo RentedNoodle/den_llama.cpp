@@ -577,6 +577,13 @@ extern "C" {
         GGML_OP_DSV4_HC_PRE,
         GGML_OP_DSV4_HC_POST,
 
+        // KVarN record-oriented KV-cache operators.  They are not GGUF
+        // tensor types and are never serialized in model weights.
+        GGML_OP_KVARN_WHT,
+        GGML_OP_KVARN_STORE,
+        GGML_OP_KVARN_VIEW,
+        GGML_OP_KVARN_MATERIALIZE,
+
         GGML_OP_UNARY,
 
         GGML_OP_MAP_CUSTOM1,
@@ -2620,6 +2627,52 @@ extern "C" {
             struct ggml_tensor  * beta,
             struct ggml_tensor  * state,
             int64_t               K);
+
+    // KVarN normalized Sylvester Walsh-Hadamard transform for 128/256/512
+    // head widths.  The transform is self-inverse.
+    GGML_API struct ggml_tensor * ggml_kvarn_wht(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * a,
+            int                   head_width);
+
+    // KVarN structured KV-cache operations.  Records span full 128-token
+    // tiles, so this deliberately remains separate from ggml_type.
+    GGML_API struct ggml_tensor * ggml_kvarn_store(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * current,
+            struct ggml_tensor  * indices,
+            struct ggml_tensor  * stage,
+            struct ggml_tensor  * records,
+            int                   bits,
+            int                   sinkhorn_iters,
+            bool                  value,
+            int                   stage_groups);
+
+    GGML_API struct ggml_tensor * ggml_kvarn_view(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * records,
+            struct ggml_tensor  * stage_after_store,
+            struct ggml_tensor  * indices,
+            int                   n_kv,
+            int                   stream_start,
+            int                   n_stream,
+            int                   bits,
+            bool                  value,
+            int                   stage_groups);
+
+    // Reconstructs a standard F16 tensor from KVarN records and staging. The
+    // result can be consumed by any ordinary attention implementation.
+    GGML_API struct ggml_tensor * ggml_kvarn_materialize(
+            struct ggml_context * ctx,
+            struct ggml_tensor  * records,
+            struct ggml_tensor  * stage_after_store,
+            struct ggml_tensor  * indices,
+            int                   n_kv,
+            int                   stream_start,
+            int                   n_stream,
+            int                   bits,
+            bool                  value,
+            int                   stage_groups);
 
     // DSA lightning indexer
     //
