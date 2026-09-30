@@ -6,6 +6,30 @@
 #define GGML_CUDA_FATTN_KVARN_OPERATION_POLICY 1
 
 constexpr int GGML_CUDA_FATTN_KVARN_SPECIALIZED_DECODE_MAX_Q = 16;
+
+// Верхняя граница n_q, при которой split-декод всё ещё выбирается. Само ядро
+// параметризовано по n_q во всех измерениях (индекс запроса, грид, partial,
+// комбинирующий проход), так что это чисто политический порог, а не предел
+// реализации. Значение задаётся вызывающей стороной через поле split_max_q;
+// ноль означает историческое поведение "только n_q == 1".
+// Значение подобрано замером под спекулятивное декодирование. MTP с
+// --spec-draft-n-max 2 даёт n_q = 3 на слот, и порог 2 отсекал быстрый
+// split-декод ровно там, где спекуляция и должна была окупаться.
+// Развёртка на 3090, Qwen3.8-27B kvarn5 + хвост 1024, глубина 126976,
+// один слот, MTP включён:
+//
+//   порог  2: 28.03 tok/s   sha 26387d987662
+//   порог  3: 31.28 tok/s   sha ff76d117e7a1
+//   порог  4: 31.27 tok/s   sha ff76d117e7a1
+//   порог  8: 31.29 tok/s   sha ff76d117e7a1
+//   порог 16: 31.18 tok/s   sha ff76d117e7a1
+//
+// Плато начинается с трёх и суммы совпадают побитово — значит всё решает
+// единственный переход с 2 на 3, а n_q при одном слоте ровно 3. Восемь
+// берётся с запасом на два слота (n_q до 6); на двух слотах с MTP без
+// объединённого кэша это даёт 69.25 против 66.19 tok/s.
+//
+// Без MTP значение безразлично: там n_q не превышает 2 и маршрут тот же.
 constexpr int GGML_CUDA_FATTN_KVARN_SPLIT_DEFAULT_MAX_Q = 8;
 constexpr int GGML_CUDA_FATTN_KVARN_PORTABLE_THREADS = 128;
 constexpr uint32_t GGML_CUDA_FATTN_KVARN_PORTABLE_MAX_Q =
@@ -229,6 +253,17 @@ inline ggml_cuda_fattn_kvarn_route ggml_cuda_fattn_kvarn_select_route(
     if (input.vector_eligible) {
         return GGML_CUDA_FATTN_KVARN_ROUTE_DECODE_VECTOR;
     }
+    // Split decode parallelizes one query over the KV sequence. Reusing it for
+    // speculative verification repeats K/V decoding for every query and grows
+    // its partial output with n_q * n_splits. The native MMA path instead tiles
+    // the short query batch and reuses each decoded K/V tile across those rows.
+    //
+    // Это верно как описание работы, но не как вывод. При n_q > 1 generic-mma
+    // теряет сам split по KV, а KVarN на нём распаковывает записи в горячем
+    // цикле при nstages == 0 и 64 нитях на блок. Замеры на 3090 (два слота,
+    // n_kv 65000): split-декод при n_q == 1 даёт 24.0 tok/s, generic-mma при
+    // n_q == 2 — 2.8 на воркера. Дублирование деквантизации обходится дешевле
+    // потери параллелизма, поэтому порог вынесен в split_max_q.
     const int split_max_q = input.split_max_q > 0 ? input.split_max_q : 1;
     if (input.n_q <= split_max_q && input.split_eligible) {
         return GGML_CUDA_FATTN_KVARN_ROUTE_DECODE_SPLIT;

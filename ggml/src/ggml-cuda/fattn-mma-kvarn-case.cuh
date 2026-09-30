@@ -12,9 +12,9 @@ using ggml_cuda_fattn_kernel_attr_ptr_t = const void *;
 using ggml_cuda_fattn_kernel_attr_ptr_t = fattn_kernel_t;
 #endif
 
-// Keep prefill single-window through 64K to avoid an additional floating-point
-// partial merge. Lower values remain available through GGML_KVARN_WINDOW_CHUNK
-// when concurrent long prompts require less transient K/V scratch.
+// STOPGAP: keep windowed prefill single-chunk by default until the chunked
+// merge path emits reference-faithful partials. Smaller chunks remain useful
+// for profiling via GGML_KVARN_WINDOW_CHUNK.
 static constexpr int GGML_CUDA_FATTN_KVARN_WINDOW_CHUNK = 65536;
 
 static inline bool ggml_cuda_fattn_kvarn_window_enabled() {
@@ -40,17 +40,86 @@ static inline fattn_kernel_t ggml_cuda_flash_attn_ext_mma_kvarn_select_kernel(
 
     if (k_original_domain) {
         GGML_ASSERT(v_original_domain);
-        return flash_attn_ext_f16<DKQ, DV, ncols1, ncols2, use_logit_softcap, V_is_K_view, false,
+        return flash_attn_ext_f16<DKQ, DV, ncols1, ncols2, use_logit_softcap, V_is_K_view,
             GGML_CUDA_FATTN_KVARN_ORIGINAL_TYPE, GGML_CUDA_FATTN_KVARN_ORIGINAL_TYPE>;
     }
 
     if (v_original_domain) {
-        return flash_attn_ext_f16<DKQ, DV, ncols1, ncols2, use_logit_softcap, V_is_K_view, false,
+        return flash_attn_ext_f16<DKQ, DV, ncols1, ncols2, use_logit_softcap, V_is_K_view,
             GGML_CUDA_FATTN_KVARN_TYPE, GGML_CUDA_FATTN_KVARN_ORIGINAL_TYPE>;
     }
 
-    return flash_attn_ext_f16<DKQ, DV, ncols1, ncols2, use_logit_softcap, V_is_K_view, false,
+    return flash_attn_ext_f16<DKQ, DV, ncols1, ncols2, use_logit_softcap, V_is_K_view,
         GGML_CUDA_FATTN_KVARN_TYPE, GGML_CUDA_FATTN_KVARN_TYPE>;
+}
+
+template <int D>
+static __global__ void ggml_cuda_fattn_kvarn_window_dequant_kernel(
+        const ggml_cuda_fattn_kvarn_desc * k_descs,
+        const ggml_cuda_fattn_kvarn_desc * v_descs,
+        half * k_f16,
+        half * v_f16,
+        int chunk_begin,
+        int chunk_len,
+        int n_kv_heads) {
+    static_assert(D == 128 || D == 256 || D == 512, "windowed KVarN prefill supports 128-wide slices through D512");
+    constexpr int slices = D / GGML_CUDA_FATTN_KVARN_DIM;
+    constexpr int warp_size = ggml_cuda_get_physical_warp_size();
+
+    const int token = blockIdx.x;
+    const int head  = blockIdx.y;
+    const int seq   = blockIdx.z;
+    const int warp  = threadIdx.x / warp_size;
+    const int side  = warp / slices;
+    const int slice = warp - side * slices;
+    const int lane  = threadIdx.x - warp * warp_size;
+
+    if (side >= 2 || token >= chunk_len) {
+        return;
+    }
+
+    const ggml_cuda_fattn_kvarn_desc & desc = side == 0 ?
+        k_descs[(size_t) seq * n_kv_heads + head] :
+        v_descs[(size_t) seq * n_kv_heads + head];
+
+    __shared__ float row_scratch[2][slices][2][GGML_CUDA_FATTN_KVARN_DIM];
+    float * row0 = row_scratch[side][slice][0];
+    float * row1 = row_scratch[side][slice][1];
+
+    ggml_cuda_fattn_kvarn_load_rotated_slice_warp(
+            desc, chunk_begin + token, slice, true, row0, lane);
+    const bool needs_original = desc.original_domain != 0;
+    __syncthreads();
+    float * out = row0;
+    const bool combine_slices = needs_original && desc.head_slices > 1;
+    if (combine_slices) {
+        constexpr float inv_sqrt_slices = slices == 1 ? 1.0f : (slices == 2 ? 0.7071067811865475f : 0.5f);
+        for (int d = lane; d < GGML_CUDA_FATTN_KVARN_DIM; d += warp_size) {
+            float x = 0.0f;
+#pragma unroll
+            for (int src_slice = 0; src_slice < slices; ++src_slice) {
+                x += ggml_cuda_fattn_kvarn_hslice_sign(slice, src_slice) *
+                    row_scratch[side][src_slice][0][d];
+            }
+            row1[d] = x * inv_sqrt_slices;
+        }
+    }
+    // Every combining warp reads row0 from every peer slice above. Keep this
+    // barrier unconditional because K and V may use different domains.
+    __syncthreads();
+    if (needs_original) {
+        if (combine_slices) {
+            out = ggml_cuda_fattn_kvarn_inverse_wht_128_warp(row1, row0, lane);
+        } else {
+            out = ggml_cuda_fattn_kvarn_inverse_wht_128_warp(row0, row1, lane);
+        }
+    }
+
+    half * dst = (side == 0 ? k_f16 : v_f16) +
+        (((size_t) seq * n_kv_heads + head) * chunk_len + token) * D;
+    for (int d = lane; d < GGML_CUDA_FATTN_KVARN_DIM; d += warp_size) {
+        dst[slice * GGML_CUDA_FATTN_KVARN_DIM + d] = __float2half(out[d]);
+    }
 }
 
 template<int DKQ, int DV, int ncols1, int ncols2, bool use_logit_softcap>
@@ -106,8 +175,8 @@ static __global__ void ggml_cuda_fattn_kvarn_window_f16_partial_kernel(
     constexpr bool V_is_K_view = false;
     constexpr bool needs_fixup = false;
     constexpr bool is_fixup = true;
-    flash_attn_ext_f16_process_tile<DKQ, DV, ncols1, ncols2, nwarps, use_logit_softcap, V_is_K_view, false, needs_fixup, is_fixup>
-        (Q_f2, K_h2, V_h2, mask_h, nullptr, sinks_f, dstk, partial_ptr, nullptr, scale, slope, logit_softcap,
+    flash_attn_ext_f16_process_tile<DKQ, DV, ncols1, ncols2, nwarps, use_logit_softcap, V_is_K_view, needs_fixup, is_fixup>
+        (Q_f2, K_h2, V_h2, mask_h, sinks_f, dstk, partial_ptr, nullptr, scale, slope, logit_softcap,
          ne01, ne02, gqa_ratio, ne11, nb01 / (int32_t) sizeof(float2), nb02 / (int32_t) sizeof(float2),
          nb11 / (int32_t) sizeof(half2), nb21 / (int32_t) sizeof(half2), nb31 / (int32_t) sizeof(half),
          jt, zt_gqa, 0, iter_k);
@@ -173,8 +242,8 @@ static __global__ void ggml_cuda_fattn_kvarn_window_f16_direct_kernel(
     constexpr bool V_is_K_view = false;
     constexpr bool needs_fixup = false;
     constexpr bool is_fixup = false;
-    flash_attn_ext_f16_process_tile<DKQ, DV, ncols1, ncols2, nwarps, use_logit_softcap, V_is_K_view, false, needs_fixup, is_fixup>
-        (Q_f2, K_h2, V_h2, mask_h, nullptr, sinks_f, dstk, nullptr, nullptr, scale, slope, logit_softcap,
+    flash_attn_ext_f16_process_tile<DKQ, DV, ncols1, ncols2, nwarps, use_logit_softcap, V_is_K_view, needs_fixup, is_fixup>
+        (Q_f2, K_h2, V_h2, mask_h, sinks_f, dstk, nullptr, nullptr, scale, slope, logit_softcap,
          ne01, ne02, gqa_ratio, ne11, nb01 / (int32_t) sizeof(float2), nb02 / (int32_t) sizeof(float2),
          nb11 / (int32_t) sizeof(half2), nb21 / (int32_t) sizeof(half2), nb31 / (int32_t) sizeof(half),
          jt, zt_gqa, 0, iter_k);
@@ -259,6 +328,27 @@ static __global__ void ggml_cuda_fattn_kvarn_window_merge_kernel(
     acc_ptr[out_off] = acc_scale * acc_ptr[out_off] + part_scale * part;
     if (d == 0) {
         acc_meta_ptr[row_off] = make_float2(max_new, acc_scale * acc_meta.y + part_scale * part_meta.y);
+    }
+}
+
+template<int D>
+__launch_bounds__(D, 1)
+static __global__ void ggml_cuda_fattn_kvarn_window_finalize_kernel(
+        float * acc_ptr,
+        const float2 * acc_meta_ptr,
+        float2 * dst_meta_ptr,
+        const int n_rows) {
+    const int row = blockIdx.x;
+    const int d = threadIdx.x;
+    if (row >= n_rows) {
+        return;
+    }
+
+    const float rowsum = acc_meta_ptr[row].y;
+    float & v = acc_ptr[(size_t) row * D + d];
+    v = rowsum > 0.0f ? v / rowsum : 0.0f;
+    if (d == 0 && dst_meta_ptr != nullptr) {
+        dst_meta_ptr[row] = acc_meta_ptr[row];
     }
 }
 
@@ -396,16 +486,13 @@ static bool ggml_cuda_flash_attn_ext_mma_kvarn_windowed_case_impl(
     const float m1 = powf(2.0f, -(max_bias / 2.0f) / n_head_log2);
     const uint3 ne01 = init_fastdiv_values(Q->ne[1]);
 
-    static const ggml_cuda_fattn_kvarn_window_dequant_kernel_t dequant_kernel =
-        ggml_cuda_fattn_kvarn_window_dequant_get_kernel<DKQ>();
-    static const ggml_cuda_fattn_kvarn_window_finalize_kernel_t finalize_kernel =
-        ggml_cuda_fattn_kvarn_window_finalize_get_kernel<DV>();
     const dim3 dequant_block((uint32_t) (2 * plan.slices * warp_size_host), 1, 1);
     const dim3 partial_block((uint32_t) warp_size_host,
             (uint32_t) nwarps, 1);
     const dim3 partial_grid((uint32_t) ntiles_dst, 1, 1);
     const dim3 merge_block(DV, 1, 1);
     const dim3 merge_grid((uint32_t) ntiles_dst, ncols, 1);
+    const dim3 finalize_grid((uint32_t) n_rows, 1, 1);
 
     // The single-window path below may dequantize the full active window, but it
     // is bounded by window_chunk and kept as a transient scratch allocation.
@@ -414,7 +501,7 @@ static bool ggml_cuda_flash_attn_ext_mma_kvarn_windowed_case_impl(
         const int chunk_len = plan.n_kv;
         const dim3 dequant_grid((uint32_t) chunk_len, (uint32_t) plan.n_kv_heads, (uint32_t) plan.n_stream);
         ggml_cuda_kernel_launch_params dequant_params(dequant_grid, dequant_block, 0, stream);
-        ggml_cuda_kernel_launch(dequant_kernel, dequant_params,
+        ggml_cuda_kernel_launch(ggml_cuda_fattn_kvarn_window_dequant_kernel<DKQ>, dequant_params,
             k_desc.get(), v_desc.get(), k_f16.get(), v_f16.get(), 0, chunk_len, plan.n_kv_heads);
 
         const char * mask_data = mask ? (const char *) mask->data : nullptr;
@@ -460,7 +547,7 @@ static bool ggml_cuda_flash_attn_ext_mma_kvarn_windowed_case_impl(
             dst->src[1] = &k_win;
             dst->src[2] = &v_win;
             launch_fattn<DV, ncols1, ncols2>(
-                ctx, dst, f16_kernel, nwarps, nbytes_shared_total, nbatch_fa, false, false, true, false, warp_size_host);
+                ctx, dst, f16_kernel, nwarps, nbytes_shared_total, nbatch_fa, false, false, true, warp_size_host);
             dst->src[1] = orig_k;
             dst->src[2] = orig_v;
             return true;
@@ -503,7 +590,7 @@ static bool ggml_cuda_flash_attn_ext_mma_kvarn_windowed_case_impl(
         const int chunk_len = std::min(window_chunk, plan.n_kv - chunk_begin);
         const dim3 dequant_grid((uint32_t) chunk_len, (uint32_t) plan.n_kv_heads, (uint32_t) plan.n_stream);
         ggml_cuda_kernel_launch_params dequant_params(dequant_grid, dequant_block, 0, stream);
-        ggml_cuda_kernel_launch(dequant_kernel, dequant_params,
+        ggml_cuda_kernel_launch(ggml_cuda_fattn_kvarn_window_dequant_kernel<DKQ>, dequant_params,
             k_desc.get(), v_desc.get(), k_f16.get(), v_f16.get(), chunk_begin, chunk_len, plan.n_kv_heads);
 
         const char * mask_data = mask ? (const char *) mask->data + (size_t) chunk_begin * mask->nb[0] : nullptr;
@@ -535,9 +622,8 @@ static bool ggml_cuda_flash_attn_ext_mma_kvarn_windowed_case_impl(
         init = false;
     }
 
-    const dim3 finalize_grid((uint32_t) n_rows, 1, 1);
     ggml_cuda_kernel_launch_params finalize_params(finalize_grid, merge_block, 0, stream);
-    ggml_cuda_kernel_launch(finalize_kernel, finalize_params,
+    ggml_cuda_kernel_launch(ggml_cuda_fattn_kvarn_window_finalize_kernel<DV>, finalize_params,
         (float *) dst->data, acc_meta.get(), dst_meta, n_rows);
     CUDA_CHECK(cudaGetLastError());
     return true;
@@ -745,9 +831,8 @@ void ggml_cuda_flash_attn_ext_mma_kvarn_case(ggml_backend_cuda_context & ctx, gg
     dst->src[2] = &V_desc;
     // need_f16_K=false, need_f16_V=false: KVarN K/V stay descriptor-backed.
     // Mixed prefill reconstructs original-domain V in the native loader.
-    // use_sparse=false: record loads are not qualified for sparse gathers.
     launch_fattn<DV, ncols1, ncols2>
-        (ctx, dst, fattn_kernel, nwarps, nbytes_shared_total, nbatch_fa, false, false, true, false, warp_size_host);
+        (ctx, dst, fattn_kernel, nwarps, nbytes_shared_total, nbatch_fa, false, false, true, warp_size_host);
     dst->src[1] = orig_k;
     dst->src[2] = orig_v;
 }

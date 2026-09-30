@@ -83,9 +83,7 @@ ggml_cuda_fattn_kvarn_decode_plan_tile(
         const int64_t a1 = ggml_cuda_fattn_kvarn_read_cell(desc, e1, stage1);
         const int span = (token_end - 1) - token_begin;
         const int g0 = e0 != -1 ? (int) (a0 / GGML_CUDA_FATTN_KVARN_DIM) : -1;
-        const int g1 = e1 != -1 ? (int) (a1 / GGML_CUDA_FATTN_KVARN_DIM) : -2;
-        const bool contiguous = e0 != -1 && e1 != -1 && stage0 == stage1 &&
-            (int) (a1 - a0) == span && g0 == g1;
+        const bool contiguous = e0 != -1 && e1 != -1 && stage0 == stage1 && (int) (a1 - a0) == span;
         const bool rec0 = desc.swa ?
             ggml_cuda_fattn_kvarn_decode_swa_record_backed(desc, g0) :
             (!stage0 && (desc.read_indirect || ggml_cuda_fattn_kvarn_decode_group_from_record(desc, g0)));
@@ -188,9 +186,11 @@ static __device__ __forceinline__ int ggml_cuda_fattn_kvarn_decode_unpack(
 template<int BITS>
 static __device__ __forceinline__ void ggml_cuda_fattn_kvarn_decode_unpack2(
         const uint8_t * raw,
-        const int index,
+        const int row,
+        const int col,
         int & a,
         int & b) {
+    const int index = ggml_cuda_kvarn_payload_index(row, col);
     const uint32_t * words = (const uint32_t *) raw;
     const int bit_offset = index * BITS;
     const int word_offset = bit_offset >> 5;
@@ -262,8 +262,16 @@ static __global__ void ggml_cuda_fattn_kvarn_decode_mma_kernel(
     // в score_partial_sh). Результат лишних строк отбрасывается по h < MAX_GQA,
     // но само чтение было некорректным.
     constexpr int Q_ROWS = MAX_GQA < 8 ? 8 : MAX_GQA;
-    constexpr int P_ROWS = MAX_GQA < 8 ? 8 : MAX_GQA;
     constexpr int P_STRIDE2 = SPLIT_TOKENS / 2 + 4;
+    // Ровно та же беда, что была у q_sh, и лечится тем же приёмом. Операнд B
+    // матричного умножения — tile<8, 8, half2>, поэтому load_ldmatrix ниже
+    // читает из p_sh ФИКСИРОВАННЫЕ 8 строк по P_STRIDE2. При MAX_GQA == 6
+    // массив объявлялся на шесть строк, и для последней строки тайла
+    // (qt == Q_TILE - 1) чтение уходило ЗА массив. На результат это не влияло:
+    // лишние строки дают элементы выхода с j == 6, 7, а они отбрасываются по
+    // `head < gqa_head_count` при записи в partial. Но чтение было настоящим
+    // выходом за границу.
+    constexpr int P_ROWS = MAX_GQA < 8 ? 8 : MAX_GQA;
 
     using T_A = tile<16, 8, half2>;
     using T_B = tile<8, 8, half2>;
@@ -309,20 +317,7 @@ static __global__ void ggml_cuda_fattn_kvarn_decode_mma_kernel(
 #define KVARN_AXIS_OTHER(sl, i) __half2float(axes_sh[sl][2 * GGML_CUDA_FATTN_KVARN_DIM + (i)])
     __shared__ float zq_sh[Q_TILE][SLICES][MAX_GQA];
     __shared__ float m_sh[Q_TILE][MAX_GQA];
-    // NVCC 13.1/sm_86 trims eight bytes from this kernel when the TU-local
-    // combine instantiation is removed. Preserve the verified baseline resource
-    // footprint only for that compiler target; other backends/toolkits retain
-    // the original declaration until separately proven to need compensation.
-#if defined(__CUDA_ARCH__) && __CUDA_ARCH__ == 860 && \
-    defined(__CUDACC_VER_MAJOR__) && __CUDACC_VER_MAJOR__ == 13 && \
-    defined(__CUDACC_VER_MINOR__) && __CUDACC_VER_MINOR__ == 1 && \
-    !defined(__HIPCC__) && !defined(GGML_USE_MUSA)
-    static constexpr int GGML_CUDA_FATTN_KVARN_DECODE_RESOURCE_PAD =
-        D == 128 && MAX_GQA == 6 && SPLIT_TOKENS == 64 && NWARPS == 4 && Q_TILE == 1 ? 2 : 0;
-#else
-    static constexpr int GGML_CUDA_FATTN_KVARN_DECODE_RESOURCE_PAD = 0;
-#endif
-    __shared__ float denom_sh[Q_TILE][MAX_GQA + GGML_CUDA_FATTN_KVARN_DECODE_RESOURCE_PAD];
+    __shared__ float denom_sh[Q_TILE][MAX_GQA];
 
     const ggml_cuda_fattn_kvarn_desc & k_desc = k_descs[stream * n_kv_heads + kv_head];
     const ggml_cuda_fattn_kvarn_desc & v_desc = v_descs[stream * n_kv_heads + kv_head];
@@ -383,8 +378,6 @@ static __global__ void ggml_cuda_fattn_kvarn_decode_mma_kernel(
     const bool v_from_record = v_tile.fast;
     const int k_payload_bytes = GGML_CUDA_FATTN_KVARN_DIM * GGML_CUDA_FATTN_KVARN_DIM * K_BITS / 8;
     const int v_payload_bytes = GGML_CUDA_FATTN_KVARN_DIM * GGML_CUDA_FATTN_KVARN_DIM * V_BITS / 8;
-    const int k_row_bytes = GGML_CUDA_FATTN_KVARN_DIM * K_BITS / 8;
-    const int v_row_bytes = GGML_CUDA_FATTN_KVARN_DIM * V_BITS / 8;
     const int record_group_k = k_tile.record_group;
     const int record_group_v = v_tile.record_group;
 
@@ -497,11 +490,11 @@ static __global__ void ggml_cuda_fattn_kvarn_decode_mma_kernel(
                     const int pos = k_tile.pos_begin + chunk * TOKENS_PER_CHUNK + token_local;
                     float x00, x01, x10, x11;
                     if (k_split_in_group) {
-                        const uint8_t * row0 = k_records[slice] + (local_dim + 0) * k_row_bytes;
-                        const uint8_t * row1 = k_records[slice] + (local_dim + 1) * k_row_bytes;
                         int q00, q01, q10, q11;
-                        ggml_cuda_fattn_kvarn_decode_unpack2<K_BITS>(row0, pos, q00, q01);
-                        ggml_cuda_fattn_kvarn_decode_unpack2<K_BITS>(row1, pos, q10, q11);
+                        ggml_cuda_fattn_kvarn_decode_unpack2<K_BITS>(
+                            k_records[slice], local_dim + 0, pos, q00, q01);
+                        ggml_cuda_fattn_kvarn_decode_unpack2<K_BITS>(
+                            k_records[slice], local_dim + 1, pos, q10, q11);
                         x00 = (float) q00; x01 = (float) q01;
                         x10 = (float) q10; x11 = (float) q11;
                     } else {
@@ -603,14 +596,15 @@ static __global__ void ggml_cuda_fattn_kvarn_decode_mma_kernel(
 #pragma unroll
     for (int qt = 0; qt < Q_TILE; ++qt) {
         half * p_h = (half *) p_sh[qt];
-        // load_ldmatrix below reads a physical eight-row probability tile. When
-        // MAX_GQA is six, initialize the two rows that are not produced by
-        // softmax so every Q_TILE row has defined input for the V mma.
-        for (int i = tid; i < (P_ROWS - MAX_GQA) * SPLIT_TOKENS;
-                i += NWARPS * PHYSICAL_WAVE_SIZE) {
-            const int h = MAX_GQA + i / SPLIT_TOKENS;
-            const int token = i % SPLIT_TOKENS;
-            p_h[h * (2 * P_STRIDE2) + token] = __float2half(0.0f);
+        // Строки MAX_GQA..P_ROWS-1 нужны только затем, чтобы load_ldmatrix читал
+        // ВНУТРИ массива. Ниже их не пишет никто, поэтому обнуляем здесь: q_sh
+        // поступает так же (там лишние строки получают 0.0f в общем цикле
+        // заполнения). Наблюдаемый результат от этого не меняется — элементы
+        // выхода с j >= gqa_head_count всё равно отбрасываются, — но чтение
+        // перестаёт быть чтением неинициализированной разделяемой памяти.
+        for (int i = tid; i < (P_ROWS - MAX_GQA) * (2 * P_STRIDE2);
+                 i += NWARPS * PHYSICAL_WAVE_SIZE) {
+            p_h[MAX_GQA * (2 * P_STRIDE2) + i] = __float2half(0.0f);
         }
 #if defined(GGML_USE_HIP) && defined(CDNA)
         if (tid < MAX_GQA) {
@@ -722,11 +716,11 @@ static __global__ void ggml_cuda_fattn_kvarn_decode_mma_kernel(
                 const int pos0 = v_tile.pos_begin + chunk * TOKENS_PER_CHUNK + token_local + 0;
                 const int pos1 = v_tile.pos_begin + chunk * TOKENS_PER_CHUNK + token_local + 1;
                 if (v_from_record && pos1 < GGML_CUDA_FATTN_KVARN_DIM) {
-                    const uint8_t * row0 = v_records[slice] + pos0 * v_row_bytes;
-                    const uint8_t * row1 = v_records[slice] + pos1 * v_row_bytes;
                     int q0a, q0b, q1a, q1b;
-                    ggml_cuda_fattn_kvarn_decode_unpack2<V_BITS>(row0, dim_a, q0a, q0b);
-                    ggml_cuda_fattn_kvarn_decode_unpack2<V_BITS>(row1, dim_a, q1a, q1b);
+                    ggml_cuda_fattn_kvarn_decode_unpack2<V_BITS>(
+                        v_records[slice], pos0, dim_a, q0a, q0b);
+                    ggml_cuda_fattn_kvarn_decode_unpack2<V_BITS>(
+                        v_records[slice], pos1, dim_a, q1a, q1b);
                     const float other_a = KVARN_AXIS_OTHER(slice, dim_a);
                     const float other_b = KVARN_AXIS_OTHER(slice, dim_b);
                     const float s0 = KVARN_AXIS_SCALE(slice, pos0);
@@ -799,19 +793,111 @@ static __global__ void ggml_cuda_fattn_kvarn_decode_mma_kernel(
     }
 }
 
+template<int D>
+static __global__ void ggml_cuda_fattn_kvarn_decode_combine_kernel(
+        const float * partial,
+        const float2 * partial_meta,
+        float * dst,
+        float2 * dst_meta,
+        int n_splits,
+        int n_q,
+        int n_q_heads) {
+    const int q_head = blockIdx.x;
+    const int q_index = blockIdx.y;
+    const int stream = blockIdx.z;
+    const int tid = threadIdx.x;
+
+    __shared__ float reduce_sh[GGML_CUDA_FATTN_KVARN_DECODE_THREADS];
+    extern __shared__ float split_weights[];
+
+    float local_max = -FLT_MAX / 2.0f;
+    for (int split = tid; split < n_splits; split += blockDim.x) {
+        const float2 meta = partial_meta[(((size_t) stream * n_q + q_index) * n_q_heads + q_head) * n_splits + split];
+        if (meta.y > 0.0f) {
+            local_max = fmaxf(local_max, meta.x);
+        }
+    }
+    reduce_sh[tid] = local_max;
+    __syncthreads();
+    for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+        if (tid < stride) {
+            reduce_sh[tid] = fmaxf(reduce_sh[tid], reduce_sh[tid + stride]);
+        }
+        __syncthreads();
+    }
+    const float m = reduce_sh[0];
+
+    float local_denom = 0.0f;
+    for (int split = tid; split < n_splits; split += blockDim.x) {
+        const float2 meta = partial_meta[(((size_t) stream * n_q + q_index) * n_q_heads + q_head) * n_splits + split];
+        float weight = 0.0f;
+        if (meta.y > 0.0f) {
+            weight = __expf(meta.x - m);
+            local_denom += weight * meta.y;
+        }
+        split_weights[split] = weight;
+    }
+    reduce_sh[tid] = local_denom;
+    __syncthreads();
+    for (int stride = blockDim.x / 2; stride > 0; stride >>= 1) {
+        if (tid < stride) {
+            reduce_sh[tid] += reduce_sh[tid + stride];
+        }
+        __syncthreads();
+    }
+    const float denom = reduce_sh[0];
+
+    const size_t output_row = ((size_t) stream * n_q + q_index) * n_q_heads + q_head;
+    if (tid == 0 && dst_meta != nullptr) {
+        dst_meta[output_row] = make_float2(m, denom);
+    }
+
+    for (int dim = tid; dim < D; dim += blockDim.x) {
+        float out = 0.0f;
+        if (denom > 0.0f) {
+            for (int split = 0; split < n_splits; ++split) {
+                // Пропущенные сплиты не писали partial вовсе, а раньше писали
+                // туда нули: прибавить ноль и не прибавлять ничего — одно и то
+                // же значение. Заодно это убирает половину чтений partial при
+                // двух последовательностях в объединённом кэше.
+                const float weight = split_weights[split];
+                if (weight == 0.0f) {
+                    continue;
+                }
+                const size_t base = (((size_t) stream * n_q + q_index) * n_q_heads + q_head) * n_splits + split;
+                out += weight * partial[base * D + dim];
+            }
+            out /= denom;
+        }
+        dst[output_row * D + dim] = out;
+    }
+}
+
 static inline int ggml_cuda_fattn_kvarn_decode_div_up_i64(const int64_t x, const int y) {
     return (int) ((x + y - 1) / y);
 }
 
-// The combine reduction uses n_splits floats of dynamic shared memory. Keep
-// the original per-specialization preparation in the caller while caching the
-// canonical kernel pointer, so steady-state launches add no cross-TU host call.
+// The KVarN decode combine reduction holds n_splits partials in dynamic shared
+// memory. n_splits = ceil(n_kv / SPLIT_TOKENS) grows with context, so once
+// n_splits*sizeof(float) exceeds CUDA's 48KB default per-block dynamic-shared-
+// mem ceiling (~786K tokens at SPLIT_TOKENS=64), the launch fails with
+// cudaErrorInvalidConfiguration ("invalid argument"). Raise the kernel's
+// dynamic-shared-mem limit once per device to the device opt-in max, mirroring
+// CUDA_SET_SHARED_MEMORY_LIMIT. Setting it per launch to the current demand
+// would shrink the ceiling below what a later, larger launch of the same kernel
+// needs (the VEC path in fattn-kvarn-vec.cuh launches this same kernel
+// template), so the limit must only ever be raised. Coverage is bounded by the
+// device's sharedMemPerBlockOptin (e.g. ~228KB on sm_120 = n_kv ~3.7M; 64KB at
+// n_kv=1M). Beyond that the launch still fails; the split planner in
+// ggml_cuda_fattn_kvarn_decode_select does not gate on this limit.
 template<int D>
-static void ggml_cuda_fattn_kvarn_decode_combine_prepare(
-        ggml_cuda_fattn_kvarn_decode_combine_kernel_t kernel,
-        const int nbytes_shared_combine) {
+static void ggml_cuda_fattn_kvarn_decode_combine_prepare(const int nbytes_shared_combine) {
     const int device = ggml_cuda_get_device();
     GGML_ASSERT(device >= 0 && device < GGML_CUDA_MAX_DEVICES);
+    // The opt-in ceiling is shared between static and dynamic shared memory:
+    // cudaFuncSetAttribute rejects values where value + static > smpbo. The
+    // combine kernel holds reduce_sh[] in static shared memory, so the dynamic
+    // limit is smpbo minus that static footprint.
     constexpr int nbytes_static_combine = GGML_CUDA_FATTN_KVARN_DECODE_THREADS * (int) sizeof(float);
     const int smem_max = (int) ggml_cuda_info().devices[device].smpbo - nbytes_static_combine;
     GGML_ASSERT(nbytes_shared_combine <= smem_max &&
@@ -820,12 +906,10 @@ static void ggml_cuda_fattn_kvarn_decode_combine_prepare(
     static bool raised[GGML_CUDA_MAX_DEVICES] = {};
     if (!raised[device]) {
         CUDA_CHECK(cudaFuncSetAttribute(
-            reinterpret_cast<const void *>(kernel),
+            reinterpret_cast<const void *>(ggml_cuda_fattn_kvarn_decode_combine_kernel<D>),
             cudaFuncAttributeMaxDynamicSharedMemorySize, smem_max));
         raised[device] = true;
     }
-#else
-    GGML_UNUSED(kernel);
 #endif
 }
 
@@ -864,6 +948,30 @@ static int ggml_cuda_fattn_kvarn_decode_active_blocks_per_sm() {
     return max_blocks_per_sm;
 }
 
+// Принудительный выбор длины сплита для замеров. Оценка кандидатов взвешивает
+// эффективность волны множителем 10000, а число сплитов — единицей, поэтому
+// геометрия на 64 токена выигрывает у 128 всегда (99% против 95% при равном
+// числе резидентных блоков), и эффект длины сплита нельзя измерить, не обойдя
+// сам выбор. GGML_KVARN_SPLIT_TOKENS=128 оставляет только кандидатов с этой
+// длиной.
+// Принудительная ширина тайла строк запроса для замеров: 1 отключает широкий
+// тайл целиком, 2 оставляет только его. Ноль — обычный выбор по оценке.
+static int ggml_cuda_fattn_kvarn_decode_forced_q_tile() {
+    static const int value = [] {
+        const char * env = getenv("GGML_KVARN_Q_TILE");
+        return env != nullptr ? atoi(env) : 0;
+    }();
+    return value;
+}
+
+static int ggml_cuda_fattn_kvarn_decode_forced_split() {
+    static const int value = [] {
+        const char * env = getenv("GGML_KVARN_SPLIT_TOKENS");
+        return env != nullptr ? atoi(env) : 0;
+    }();
+    return value;
+}
+
 template<int D, int MAX_GQA, int SPLIT_TOKENS, int NWARPS, int K_BITS, int V_BITS, int Q_TILE = 1>
 static void ggml_cuda_fattn_kvarn_decode_consider(
         ggml_cuda_fattn_kvarn_decode_geometry & best,
@@ -873,22 +981,10 @@ static void ggml_cuda_fattn_kvarn_decode_consider(
         const int n_q,
         const int n_q_heads,
         const int n_kv_heads,
-        const int n_stream,
-        const int only_split = 0,
-        const int only_nwarps = 0,
-        const int only_gqa = 0) {
-    if (only_split > 0 && (SPLIT_TOKENS != only_split || NWARPS != only_nwarps ||
-            MAX_GQA != only_gqa)) {
+        const int n_stream) {
+    const int forced_split = ggml_cuda_fattn_kvarn_decode_forced_split();
+    if (forced_split > 0 && SPLIT_TOKENS != forced_split) {
         return;
-    }
-    // On RTX 3090, split-64 is 1.8% faster at 16K for a single query, while
-    // split-128 is 0.6% faster at 32K and 4.5% faster at 64K. Multi-query
-    // verification keeps split-128 at shorter depths because it enables query
-    // tiling and avoids duplicated partial-output traffic.
-    if constexpr (SPLIT_TOKENS == 128) {
-        if (n_q == 1 && n_kv < 32768) {
-            return;
-        }
     }
     const int gqa_ratio = n_q_heads / n_kv_heads;
     const int n_splits = ggml_cuda_fattn_kvarn_decode_div_up_i64(n_kv, SPLIT_TOKENS);
@@ -901,6 +997,10 @@ static void ggml_cuda_fattn_kvarn_decode_consider(
     // Тайл шире одной строки запроса имеет смысл только когда строк несколько:
     // при n_q == 1 он ничего не экономит, а разделяемой памяти просит больше.
     if (Q_TILE > 1 && n_q < Q_TILE) {
+        return;
+    }
+    const int forced_q_tile = ggml_cuda_fattn_kvarn_decode_forced_q_tile();
+    if (forced_q_tile > 0 && Q_TILE != forced_q_tile) {
         return;
     }
     ++best.candidate_count;
@@ -1026,25 +1126,20 @@ ggml_cuda_fattn_kvarn_decode_geometry ggml_cuda_fattn_kvarn_decode_select(
 
     const int nsm = ggml_cuda_info().devices[device].nsm;
     int64_t best_score = INT64_MIN;
-    // Select the KV partition using single-query geometry so generation and
-    // speculative verification use the same online-softmax summation order.
-    // A second pass below may still select a wider query tile without changing
-    // that partition.
-    const int n_q_geometry = 1;
     if constexpr (D == 512) {
         ggml_cuda_fattn_kvarn_decode_consider<D, 6, 64,  8, K_BITS, V_BITS>(
-            best, best_score, nsm, n_kv, n_q_geometry, n_q_heads, n_kv_heads, n_stream);
+            best, best_score, nsm, n_kv, n_q, n_q_heads, n_kv_heads, n_stream);
         ggml_cuda_fattn_kvarn_decode_consider<D, 8, 64,  8, K_BITS, V_BITS>(
-            best, best_score, nsm, n_kv, n_q_geometry, n_q_heads, n_kv_heads, n_stream);
+            best, best_score, nsm, n_kv, n_q, n_q_heads, n_kv_heads, n_stream);
         ggml_cuda_fattn_kvarn_decode_consider<D, 6, 64, 16, K_BITS, V_BITS>(
-            best, best_score, nsm, n_kv, n_q_geometry, n_q_heads, n_kv_heads, n_stream);
+            best, best_score, nsm, n_kv, n_q, n_q_heads, n_kv_heads, n_stream);
         ggml_cuda_fattn_kvarn_decode_consider<D, 8, 64, 16, K_BITS, V_BITS>(
-            best, best_score, nsm, n_kv, n_q_geometry, n_q_heads, n_kv_heads, n_stream);
+            best, best_score, nsm, n_kv, n_q, n_q_heads, n_kv_heads, n_stream);
     } else if constexpr (D == 256) {
         ggml_cuda_fattn_kvarn_decode_consider<D, 6, 64, 8, K_BITS, V_BITS>(
-            best, best_score, nsm, n_kv, n_q_geometry, n_q_heads, n_kv_heads, n_stream);
+            best, best_score, nsm, n_kv, n_q, n_q_heads, n_kv_heads, n_stream);
         ggml_cuda_fattn_kvarn_decode_consider<D, 8, 64, 8, K_BITS, V_BITS>(
-            best, best_score, nsm, n_kv, n_q_geometry, n_q_heads, n_kv_heads, n_stream);
+            best, best_score, nsm, n_kv, n_q, n_q_heads, n_kv_heads, n_stream);
         // Сплит на 128 токенов совпадает с группой записи: постоянная цена
         // блока (загрузка Q, осей, последовательный расчёт zq, барьеры)
         // раскладывается на вдвое большее число токенов, а число сплитов —
@@ -1052,9 +1147,9 @@ ggml_cuda_fattn_kvarn_decode_geometry ggml_cuda_fattn_kvarn_decode_select(
         // падает. Разделяемой памяти нужно на ~5 КиБ больше, четыре блока на
         // мультипроцессор при этом сохраняются.
         ggml_cuda_fattn_kvarn_decode_consider<D, 6, 128, 8, K_BITS, V_BITS>(
-            best, best_score, nsm, n_kv, n_q_geometry, n_q_heads, n_kv_heads, n_stream);
+            best, best_score, nsm, n_kv, n_q, n_q_heads, n_kv_heads, n_stream);
         ggml_cuda_fattn_kvarn_decode_consider<D, 8, 128, 8, K_BITS, V_BITS>(
-            best, best_score, nsm, n_kv, n_q_geometry, n_q_heads, n_kv_heads, n_stream);
+            best, best_score, nsm, n_kv, n_q, n_q_heads, n_kv_heads, n_stream);
         // Тайл на две строки запроса — ТОЛЬКО со сплитом 128, и вот почему.
         //
         // Буфер частичных сумм имеет размер n_splits * n_q * n_q_heads * D: он
@@ -1070,62 +1165,36 @@ ggml_cuda_fattn_kvarn_decode_geometry ggml_cuda_fattn_kvarn_decode_select(
         // сверху. Экономия на распаковке реальна, но она вдвое меньше того, что
         // стоит удвоение частичных сумм.
         //
-        // Бюджет разделяемой памяти при сплите 128 (числа из cuobjdump):
-        //   MAX_GQA 6, тайл 1: 13632, вторая строка добавляет 9024 -> 22656, влезает
-        //   MAX_GQA 8, тайл 1: 16256, вторая строка добавляет 10624 -> 26880, нет
-        // Порог четырёх блоков на мультипроцессор — 25344 байта. Поэтому широкий
-        // тайл существует только в варианте на шесть голов GQA; при gqa_ratio 6
-        // этого ровно достаточно, чтобы обойтись одним блоком по головам.
+        // Бюджет разделяемой памяти при сплите 128 (числа из cuobjdump).
+        // Добивка p_sh до P_ROWS == 8 добавила по 544 байта на строку
+        // тайла ((8 - 6) * P_STRIDE2 * sizeof(half2) = 2 * 68 * 4).
+        //   MAX_GQA 6, тайл 1: 13632 -> 14176, вторая строка -> 23744, влезает
+        //   MAX_GQA 8, тайл 1: 16256 -> 16256 (там P_ROWS == MAX_GQA, роста нет)
+        // Порог четырёх блоков на мультипроцессор — 25344 байта, и 23744 в него
+        // по-прежнему укладывается. Тайл на три строки: 31680 -> 33312 при
+        // пороге трёх блоков 33792 — тоже укладывается, но запас всего 480 байт.
+        // ПРОВЕРЕНО ЗАМЕРОМ, а не расчётом: GGML_CUDA_FA_ROUTE_DEBUG=1 на v24
+        // печатает active_blocks_per_sm=4 при той же геометрии, что и v23.
+        // Поэтому широкий тайл существует только в варианте на шесть голов GQA;
+        // при gqa_ratio 6 этого ровно достаточно, чтобы обойтись одним блоком
+        // по головам.
         ggml_cuda_fattn_kvarn_decode_consider<D, 6, 128, 8, K_BITS, V_BITS, 2>(
-            best, best_score, nsm, n_kv, n_q_geometry, n_q_heads, n_kv_heads, n_stream);
+            best, best_score, nsm, n_kv, n_q, n_q_heads, n_kv_heads, n_stream);
         // Тайл на три строки укладывает типичный шаг MTP (n_q = 3) в один блок
         // вместо двух, но просит 31680 байт разделяемой памяти — это три блока
         // на мультипроцессор вместо четырёх. Размен проверяется замером.
         ggml_cuda_fattn_kvarn_decode_consider<D, 6, 128, 8, K_BITS, V_BITS, 3>(
-            best, best_score, nsm, n_kv, n_q_geometry, n_q_heads, n_kv_heads, n_stream);
+            best, best_score, nsm, n_kv, n_q, n_q_heads, n_kv_heads, n_stream);
     } else if constexpr (D == 128) {
         ggml_cuda_fattn_kvarn_decode_consider<D, 6, 64, 4, K_BITS, V_BITS>(
-            best, best_score, nsm, n_kv, n_q_geometry, n_q_heads, n_kv_heads, n_stream);
+            best, best_score, nsm, n_kv, n_q, n_q_heads, n_kv_heads, n_stream);
         ggml_cuda_fattn_kvarn_decode_consider<D, 8, 64, 4, K_BITS, V_BITS>(
-            best, best_score, nsm, n_kv, n_q_geometry, n_q_heads, n_kv_heads, n_stream);
+            best, best_score, nsm, n_kv, n_q, n_q_heads, n_kv_heads, n_stream);
     }
 
     if (!best.use_split || best.n_splits <= 1) {
         best.use_split = false;
         return best;
-    }
-
-    if constexpr (D == 256) {
-        if (n_q > 1) {
-            const int only_split = best.split_tokens;
-            const int only_nwarps = best.nwarps;
-            const int only_gqa = best.gqa_per_block;
-            ggml_cuda_fattn_kvarn_decode_geometry tiled = {};
-            int64_t tiled_score = INT64_MIN;
-            ggml_cuda_fattn_kvarn_decode_consider<D, 6, 64, 8, K_BITS, V_BITS>(
-                tiled, tiled_score, nsm, n_kv, n_q, n_q_heads, n_kv_heads, n_stream,
-                only_split, only_nwarps, only_gqa);
-            ggml_cuda_fattn_kvarn_decode_consider<D, 8, 64, 8, K_BITS, V_BITS>(
-                tiled, tiled_score, nsm, n_kv, n_q, n_q_heads, n_kv_heads, n_stream,
-                only_split, only_nwarps, only_gqa);
-            ggml_cuda_fattn_kvarn_decode_consider<D, 6, 128, 8, K_BITS, V_BITS>(
-                tiled, tiled_score, nsm, n_kv, n_q, n_q_heads, n_kv_heads, n_stream,
-                only_split, only_nwarps, only_gqa);
-            ggml_cuda_fattn_kvarn_decode_consider<D, 8, 128, 8, K_BITS, V_BITS>(
-                tiled, tiled_score, nsm, n_kv, n_q, n_q_heads, n_kv_heads, n_stream,
-                only_split, only_nwarps, only_gqa);
-            ggml_cuda_fattn_kvarn_decode_consider<D, 6, 128, 8, K_BITS, V_BITS, 2>(
-                tiled, tiled_score, nsm, n_kv, n_q, n_q_heads, n_kv_heads, n_stream,
-                only_split, only_nwarps, only_gqa);
-            ggml_cuda_fattn_kvarn_decode_consider<D, 6, 128, 8, K_BITS, V_BITS, 3>(
-                tiled, tiled_score, nsm, n_kv, n_q, n_q_heads, n_kv_heads, n_stream,
-                only_split, only_nwarps, only_gqa);
-            if (tiled.use_split) {
-                const int candidates = best.candidate_count + tiled.candidate_count;
-                best = tiled;
-                best.candidate_count = candidates;
-            }
-        }
     }
 
     const int direct_blocks_per_wave = nsm * best.max_blocks_per_sm;
@@ -1220,12 +1289,11 @@ void ggml_cuda_fattn_kvarn_decode_launch(const ggml_cuda_fattn_kvarn_decode_args
     }
     CUDA_CHECK(cudaGetLastError());
 
-    static const ggml_cuda_fattn_kvarn_decode_combine_kernel_t combine_kernel =
-        ggml_cuda_fattn_kvarn_decode_combine_get_kernel<D>();
     const dim3 blocks_combine((uint32_t) args.n_q_heads, (uint32_t) args.n_q, (uint32_t) args.n_stream);
+
     const int nbytes_shared_combine = args.n_splits * (int) sizeof(float);
-    ggml_cuda_fattn_kvarn_decode_combine_prepare<D>(combine_kernel, nbytes_shared_combine);
-    combine_kernel
+    ggml_cuda_fattn_kvarn_decode_combine_prepare<D>(nbytes_shared_combine);
+    ggml_cuda_fattn_kvarn_decode_combine_kernel<D>
         <<<blocks_combine, GGML_CUDA_FATTN_KVARN_DECODE_THREADS, nbytes_shared_combine, args.stream>>>(
             args.partial, args.partial_meta, args.dst, args.dst_meta,
             args.n_splits, args.n_q, args.n_q_heads);

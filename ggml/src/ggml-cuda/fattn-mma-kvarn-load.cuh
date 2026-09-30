@@ -1,21 +1,23 @@
 #pragma once
 
 #include "fattn-mma-kvarn.cuh"
+#include "kvarn-payload-layout.cuh"
 
 static __device__ __forceinline__ uint8_t ggml_cuda_fattn_kvarn_unpack_record(
         const uint8_t * record, const int index, const int bits) {
+    const int physical = ggml_cuda_kvarn_payload_index_from_linear(index);
     if (bits == 8) {
-        return record[index];
+        return record[physical];
     }
     if (bits == 4) {
-        const uint8_t packed = record[index >> 1];
-        return (packed >> ((index & 1) << 2)) & 0x0fu;
+        const uint8_t packed = record[physical >> 1];
+        return (packed >> ((physical & 1) << 2)) & 0x0fu;
     }
     if (bits == 2) {
-        const uint8_t packed = record[index >> 2];
-        return (packed >> ((index & 3) << 1)) & 0x03u;
+        const uint8_t packed = record[physical >> 2];
+        return (packed >> ((physical & 3) << 1)) & 0x03u;
     }
-    const int bit_offset = index * bits;
+    const int bit_offset = physical * bits;
     const int byte_offset = bit_offset >> 3;
     const int bit_in_byte = bit_offset & 7;
     const uint16_t packed = (uint16_t) record[byte_offset] | ((uint16_t) record[byte_offset + 1] << 8);
@@ -27,20 +29,26 @@ static __device__ __forceinline__ uint8_t ggml_cuda_fattn_kvarn_unpack_record(
 // window and one bit-offset calculation serve both output lanes.
 static __device__ __forceinline__ uint16_t ggml_cuda_fattn_kvarn_unpack_record_pair(
         const uint8_t * record, const int index, const int bits) {
+    const int physical0 = ggml_cuda_kvarn_payload_index_from_linear(index);
+    const int physical1 = ggml_cuda_kvarn_payload_index_from_linear(index + 1);
+    if (physical1 != physical0 + 1) {
+        return (uint16_t) ggml_cuda_fattn_kvarn_unpack_record(record, index, bits) |
+            ((uint16_t) ggml_cuda_fattn_kvarn_unpack_record(record, index + 1, bits) << 8);
+    }
     if (bits == 8) {
-        return (uint16_t) record[index] | ((uint16_t) record[index + 1] << 8);
+        return (uint16_t) record[physical0] | ((uint16_t) record[physical1] << 8);
     }
     if (bits == 4) {
-        const uint8_t packed = record[index >> 1];
+        const uint8_t packed = record[physical0 >> 1];
         return (uint16_t) (packed & 0x0fu) | ((uint16_t) (packed >> 4) << 8);
     }
     if (bits == 2) {
-        const uint8_t packed = record[index >> 2];
-        const int shift = (index & 3) << 1;
+        const uint8_t packed = record[physical0 >> 2];
+        const int shift = (physical0 & 3) << 1;
         return (uint16_t) ((packed >> shift) & 0x03u) |
             ((uint16_t) ((packed >> (shift + 2)) & 0x03u) << 8);
     }
-    const int bit_offset = index * bits;
+    const int bit_offset = physical0 * bits;
     const int byte_offset = bit_offset >> 3;
     const int bit_in_byte = bit_offset & 7;
     const uint16_t packed = (uint16_t) record[byte_offset] | ((uint16_t) record[byte_offset + 1] << 8);
@@ -78,18 +86,28 @@ static __device__ __forceinline__ float ggml_cuda_fattn_kvarn_load_rotated(
         if (encoded == -1) {
             return 0.0f;
         }
+        if (encoded < -1) {
+            const int64_t abs_pos = -encoded - 2;
+            group = (int) (abs_pos / GGML_CUDA_FATTN_KVARN_DIM);
+            pos = (int) (abs_pos - (int64_t) group * GGML_CUDA_FATTN_KVARN_DIM);
+            const int stage_base = desc.stream * GGML_CUDA_FATTN_KVARN_DIM * desc.stage_groups;
+            stage_pos = stage_base + (group == 0 ? pos : GGML_CUDA_FATTN_KVARN_DIM +
+                ((group - 1) % desc.tail_groups) * GGML_CUDA_FATTN_KVARN_DIM + pos);
+            return ggml_cuda_fattn_kvarn_load_stage_rotated(desc, stage_pos, record_head, dim);
+        }
         bool explicitly_staged;
-        int assigned_slot = -1;
-        const int64_t abs_pos = ggml_cuda_fattn_kvarn_read_cell(
-                desc, encoded, explicitly_staged, &assigned_slot);
+        const int64_t abs_pos = ggml_cuda_fattn_kvarn_read_cell(desc, encoded, explicitly_staged);
         group = (int) (abs_pos / GGML_CUDA_FATTN_KVARN_DIM);
         pos   = (int) (abs_pos - (int64_t) group * GGML_CUDA_FATTN_KVARN_DIM);
         from_stage = explicitly_staged ||
             (!(desc.read_indirect && !desc.swa) && ggml_cuda_fattn_kvarn_group_from_stage(desc, group));
         from_record = !explicitly_staged && (desc.read_indirect && !desc.swa ? true :
             ggml_cuda_fattn_kvarn_group_from_record(desc, group));
-        stage_pos = ggml_cuda_fattn_kvarn_stage_pos(
-                desc, group, pos, assigned_slot);
+        const int stage_base = desc.stream * GGML_CUDA_FATTN_KVARN_DIM * desc.stage_groups;
+        stage_pos = desc.swa ?
+            (group % desc.stage_groups) * GGML_CUDA_FATTN_KVARN_DIM + pos :
+            stage_base + (group == 0 ? pos : GGML_CUDA_FATTN_KVARN_DIM +
+                ((group - 1) % desc.tail_groups) * GGML_CUDA_FATTN_KVARN_DIM + pos);
         record_group = desc.swa ? group % desc.groups_per_stream :
             desc.stream * desc.groups_per_stream + group;
     } else {

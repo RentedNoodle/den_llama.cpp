@@ -9,7 +9,9 @@
 
 #include <algorithm>
 #include <cmath>
+#include <cstdlib>
 #include <cstring>
+#include <string>
 #include <limits>
 #include <map>
 #include <set>
@@ -120,6 +122,8 @@ bool kvarn_backend_supports_tail_write(
 // records. Keep this low enough that KVarN remains a KV-memory win over q5_0.
 constexpr uint32_t KVAR_N_SWA_TAIL_GROUPS = 2;
 constexpr uint32_t KVAR_N_STATE_MAGIC = 0x4e52564b; // "KVRN"
+// Version 17 records the backend's physical code-payload layout. This prevents
+// row-major state from being restored as the byte-neutral SM120 tile16 layout.
 // Version 16 stores full unified non-SWA stages as source-cell rows so state
 // can remap across contexts with different sequence-dependent stage depths.
 // Version 15 adds self-contained selective record groups with cell remapping.
@@ -133,7 +137,7 @@ constexpr uint32_t KVAR_N_STATE_MAGIC = 0x4e52564b; // "KVRN"
 // otherwise be restored in the wrong domain. Version 5 added stage_groups
 // validation. Version 10 rejects states with the pre-dedup SWA record-ring layout.
 constexpr uint32_t KVAR_N_STATE_VERSION_MIN = 12;
-constexpr uint32_t KVAR_N_STATE_VERSION = 16;
+constexpr uint32_t KVAR_N_STATE_VERSION = 17;
 constexpr uint32_t KVAR_N_STATE_RECORDS_FULL = 0;
 constexpr uint32_t KVAR_N_STATE_STAGE_ONLY_PARTIAL = 1;
 constexpr uint32_t KVAR_N_STATE_RECORDS_SELECTIVE = 2;
@@ -255,6 +259,33 @@ bool llama_kvarn_backend_mixed_tail_native_preferred(ggml_backend_dev_t dev) {
         ggml_backend_reg_get_proc_address(
             reg, "ggml_backend_kvarn_mixed_tail_native_preferred") : nullptr;
     return fn == nullptr || fn(dev);
+}
+
+uint32_t llama_kvarn_backend_record_layout(ggml_backend_dev_t dev) {
+    if (dev == nullptr || ggml_backend_dev_type(dev) == GGML_BACKEND_DEVICE_TYPE_CPU) {
+        return GGML_BACKEND_KVARN_RECORD_LAYOUT_ROW_MAJOR;
+    }
+    if (ggml_backend_dev_is_meta(dev)) {
+        const size_t count = ggml_backend_meta_device_count(dev);
+        uint32_t layout = GGML_BACKEND_KVARN_RECORD_LAYOUT_ROW_MAJOR;
+        for (size_t i = 0; i < count; ++i) {
+            const uint32_t candidate = llama_kvarn_backend_record_layout(
+                    ggml_backend_meta_device_get(dev, i));
+            if (i == 0) {
+                layout = candidate;
+            } else if (candidate != layout) {
+                throw std::runtime_error("KVarN meta backend mixes incompatible record layouts");
+            }
+        }
+        return layout;
+    }
+    if (auto * capabilities_fn = kvarn_capabilities_proc(dev)) {
+        ggml_backend_kvarn_capabilities capabilities = {};
+        if (query_kvarn_capabilities(dev, capabilities_fn, capabilities)) {
+            return capabilities.record_layout;
+        }
+    }
+    return GGML_BACKEND_KVARN_RECORD_LAYOUT_ROW_MAJOR;
 }
 
 bool llama_kvarn_backend_supports_ops(ggml_backend_dev_t dev) {
@@ -638,12 +669,10 @@ uint32_t kvarn_record_groups_per_stream(uint32_t kv_size, uint32_t n_ubatch, uin
 llama_kv_cache_kvarn_context::llama_kv_cache_kvarn_context(
         llama_kv_cache_kvarn * cache,
         llama_memory_context_ptr base,
-        llama_context * update_lctx,
-        std::vector<int32_t> shared_graph_layers) :
+        llama_context * update_lctx) :
     llama_kv_cache_context(base ? base->get_status() : LLAMA_MEMORY_STATUS_FAILED_PREPARE),
     cache(cache),
     base_ctx(std::move(base)),
-    shared_graph_layers(std::move(shared_graph_layers)),
     update_lctx(update_lctx) {
 }
 
@@ -651,22 +680,24 @@ llama_kv_cache_context * llama_kv_cache_kvarn_context::base() const {
     return static_cast<llama_kv_cache_context *>(base_ctx.get());
 }
 
-int32_t llama_kv_cache_kvarn_context::graph_layer_for(int32_t il) const {
-    if (shared_graph_layers.empty()) {
-        return il;
-    }
-    const int32_t shared = shared_graph_layers.at(il);
-    GGML_ASSERT(shared >= 0);
-    return shared;
-}
-
 bool llama_kv_cache_kvarn_context::next() {
+    // Контекст создаётся один на весь батч (llama_kv_cache_kvarn::init_batch),
+    // а next() лишь переводит базовый контекст на следующий ubatch. План
+    // компактного чтения строится по составу занятых ячеек и по sinfo текущего
+    // ubatch'а, поэтому мемоизацию надо сбросить: иначе второй и последующие
+    // ubatch'и продолжат читать набор ячеек первого, а записанные ими ячейки
+    // (включая их собственные) окажутся вне плана и невидимы для внимания.
     compact_read_plan_cache.clear();
     return base()->next();
 }
 
 bool llama_kv_cache_kvarn_context::apply() {
+    // apply() фиксирует ячейки текущего ubatch'а в метаданных кэша — ровно то,
+    // из чего строится план, и вызывается ровно один раз перед сборкой графа
+    // (llama_context::process_ubatch). Сбрасываем и здесь, чтобы план в
+    // принципе не мог пережить изменение состояния кэша.
     compact_read_plan_cache.clear();
+
     if (!base()->apply()) {
         return false;
     }
@@ -699,78 +730,149 @@ uint32_t llama_kv_cache_kvarn_context::get_n_kv() const {
             uint32_t(compact_read_plan().size()) : base()->get_n_kv();
 }
 
+bool llama_kv_cache_kvarn_context::compact_read_plan_is_identity() const {
+    const auto & plan = compact_read_plan();
+    for (size_t read = 0; read < plan.size(); ++read) {
+        if (plan[read] < 0) {
+            break;      // дальше только заглушки, они и так маскируются
+        }
+        if (plan[read] != int64_t(read)) {
+            return false;
+        }
+    }
+    return true;
+}
+
 bool llama_kv_cache_kvarn_context::uses_compact_read_indices() const {
-    return (!shared_graph_layers.empty() && !cache->is_swa() && cache->get_kv_n_stream() == 1) ||
-            cache->uses_compact_read_indices();
-}
-
-bool llama_kv_cache_kvarn_context::uses_shared_live_indices() const {
-    return !shared_graph_layers.empty() && !cache->is_swa() && cache->get_kv_n_stream() > 1;
-}
-
-bool llama_kv_cache_kvarn_context::uses_materialization_indices() const {
-    return uses_compact_read_indices() || uses_shared_live_indices();
+    if (!cache->uses_compact_read_indices()) {
+        return false;
+    }
+    // Косвенное чтение включается по статическому свойству кэша (несколько
+    // последовательностей в одном потоке), а не по тому, нужно ли оно на самом
+    // деле. Но после упорядочивания плана по номеру ячейки типичный случай —
+    // тождественный план: слоты набивают арену подряд, дырок нет, и элемент j
+    // указывает ровно на ячейку j. Тогда индексы — чистые накладные расходы:
+    // ядро грузит int64 на каждый токен, чтобы получить то же самое число.
+    // Замер на 3090, один запрос глубиной 60000: 24.77 tok/s с косвенностью
+    // против 30.43 без неё при прочих равных.
+    //
+    // Тождественность плана означает отсутствие дырок, поэтому базовый n_kv и
+    // базовая маска совпадают с планом, и переход на прямое чтение согласован.
+    //
+    // ВЫКЛЮЧЕНО ПО УМОЛЧАНИЮ по результатам замеров.
+    //
+    // Прежние +11% относились к состоянию ДО починки ядра дескрипторов: прямое
+    // чтение отключает построение тензора индексов и тем самым избавляло то ядро
+    // от перебора мегабайта индексов. Ту же трату мы устранили напрямую, расширив
+    // его блок со 128 нитей до 1024. На текущей базе прямое чтение даёт 27.58
+    // против 27.83 tok/s на одном слоте и 27.64 против 27.64 на двух, то есть
+    // ничего или чуть хуже — при том что численный результат меняет.
+    //
+    // Численное расхождение с косвенным путём объяснено. Профиль с --parallel 1,
+    // где косвенное чтение не включается вовсе, даёт ровно тот же вывод, что и
+    // прямое чтение (sha 64635495f2ed), тогда как косвенный путь даёт свой
+    // (ab50a617ca86). То есть «странным» оказывается косвенный путь, а прямое
+    // чтение совпадает с каноническим путём без плана. Причина: размер плана
+    // дополняется до кратного 256, а базовый n_kv дополняется по своему правилу,
+    // отсюда другое число сплитов и другая группировка суммирования в софтмаксе.
+    // Сверка с portable-эталоном это подтверждает: прямое чтение расходится с
+    // эталоном ПОЗЖЕ косвенного (64 токена против 13 на глубине 5000, 57 против 5
+    // на 26000), то есть ближе к эталону.
+    //
+    // LLAMA_KVARN_DIRECT_IDENTITY=0 возвращает косвенное чтение для сверки.
+    static const bool allow_direct = [] {
+        const char * env = getenv("LLAMA_KVARN_DIRECT_IDENTITY");
+        return env != nullptr && std::string(env) == "1";
+    }();
+    return !(allow_direct && compact_read_plan_is_identity());
 }
 
 const std::vector<int64_t> & llama_kv_cache_kvarn_context::compact_read_plan() const {
-    GGML_ASSERT(uses_compact_read_indices());
+    GGML_ASSERT(cache->uses_compact_read_indices());
     if (!compact_read_plan_cache.empty()) {
         return compact_read_plan_cache;
     }
     const auto * kv = cache->get_metadata_cache();
     const auto & cells = kv->get_cells(0);
     uint32_t scan_end = std::min<uint32_t>(cells.size(), base()->get_n_kv());
-    if (shared_graph_layers.empty() && !current_sinfo().empty()) {
+    if (!current_sinfo().empty()) {
         GGML_ASSERT(current_sinfo().n_stream() == 1);
         for (const uint32_t cell : current_sinfo().idxs[0]) {
             scan_end = std::max(scan_end, cell + 1u);
         }
     }
-    std::vector<std::pair<llama_pos, uint32_t>> ordered;
-    ordered.reserve(cells.get_used());
-    for (uint32_t cell = 0; cell < scan_end; ++cell) {
-        if (!cells.is_empty(cell)) {
-            ordered.emplace_back(cells.pos_get(cell), cell);
-        }
-    }
-    std::stable_sort(ordered.begin(), ordered.end(), [](const auto & a, const auto & b) {
-        return a.first < b.first || (a.first == b.first && a.second < b.second);
-    });
+    // Порядок плана определяет порядок, в котором ядро внимания обходит ячейки.
+    // Сортировка по позиции безобидна при одной последовательности (ячейки уже
+    // перебраны по возрастанию, значит и позиции возрастают), но при двух
+    // последовательностях с совпадающими диапазонами позиций план становится
+    // строго чередующимся между двумя далёкими областями ячеек. Ядро проверяет
+    // непрерывность тайла как (последняя ячейка - первая) == 63
+    // (ggml_cuda_fattn_kvarn_decode_plan_tile), и при чередовании это условие
+    // не выполняется НИ НА ОДНОМ тайле: быстрый путь отключается целиком, и
+    // каждый элемент K и V идёт поэлементной загрузкой с рантайм-битностью.
+    // Замер на 3090, два слота по 60000 токенов, n_kv 130k: 3.95 tok/s против
+    // 13.55 у того же шейпа без unified-кэша, где косвенного чтения нет вовсе.
+    //
+    // Для корректности порядок безразличен: маска строится по плану, а не по
+    // предположению о монотонности позиций. Поэтому по умолчанию сохраняем
+    // порядок по ячейке (то есть не сортируем вовсе). Переменная
+    // LLAMA_KVARN_PLAN_ORDER=pos возвращает прежнее поведение — ТОЛЬКО для
+    // сверки. Это не безопасный откат: проверки непрерывности тайла смотрят
+    // лишь на концы диапазона (последняя ячейка минус первая равна длине
+    // пролёта), что корректно только при монотонности по ячейке. При порядке
+    // по позиции чередующийся план может дать ложное совпадение — например,
+    // ячейки 128..159 и 160..191 с одинаковыми позициями дают план
+    // 128,160,129,161,...,159,191, где 191-128 == 63 — и тайл будет ошибочно
+    // признан непрерывным, а прочитан подряд, вразрез с маской.
+    static const bool order_by_pos = [] {
+        const char * env = getenv("LLAMA_KVARN_PLAN_ORDER");
+        return env != nullptr && std::string(env) == "pos";
+    }();
+    // Промежуточный вектор пар нужен только сортировке по позиции, а она по
+    // умолчанию выключена. Без неё он стоит лишнего прохода, вдвое большего
+    // объёма (восемь байт на ячейку против четырёх) и вызова pos_get на каждую
+    // ячейку — и всё это на КАЖДОМ шаге декодирования по всем занятым ячейкам,
+    // которых при двух слотах по 65000 токенов сто тридцать тысяч.
     std::vector<uint32_t> occupied;
-    occupied.reserve(ordered.size());
-    for (const auto & entry : ordered) {
-        occupied.push_back(entry.second);
+    occupied.reserve(cells.get_used());
+    if (order_by_pos) {
+        std::vector<std::pair<llama_pos, uint32_t>> ordered;
+        ordered.reserve(cells.get_used());
+        for (uint32_t cell = 0; cell < scan_end; ++cell) {
+            if (!cells.is_empty(cell)) {
+                ordered.emplace_back(cells.pos_get(cell), cell);
+            }
+        }
+        std::stable_sort(ordered.begin(), ordered.end(), [](const auto & a, const auto & b) {
+            return a.first < b.first || (a.first == b.first && a.second < b.second);
+        });
+        for (const auto & entry : ordered) {
+            occupied.push_back(entry.second);
+        }
+    } else {
+        for (uint32_t cell = 0; cell < scan_end; ++cell) {
+            if (!cells.is_empty(cell)) {
+                occupied.push_back(cell);
+            }
+        }
     }
     std::vector<uint32_t> pending;
     if (!current_sinfo().empty()) {
         GGML_ASSERT(current_sinfo().n_stream() == 1);
         pending.assign(current_sinfo().idxs[0].begin(), current_sinfo().idxs[0].end());
     }
+    // Выравнивание плана по границе группы записи включено по умолчанию: без
+    // него ядро декода никогда не берёт быстрый путь чтения K в объединённом
+    // кэше (см. комментарий в llama_kvarn_compact_read_plan).
+    // LLAMA_KVARN_PLAN_ALIGN=0 возвращает плотный план для сверки.
+    static const bool align_plan = [] {
+        const char * env = getenv("LLAMA_KVARN_PLAN_ALIGN");
+        return env == nullptr || atoi(env) != 0;
+    }();
     compact_read_plan_cache = llama_kvarn_compact_read_plan(
-            occupied, pending, cells.size(), 256, KVAR_N_GROUP);
+            occupied, pending, cells.size(), 256,
+            align_plan ? uint32_t(KVAR_N_GROUP) : 0u);
     return compact_read_plan_cache;
-}
-
-std::vector<int64_t> llama_kv_cache_kvarn_context::shared_live_indices() const {
-    GGML_ASSERT(uses_shared_live_indices());
-    // Shared MTP layers have no K/V projections, and the metadata view does not
-    // apply its pending ubatch. Only committed target cells have backing KVarN
-    // stage or record data, so auxiliary slot reservations must not advance
-    // these per-stream live boundaries.
-    const auto * metadata = cache->get_metadata_cache();
-    const uint32_t n_stream = cache->get_kv_n_stream();
-    const uint32_t kv_size = cache->get_kv_size();
-    std::vector<int64_t> result(n_stream, -1);
-    for (uint32_t stream = 0; stream < n_stream; ++stream) {
-        const auto & cells = metadata->get_cells(stream);
-        for (uint32_t cell = uint32_t(cells.size()); cell-- > 0;) {
-            if (!cells.is_empty(cell)) {
-                result[stream] = int64_t(stream)*kv_size + cell;
-                break;
-            }
-        }
-    }
-    return result;
 }
 
 llama_kv_cache * llama_kv_cache_kvarn_context::get_kv() const {
@@ -779,15 +881,6 @@ llama_kv_cache * llama_kv_cache_kvarn_context::get_kv() const {
 
 const llama_kv_cache::slot_info & llama_kv_cache_kvarn_context::current_sinfo() const {
     return base()->current_sinfo();
-}
-
-const llama_kv_cache::slot_info_vec_t & llama_kv_cache_kvarn_context::get_sinfos() const {
-    return base()->get_sinfos();
-}
-
-void llama_kv_cache_kvarn_context::get_prev_tokens(
-        const llama_ubatch & ubatch, uint32_t n, std::vector<llama_token> & res) const {
-    base()->get_prev_tokens(ubatch, n, res);
 }
 
 ggml_type llama_kv_cache_kvarn_context::type_k() const {
@@ -804,14 +897,10 @@ ggml_tensor * llama_kv_cache_kvarn_context::get_k(ggml_context * ctx, int32_t il
 
 ggml_tensor * llama_kv_cache_kvarn_context::get_k_for_attention(
         ggml_context * ctx, int32_t il, bool native_attention) const {
-    const int32_t shared_il = graph_layer_for(il);
-    const auto it = stored_k.find(cache->mapped_layer_id(shared_il));
-    ggml_tensor * stored = it != stored_k.end() ? it->second :
-            cache->get_materialization_source(shared_il, false);
-    GGML_ASSERT(stored != nullptr);
+    const auto it = stored_k.find(cache->mapped_layer_id(il));
+    GGML_ASSERT(it != stored_k.end());
     return native_attention ? get_k_native(ctx, il) :
-        cache->materialize(ctx, stored, shared_il, get_n_kv(), current_sinfo(), false,
-                mat_idxs, uses_compact_read_indices());
+        cache->materialize(ctx, it->second, il, get_n_kv(), current_sinfo(), false, mat_idxs);
 }
 
 ggml_tensor * llama_kv_cache_kvarn_context::get_v(ggml_context * ctx, int32_t il) const {
@@ -820,22 +909,18 @@ ggml_tensor * llama_kv_cache_kvarn_context::get_v(ggml_context * ctx, int32_t il
 
 ggml_tensor * llama_kv_cache_kvarn_context::get_v_for_attention(
         ggml_context * ctx, int32_t il, bool native_attention) const {
-    const int32_t shared_il = graph_layer_for(il);
-    const auto it = stored_v.find(cache->mapped_layer_id(shared_il));
-    ggml_tensor * stored = it != stored_v.end() ? it->second :
-            cache->get_materialization_source(shared_il, true);
-    GGML_ASSERT(stored != nullptr);
+    const auto it = stored_v.find(cache->mapped_layer_id(il));
+    GGML_ASSERT(it != stored_v.end());
     return native_attention ? get_v_native(ctx, il) :
-        cache->materialize(ctx, stored, shared_il, get_n_kv(), current_sinfo(), true,
-                mat_idxs, uses_compact_read_indices());
+        cache->materialize(ctx, it->second, il, get_n_kv(), current_sinfo(), true, mat_idxs);
 }
 
 ggml_tensor * llama_kv_cache_kvarn_context::get_k_tail(ggml_context * ctx, int32_t il) const {
-    return shared_graph_layers.empty() ? cache->get_tail(ctx, il, false) : nullptr;
+    return cache->get_tail(ctx, il, false);
 }
 
 ggml_tensor * llama_kv_cache_kvarn_context::get_v_tail(ggml_context * ctx, int32_t il) const {
-    return shared_graph_layers.empty() ? cache->get_tail(ctx, il, true) : nullptr;
+    return cache->get_tail(ctx, il, true);
 }
 
 uint32_t llama_kv_cache_kvarn_context::get_tail_slots() const {
@@ -863,28 +948,27 @@ uint32_t llama_kv_cache_kvarn_context::get_tail_body_execution_stride() const {
 }
 
 uint32_t llama_kv_cache_kvarn_context::get_tail_body_execution_rows(int32_t il) const {
-    return shared_graph_layers.empty() ?
-            cache->get_metadata_cache()->get_tail_body_execution_rows(il) : 0;
+    return cache->get_metadata_cache()->get_tail_body_execution_rows(il);
 }
 
 bool llama_kv_cache_kvarn_context::has_compact_tail() const {
-    return shared_graph_layers.empty() && base()->has_compact_tail();
+    return base()->has_compact_tail();
 }
 
 bool llama_kv_cache_kvarn_context::has_kv_body() const {
-    return !shared_graph_layers.empty() || base()->has_kv_body();
+    return base()->has_kv_body();
 }
 
 bool llama_kv_cache_kvarn_context::has_kv_body(int32_t il) const {
-    return !shared_graph_layers.empty() || cache->get_metadata_cache()->has_kv_body(il);
+    return cache->get_metadata_cache()->has_kv_body(il);
 }
 
 bool llama_kv_cache_kvarn_context::has_tail_current(int32_t il) const {
-    return shared_graph_layers.empty() && cache->get_metadata_cache()->has_tail_current(il);
+    return cache->get_metadata_cache()->has_tail_current(il);
 }
 
 ggml_backend_dev_t llama_kv_cache_kvarn_context::get_tail_backend(int32_t il) const {
-    return shared_graph_layers.empty() ? cache->get_metadata_cache()->get_tail_backend(il) : nullptr;
+    return cache->get_metadata_cache()->get_tail_backend(il);
 }
 
 llama_kv_tail_storage_kind llama_kv_cache_kvarn_context::get_tail_storage_kind() const {
@@ -896,15 +980,15 @@ uint32_t llama_kv_cache_kvarn_context::get_tail_rollback_tokens() const {
 }
 
 llama_kv_tail_route llama_kv_cache_kvarn_context::get_tail_route(int32_t il) const {
-    return shared_graph_layers.empty() ? cache->get_tail_route(il) : LLAMA_KV_TAIL_ROUTE_NONE;
+    return cache->get_tail_route(il);
 }
 
 const llama_kv_tail_layer_route * llama_kv_cache_kvarn_context::get_tail_layer_route(int32_t il) const {
-    return shared_graph_layers.empty() ? cache->get_metadata_cache()->get_tail_layer_route(il) : nullptr;
+    return cache->get_metadata_cache()->get_tail_layer_route(il);
 }
 
 bool llama_kv_cache_kvarn_context::get_tail_explicit_bias(int32_t il) const {
-    return shared_graph_layers.empty() && cache->get_tail_explicit_bias(il);
+    return cache->get_tail_explicit_bias(il);
 }
 
 bool llama_kv_cache_kvarn_context::can_pack_tail_body(const llama_ubatch & ubatch) const {
@@ -915,21 +999,15 @@ bool llama_kv_cache_kvarn_context::can_pack_tail_body(const llama_ubatch & ubatc
 }
 
 ggml_tensor * llama_kv_cache_kvarn_context::get_k_native(ggml_context * ctx, int32_t il) const {
-    const int32_t shared_il = graph_layer_for(il);
-    const auto it = stored_k.find(cache->mapped_layer_id(shared_il));
-    ggml_tensor * stored = it != stored_k.end() ? it->second :
-            cache->get_materialization_source(shared_il, false);
-    GGML_ASSERT(stored != nullptr);
-    return cache->view(ctx, stored, shared_il, get_n_kv(), current_sinfo(), false, mat_idxs);
+    const auto it = stored_k.find(cache->mapped_layer_id(il));
+    GGML_ASSERT(it != stored_k.end());
+    return cache->view(ctx, it->second, il, get_n_kv(), current_sinfo(), false, mat_idxs);
 }
 
 ggml_tensor * llama_kv_cache_kvarn_context::get_v_native(ggml_context * ctx, int32_t il) const {
-    const int32_t shared_il = graph_layer_for(il);
-    const auto it = stored_v.find(cache->mapped_layer_id(shared_il));
-    ggml_tensor * stored = it != stored_v.end() ? it->second :
-            cache->get_materialization_source(shared_il, true);
-    GGML_ASSERT(stored != nullptr);
-    return cache->view(ctx, stored, shared_il, get_n_kv(), current_sinfo(), true, mat_idxs);
+    const auto it = stored_v.find(cache->mapped_layer_id(il));
+    GGML_ASSERT(it != stored_v.end());
+    return cache->view(ctx, it->second, il, get_n_kv(), current_sinfo(), true, mat_idxs);
 }
 
 ggml_tensor * llama_kv_cache_kvarn_context::build_input_kvarn_rot(ggml_context * ctx, int n_rot) const {
@@ -945,12 +1023,8 @@ ggml_tensor * llama_kv_cache_kvarn_context::cpy_k(
         ggml_tensor * k_cur,
         ggml_tensor * k_idxs,
         int32_t il) const {
-    if (!shared_graph_layers.empty() || !k_cur) {
-        return nullptr;
-    }
-    const int32_t shared_il = graph_layer_for(il);
-    auto * result = cache->store(ctx, k_cur, k_idxs, shared_il, current_sinfo(), false);
-    stored_k[cache->mapped_layer_id(shared_il)] = result;
+    auto * result = cache->store(ctx, k_cur, k_idxs, il, current_sinfo(), false);
+    stored_k[cache->mapped_layer_id(il)] = result;
     return result;
 }
 
@@ -959,12 +1033,8 @@ ggml_tensor * llama_kv_cache_kvarn_context::cpy_v(
         ggml_tensor * v_cur,
         ggml_tensor * v_idxs,
         int32_t il) const {
-    if (!shared_graph_layers.empty() || !v_cur) {
-        return nullptr;
-    }
-    const int32_t shared_il = graph_layer_for(il);
-    auto * result = cache->store(ctx, v_cur, v_idxs, shared_il, current_sinfo(), true);
-    stored_v[cache->mapped_layer_id(shared_il)] = result;
+    auto * result = cache->store(ctx, v_cur, v_idxs, il, current_sinfo(), true);
+    stored_v[cache->mapped_layer_id(il)] = result;
     return result;
 }
 
@@ -981,18 +1051,12 @@ ggml_tensor * llama_kv_cache_kvarn_context::cpy_v_with_tail(
 ggml_tensor * llama_kv_cache_kvarn_context::cpy_k_tail(
         ggml_context * ctx, ggml_tensor * k_cur, ggml_tensor * tail_idxs,
         int32_t il, ggml_tensor * dependency) const {
-    if (!shared_graph_layers.empty() || !k_cur || !tail_idxs) {
-        return nullptr;
-    }
     return cache->store_tail(ctx, k_cur, tail_idxs, il, false, dependency);
 }
 
 ggml_tensor * llama_kv_cache_kvarn_context::cpy_v_tail(
         ggml_context * ctx, ggml_tensor * v_cur, ggml_tensor * tail_idxs,
         int32_t il, ggml_tensor * dependency) const {
-    if (!shared_graph_layers.empty() || !v_cur || !tail_idxs) {
-        return nullptr;
-    }
     return cache->store_tail(ctx, v_cur, tail_idxs, il, true, dependency);
 }
 
@@ -1022,12 +1086,11 @@ ggml_tensor * llama_kv_cache_kvarn_context::build_input_v_rot(ggml_context * ctx
 }
 
 ggml_tensor * llama_kv_cache_kvarn_context::build_input_kvarn_mat_idxs(ggml_context * ctx) const {
-    // SWA and compact reads use one index per output cache cell. Shared
-    // multi-stream reads need one high-watermark index per target stream so
-    // materialization can locate each stream's live stage group.
-    const uint32_t n_indices = cache->is_swa() ? get_n_kv()*cache->get_kv_n_stream() :
-            (uses_shared_live_indices() ? cache->get_kv_n_stream() : get_n_kv());
-    ggml_tensor * res = ggml_new_tensor_1d(ctx, GGML_TYPE_I64, n_indices);
+    // SWA ring read: one absolute token position per output cache cell.
+    // Sized to the padded n_kv so the graph is reusable across batches; empty
+    // window cells are marked with idx < 0 and produce zero output.
+    const uint32_t n_kv = get_n_kv();
+    ggml_tensor * res = ggml_new_tensor_1d(ctx, GGML_TYPE_I64, n_kv);
     ggml_set_input(res);
     ggml_set_name(res, cache->is_swa() ?
             "attn_inp_kvarn_mat_idxs_swa" : "attn_inp_kvarn_read_idxs");
@@ -1037,13 +1100,6 @@ ggml_tensor * llama_kv_cache_kvarn_context::build_input_kvarn_mat_idxs(ggml_cont
 void llama_kv_cache_kvarn_context::set_input_kvarn_mat_idxs(ggml_tensor * dst, const llama_ubatch * ubatch) const {
     GGML_ASSERT(ggml_backend_buffer_is_host(dst->buffer));
     GGML_ASSERT(dst->type == GGML_TYPE_I64);
-
-    if (uses_shared_live_indices()) {
-        const auto indices = shared_live_indices();
-        GGML_ASSERT(indices.size() == size_t(dst->ne[0]));
-        std::memcpy(dst->data, indices.data(), indices.size()*sizeof(indices[0]));
-        return;
-    }
 
     if (uses_compact_read_indices()) {
         const auto & plan = compact_read_plan();
@@ -1056,57 +1112,40 @@ void llama_kv_cache_kvarn_context::set_input_kvarn_mat_idxs(ggml_tensor * dst, c
                 data[read] = cell;
                 continue;
             }
-            int32_t stage_slot = -1;
-            if (metadata->allocation_cell_uses_stage(uint32_t(cell))) {
-                const auto & sinfo = current_sinfo();
-                if (!sinfo.empty() && !sinfo.stage_slots.empty()) {
-                    for (uint32_t stream = 0; stream < sinfo.n_stream() && stage_slot < 0; ++stream) {
-                        for (size_t i = 0; i < sinfo.idxs[stream].size(); ++i) {
-                            if (sinfo.idxs[stream][i] == uint32_t(cell)) {
-                                stage_slot = int32_t(sinfo.stage_slots[stream][i]);
-                                break;
-                            }
-                        }
-                    }
-                }
-                if (stage_slot < 0) {
-                    stage_slot = metadata->allocation_cell_stage_slot(uint32_t(cell));
-                }
-                GGML_ASSERT(stage_slot >= 0);
-            }
-            data[read] = stage_slot >= 0 ?
-                    llama_kvarn_encode_stage_cell(uint32_t(cell), uint32_t(stage_slot)) : cell;
+            data[read] = metadata->allocation_cell_uses_stage(uint32_t(cell)) ?
+                    llama_kvarn_encode_stage_cell(uint32_t(cell)) : cell;
         }
         return;
     }
 
     const auto * kv = cache->get_metadata_cache();
-    const uint32_t n_stream = cache->get_kv_n_stream();
-    GGML_ASSERT(dst->ne[0] % n_stream == 0);
-    const uint32_t n_kv = uint32_t(dst->ne[0]) / n_stream;
+    const uint32_t n_kv = (uint32_t) dst->ne[0];
     int64_t * data = (int64_t *) dst->data;
 
-    for (uint32_t stream = 0; stream < n_stream; ++stream) {
-        const auto & cells = kv->get_cells(stream);
-        for (uint32_t cell = 0; cell < n_kv; ++cell) {
-            data[stream*n_kv + cell] = cells.is_empty(cell) ? -1 :
-                    llama_kvarn_encode_swa_position(stream, uint32_t(cells.pos_get(cell)));
+    // single stream for SWA ring
+    const auto & cells = kv->get_cells(0);
+    for (uint32_t cell = 0; cell < n_kv; ++cell) {
+        if (cells.is_empty(cell)) {
+            data[cell] = -1; // empty window cell
+        } else {
+            data[cell] = (int64_t) cells.pos_get(cell);
         }
     }
 
-    // Metadata commits after compute. Mirror pending target writes; shared MTP
-    // contexts have no K/V projections and read only committed target records.
-    if (ubatch != nullptr && shared_graph_layers.empty()) {
+    // During graph compute the metadata cells still hold the previous committed
+    // state; the current ubatch is committed only after compute. Mirror the
+    // pending SWA ring slot mapping here so native KVarN views use the same
+    // absolute positions as the K/V store and mask inputs for this graph.
+    if (ubatch != nullptr) {
         const auto & sinfo = current_sinfo();
         if (!sinfo.empty()) {
+            GGML_ASSERT(sinfo.n_stream() == 1);
             GGML_ASSERT(ubatch->n_tokens == sinfo.size()*sinfo.n_stream());
+
             for (uint32_t s = 0; s < sinfo.n_stream(); ++s) {
-                const uint32_t stream = sinfo.strm[s];
-                GGML_ASSERT(stream < n_stream);
                 for (uint32_t i = 0; i < sinfo.size(); ++i) {
                     GGML_ASSERT(sinfo.idxs[s][i] < n_kv);
-                    data[stream*n_kv + sinfo.idxs[s][i]] = llama_kvarn_encode_swa_position(
-                            stream, uint32_t(ubatch->pos[s*sinfo.size() + i]));
+                    data[sinfo.idxs[s][i]] = (int64_t) ubatch->pos[s*sinfo.size() + i];
                 }
             }
         }
@@ -1115,49 +1154,31 @@ void llama_kv_cache_kvarn_context::set_input_kvarn_mat_idxs(ggml_tensor * dst, c
 
 void llama_kv_cache_kvarn_context::set_input_k_idxs(ggml_tensor * dst, const llama_ubatch * ubatch) const {
     if (cache->is_swa()) {
+        // SWA ring store: indices carry absolute token positions (one per input token).
+        // The store op decodes group = idx/128, pos = idx%128 and maps the group into a
+        // ring slot. The metadata cache's own cell ordering is irrelevant to the records.
         GGML_ASSERT(ggml_backend_buffer_is_host(dst->buffer));
         int64_t * data = (int64_t *) dst->data;
-        const auto & sinfo = current_sinfo();
-        GGML_ASSERT(ubatch->n_tokens == sinfo.size()*sinfo.n_stream());
-        for (uint32_t s = 0; s < sinfo.n_stream(); ++s) {
-            for (uint32_t i = 0; i < sinfo.size(); ++i) {
-                data[s*sinfo.size() + i] = llama_kvarn_encode_swa_position(
-                        sinfo.strm[s], uint32_t(ubatch->pos[s*sinfo.size() + i]));
-            }
+        const uint32_t n_tokens = ubatch->n_tokens;
+        for (uint32_t i = 0; i < n_tokens; ++i) {
+            data[i] = (int64_t) ubatch->pos[i];
         }
         return;
     }
     base()->set_input_k_idxs(dst, ubatch);
-    if (cache->uses_compact_read_indices()) {
-        GGML_ASSERT(ggml_backend_buffer_is_host(dst->buffer));
-        const auto & sinfo = current_sinfo();
-        GGML_ASSERT(sinfo.n_stream() == 1 && !sinfo.stage_slots.empty() &&
-                sinfo.stage_slots[0].size() == ubatch->n_tokens);
-        auto * data = static_cast<int64_t *>(dst->data);
-        for (uint32_t i = 0; i < ubatch->n_tokens; ++i) {
-            data[i] = llama_kvarn_encode_store_cell(
-                    llama_kvarn_decode_cell(data[i]), sinfo.stage_slots[0][i]);
-        }
-    }
 }
 
 void llama_kv_cache_kvarn_context::set_input_v_idxs(ggml_tensor * dst, const llama_ubatch * ubatch) const {
     if (cache->is_swa()) {
-        set_input_k_idxs(dst, ubatch);
+        GGML_ASSERT(ggml_backend_buffer_is_host(dst->buffer));
+        int64_t * data = (int64_t *) dst->data;
+        const uint32_t n_tokens = ubatch->n_tokens;
+        for (uint32_t i = 0; i < n_tokens; ++i) {
+            data[i] = (int64_t) ubatch->pos[i];
+        }
         return;
     }
     base()->set_input_v_idxs(dst, ubatch);
-    if (cache->uses_compact_read_indices()) {
-        GGML_ASSERT(ggml_backend_buffer_is_host(dst->buffer));
-        const auto & sinfo = current_sinfo();
-        GGML_ASSERT(sinfo.n_stream() == 1 && !sinfo.stage_slots.empty() &&
-                sinfo.stage_slots[0].size() == ubatch->n_tokens);
-        auto * data = static_cast<int64_t *>(dst->data);
-        for (uint32_t i = 0; i < ubatch->n_tokens; ++i) {
-            data[i] = llama_kvarn_encode_store_cell(
-                    llama_kvarn_decode_cell(data[i]), sinfo.stage_slots[0][i]);
-        }
-    }
 }
 
 void llama_kv_cache_kvarn_context::set_input_tail_idxs(
@@ -1171,27 +1192,11 @@ void llama_kv_cache_kvarn_context::set_input_tail_body_idxs(ggml_tensor * dst) c
 
 void llama_kv_cache_kvarn_context::set_input_k_idxs_backend(ggml_tensor * dst, const llama_ubatch * ubatch) const {
     if (cache->is_swa()) {
-        const auto & sinfo = current_sinfo();
-        GGML_ASSERT(ubatch->n_tokens == sinfo.size()*sinfo.n_stream());
-        std::vector<int64_t> data(ubatch->n_tokens);
-        for (uint32_t s = 0; s < sinfo.n_stream(); ++s) {
-            for (uint32_t i = 0; i < sinfo.size(); ++i) {
-                data[s*sinfo.size() + i] = llama_kvarn_encode_swa_position(
-                        sinfo.strm[s], uint32_t(ubatch->pos[s*sinfo.size() + i]));
-            }
-        }
-        ggml_backend_tensor_set(dst, data.data(), 0, data.size() * sizeof(int64_t));
-        return;
-    }
-    if (cache->uses_compact_read_indices()) {
-        const auto & sinfo = current_sinfo();
-        GGML_ASSERT(sinfo.n_stream() == 1 && !sinfo.stage_slots.empty() &&
-                sinfo.stage_slots[0].size() == ubatch->n_tokens);
         std::vector<int64_t> data(ubatch->n_tokens);
         for (uint32_t i = 0; i < ubatch->n_tokens; ++i) {
-            data[i] = llama_kvarn_encode_store_cell(sinfo.idxs[0][i], sinfo.stage_slots[0][i]);
+            data[i] = (int64_t) ubatch->pos[i];
         }
-        ggml_backend_tensor_set(dst, data.data(), 0, data.size()*sizeof(int64_t));
+        ggml_backend_tensor_set(dst, data.data(), 0, data.size() * sizeof(int64_t));
         return;
     }
     base()->set_input_k_idxs_backend(dst, ubatch);
@@ -1199,27 +1204,11 @@ void llama_kv_cache_kvarn_context::set_input_k_idxs_backend(ggml_tensor * dst, c
 
 void llama_kv_cache_kvarn_context::set_input_v_idxs_backend(ggml_tensor * dst, const llama_ubatch * ubatch) const {
     if (cache->is_swa()) {
-        const auto & sinfo = current_sinfo();
-        GGML_ASSERT(ubatch->n_tokens == sinfo.size()*sinfo.n_stream());
-        std::vector<int64_t> data(ubatch->n_tokens);
-        for (uint32_t s = 0; s < sinfo.n_stream(); ++s) {
-            for (uint32_t i = 0; i < sinfo.size(); ++i) {
-                data[s*sinfo.size() + i] = llama_kvarn_encode_swa_position(
-                        sinfo.strm[s], uint32_t(ubatch->pos[s*sinfo.size() + i]));
-            }
-        }
-        ggml_backend_tensor_set(dst, data.data(), 0, data.size() * sizeof(int64_t));
-        return;
-    }
-    if (cache->uses_compact_read_indices()) {
-        const auto & sinfo = current_sinfo();
-        GGML_ASSERT(sinfo.n_stream() == 1 && !sinfo.stage_slots.empty() &&
-                sinfo.stage_slots[0].size() == ubatch->n_tokens);
         std::vector<int64_t> data(ubatch->n_tokens);
         for (uint32_t i = 0; i < ubatch->n_tokens; ++i) {
-            data[i] = llama_kvarn_encode_store_cell(sinfo.idxs[0][i], sinfo.stage_slots[0][i]);
+            data[i] = (int64_t) ubatch->pos[i];
         }
-        ggml_backend_tensor_set(dst, data.data(), 0, data.size()*sizeof(int64_t));
+        ggml_backend_tensor_set(dst, data.data(), 0, data.size() * sizeof(int64_t));
         return;
     }
     base()->set_input_v_idxs_backend(dst, ubatch);
@@ -1369,6 +1358,7 @@ llama_kv_cache_kvarn::llama_kv_cache_kvarn(
         metadata->set_allocation_group_size(KVAR_N_GROUP, n_stream == 1 ? tail_groups : 1u);
     }
     if (swa) {
+        GGML_ASSERT(n_stream == 1 && "SWA KVarN ring requires a single-stream cache");
         const uint32_t in_flight_groups = std::max<uint32_t>(1u, (n_ubatch + KVAR_N_GROUP - 1u) / KVAR_N_GROUP);
         // Backstop for the ring-size invariant above: the record ring must have
         // enough slots for the compressed portion of the worst-case visible tile
@@ -1436,6 +1426,13 @@ llama_kv_cache_kvarn::llama_kv_cache_kvarn(
                 "KVarN cache layer %u is assigned to backend %s, which cannot store and materialize KVarN records",
                 il, dev ? ggml_backend_dev_name(dev) : "unknown"));
         }
+        const uint32_t layer_record_layout = llama_kvarn_backend_record_layout(dev);
+        if (!record_layout_initialized) {
+            record_layout = layer_record_layout;
+            record_layout_initialized = true;
+        } else if (record_layout != layer_record_layout) {
+            throw std::runtime_error("KVarN cache layers use incompatible physical record layouts");
+        }
         auto * buft = offload ? ggml_backend_dev_buffer_type(dev) : ggml_backend_cpu_buffer_type();
         auto * ctx = ctx_for_buft(buft);
         if (!ctx) {
@@ -1457,7 +1454,7 @@ llama_kv_cache_kvarn::llama_kv_cache_kvarn(
             (!explicit_bias && kvarn_backend_supports_native_tail(
                 dev, exact_tail_type, head_dim_k, head_dim_v));
         const bool native_attention =
-            llama_kvarn_backend_supports_native_ops(dev) && native_tail && !(swa && n_stream > 1);
+            llama_kvarn_backend_supports_native_ops(dev) && native_tail;
         const bool mixed_tail_native = native_attention &&
             llama_kvarn_backend_mixed_tail_native_preferred(dev);
         const bool native_original_v = native_attention &&
@@ -1855,11 +1852,19 @@ bool llama_kv_cache_kvarn::get_can_shift() const {
 }
 
 llama_memory_i::seq_rm_capability llama_kv_cache_kvarn::get_seq_rm_capability() const {
-    // Metadata can discard an unbounded suffix because KVarN owns the body, but
-    // this cache only guarantees exact in-place rollback through the current
-    // and previous staged record.
-    return llama_memory_clamp_suffix_rollback_capability(
-            metadata->get_seq_rm_capability(), KVAR_N_GROUP);
+    auto capability = metadata->get_seq_rm_capability();
+    // The metadata cache alone does not describe what this cache can undo:
+    // can_remove() puts the KVarN group rule on top of it. That rule
+    // (llama_kvarn_can_remove_range) accepts any suffix whose start stays at or
+    // after max(0, live_group - 1) * KVAR_N_GROUP, so counting back from
+    // pos_max at least KVAR_N_GROUP tokens are always removable in place -
+    // the worst case is pos_max exactly on a group boundary, where the previous
+    // group is still resident in its own F16 stage slot (tail_groups = 2).
+    // Anything deeper is refused, hence the clamp rather than a pass-through.
+    capability.arbitrary_ranges = false;
+    capability.suffix_rollback_tokens = std::min(
+            capability.suffix_rollback_tokens, uint32_t(KVAR_N_GROUP));
+    return capability;
 }
 
 void llama_kv_cache_kvarn::clear(bool data) {
@@ -1942,18 +1947,22 @@ bool llama_kv_cache_kvarn::seq_rm_plan(
 bool llama_kv_cache_kvarn::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
     apply_pending_stream_copies(nullptr);
     if (!can_seq_rm(seq_id, p0, p1)) {
-        const bool valid_seq = seq_id >= 0 && uint32_t(seq_id) < n_seq_max;
-        const llama_pos pos_min = valid_seq ? metadata->seq_pos_min(seq_id) : -1;
-        const llama_pos pos_max = valid_seq ? metadata->seq_pos_max(seq_id) : -1;
+        // Отказ обязан быть разбираем по журналу: без чисел он не отличает
+        // «слишком глубокий откат» от «сегмента нет в метаданных» и от выхода
+        // seq_id за n_seq_max. Разбор отказа при мультимодальном черновике
+        // упирался ровно в отсутствие этих чисел.
+        const llama_pos pos_max = (seq_id >= 0 && uint32_t(seq_id) < n_seq_max)
+            ? metadata->seq_pos_max(seq_id) : -1;
+        const llama_pos pos_min = (seq_id >= 0 && uint32_t(seq_id) < n_seq_max)
+            ? metadata->seq_pos_min(seq_id) : -1;
         const llama_pos earliest_exact =
-                std::max<llama_pos>(0, pos_max / llama_pos(KVAR_N_GROUP) - 1) *
-                llama_pos(KVAR_N_GROUP);
+            std::max<llama_pos>(0, pos_max / llama_pos(KVAR_N_GROUP) - 1) * llama_pos(KVAR_N_GROUP);
         LLAMA_LOG_WARN("%s: KVarN can only remove a complete sequence or the current/previous fp16 tail groups "
                        "(seq_id = %d, p0 = %d, p1 = %d, seq_pos_min = %d, seq_pos_max = %d, "
                        "group = %u, earliest_exact = %d, meta_can_seq_rm = %d)\n",
                        __func__, seq_id, p0, p1, pos_min, pos_max,
-                       unsigned(KVAR_N_GROUP), earliest_exact,
-                       int(metadata->can_seq_rm(seq_id, p0, p1)));
+                       (unsigned) KVAR_N_GROUP, earliest_exact,
+                       (int) metadata->can_seq_rm(seq_id, p0, p1));
         return false;
     }
     return metadata->seq_rm(seq_id, p0, p1);
@@ -2070,7 +2079,7 @@ bool llama_kv_cache_kvarn::state_seq_can_save(
     }
     const bool selective = (flags & (LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY |
                                      LLAMA_STATE_SEQ_FLAGS_SELF_CONTAINED)) != 0;
-    if (swa && !stream_is_exclusive_for(seq_id)) {
+    if (swa && (flags & LLAMA_STATE_SEQ_FLAGS_SELF_CONTAINED) != 0 && !stream_is_exclusive_for(seq_id)) {
         return false;
     }
     return !has_pending_stream_copies() && (selective || stream_is_exclusive_for(seq_id));
@@ -2083,7 +2092,7 @@ bool llama_kv_cache_kvarn::state_seq_can_restore(
     }
     const bool selective = (flags & (LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY |
                                      LLAMA_STATE_SEQ_FLAGS_SELF_CONTAINED)) != 0;
-    if (swa && !stream_is_exclusive_for(seq_id)) {
+    if (swa && (flags & LLAMA_STATE_SEQ_FLAGS_SELF_CONTAINED) != 0 && !stream_is_exclusive_for(seq_id)) {
         return false;
     }
     return !has_pending_stream_copies() && (selective || stream_is_exclusive_for(seq_id));
@@ -2227,14 +2236,6 @@ uint64_t llama_kv_cache_kvarn::get_kv_tail_planner_timing_ns() const {
 }
 
 void llama_kv_cache_kvarn::state_write(llama_io_write_i & io, llama_seq_id seq_id, llama_state_seq_flags flags) const {
-    // Unlike the dense cache, a sliding ring overwrites its historical body.
-    // A partial checkpoint must own that ring, not reference its live records.
-    if (swa && (flags & LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY) != 0) {
-        if ((flags & LLAMA_STATE_SEQ_FLAGS_SELF_CONTAINED) != 0 || !stream_is_exclusive_for(seq_id)) {
-            throw std::invalid_argument("KVarN SWA partial state requires an exclusive stream and non-conflicting flags");
-        }
-        flags &= ~LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY;
-    }
     metadata->state_write(io, seq_id, flags);
     const bool partial_state = (flags & LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY) != 0 && seq_id >= 0;
     const bool self_contained = (flags & LLAMA_STATE_SEQ_FLAGS_SELF_CONTAINED) != 0 && seq_id >= 0;
@@ -2265,12 +2266,13 @@ void llama_kv_cache_kvarn::state_write(llama_io_write_i & io, llama_seq_id seq_i
     const uint32_t n_saved_streams = saved_streams.size();
     io.write(&type, sizeof(type));
     io.write(&n_layers, sizeof(n_layers));
+    io.write(&record_layout, sizeof(record_layout));
     io.write(&n_saved_streams, sizeof(n_saved_streams));
     for (const uint32_t stream : saved_streams) {
         io.write(&stream, sizeof(stream));
     }
-    // Each SWA stream is a complete position-addressed ring. Full state saves
-    // preserve every selected stream independently.
+    // A single-sequence SWA ring is already self-contained as a complete
+    // position-addressed ring. Multi-slot iSWA uses the standard-SWA fallback.
     const uint32_t state_kind = self_contained && !swa ? KVAR_N_STATE_RECORDS_SELECTIVE :
             (partial_state ? KVAR_N_STATE_STAGE_ONLY_PARTIAL :
                 (!swa && n_stream == 1 ? KVAR_N_STATE_RECORDS_FULL_REMAP_STAGE :
@@ -2362,8 +2364,7 @@ void llama_kv_cache_kvarn::state_write(llama_io_write_i & io, llama_seq_id seq_i
                 stage_groups,
                 tail_groups,
                 swa,
-                swa ? nullptr : &staged_groups,
-                swa ? nullptr : &metadata->get_allocation_stage_slots());
+                swa ? nullptr : &staged_groups);
     }
     if (selective_stage_cells.size() > std::numeric_limits<uint32_t>::max()) {
         throw std::overflow_error("KVarN selective stage row count overflows uint32_t");
@@ -2488,38 +2489,24 @@ void llama_kv_cache_kvarn::state_write(llama_io_write_i & io, llama_seq_id seq_i
 }
 
 bool llama_kv_cache_kvarn_context::uses_native_attention(int32_t il) const {
-    return shared_graph_layers.empty() && cache->uses_native_attention(graph_layer_for(il));
+    return cache->uses_native_attention(il);
 }
 
 bool llama_kv_cache_kvarn_context::mixed_tail_native_preferred(int32_t il) const {
-    return shared_graph_layers.empty() && cache->mixed_tail_native_preferred(il);
+    return cache->mixed_tail_native_preferred(il);
 }
 
 bool llama_kv_cache_kvarn_context::native_attention_uses_original_v(int32_t il) const {
-    return shared_graph_layers.empty() && cache->native_attention_uses_original_v(il);
+    return cache->native_attention_uses_original_v(il);
 }
 
 uint32_t llama_kv_cache_kvarn_context::native_rotated_max_query_tokens(int32_t il) const {
-    return shared_graph_layers.empty() ? cache->native_rotated_max_query_tokens(il) : 0;
+    return cache->native_rotated_max_query_tokens(il);
 }
 
 void llama_kv_cache_kvarn::state_read(llama_io_read_i & io, llama_seq_id seq_id, llama_state_seq_flags flags) {
-    state_read_sinfo(io, seq_id, flags, nullptr, nullptr);
-}
-
-void llama_kv_cache_kvarn::state_read_sinfo(
-        llama_io_read_i & io, llama_seq_id seq_id, llama_state_seq_flags flags,
-        llama_kv_cache::slot_info_vec_t * sinfos_out,
-        const llama_kv_cache::slot_info_vec_t * sinfos_in) {
     if (has_pending_stream_copies()) {
         throw std::runtime_error("cannot restore KVarN state while a stream copy is pending");
-    }
-
-    if (swa && (flags & LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY) != 0) {
-        if ((flags & LLAMA_STATE_SEQ_FLAGS_SELF_CONTAINED) != 0 || !stream_is_exclusive_for(seq_id)) {
-            throw std::invalid_argument("KVarN SWA partial state requires an exclusive stream and non-conflicting flags");
-        }
-        flags &= ~LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY;
     }
 
     // Parse into a restore-only metadata cache. The live metadata remains
@@ -2533,7 +2520,7 @@ void llama_kv_cache_kvarn::state_read_sinfo(
     if (self_contained) {
         metadata_prepared->set_state_remap_group_size(KVAR_N_GROUP);
     }
-    metadata_prepared->state_read_sinfo(io, seq_id, flags, sinfos_out, sinfos_in);
+    metadata_prepared->state_read(io, seq_id, flags);
     const auto & state_cell_remap_pairs = metadata_prepared->get_state_cell_remap();
     std::unordered_map<uint32_t, uint32_t> state_cell_remap(
             state_cell_remap_pairs.begin(), state_cell_remap_pairs.end());
@@ -2556,6 +2543,17 @@ void llama_kv_cache_kvarn::state_read_sinfo(
         throw std::runtime_error(
             "incompatible KVarN cache state version 11: canonical exact-tail payloads are absent; "
             "re-save the prompt cache with this build");
+    }
+
+    uint32_t saved_record_layout = GGML_BACKEND_KVARN_RECORD_LAYOUT_ROW_MAJOR;
+    if (version >= 17) {
+        io.read(&saved_record_layout, sizeof(saved_record_layout));
+    }
+    if (saved_record_layout != record_layout) {
+        throw std::runtime_error(format(
+                "KVarN cache record layout mismatch: state has %u, cache has %u; "
+                "re-save the prompt cache with this build",
+                saved_record_layout, record_layout));
     }
 
     uint32_t n_saved_streams;
@@ -2699,9 +2697,6 @@ void llama_kv_cache_kvarn::state_read_sinfo(
         throw std::runtime_error("invalid KVarN sequence stream");
     }
     if (state_kind == KVAR_N_STATE_STAGE_ONLY_PARTIAL) {
-        if (swa) {
-            throw std::runtime_error("legacy KVarN SWA partial state lacks checkpoint-owned ring records; re-save the checkpoint");
-        }
         if (seq_id < 0) {
             throw std::runtime_error("KVarN stage-only state requires a destination sequence");
         }
@@ -2763,8 +2758,7 @@ void llama_kv_cache_kvarn::state_read_sinfo(
                 stage_groups,
                 tail_groups,
                 swa,
-                swa ? nullptr : &staged_groups,
-                swa ? nullptr : &metadata_prepared->get_allocation_stage_slots());
+                swa ? nullptr : &staged_groups);
         for (const auto & cell : desired) {
             desired_stage_rows.emplace(cell.source_cell, cell.stage_row);
         }
@@ -2932,7 +2926,7 @@ void llama_kv_cache_kvarn::state_read_sinfo(
                   n_selective_stage_cells, selective_stage_bytes,
                   log_function,
                   exact_payload_bytes, exact_destination_runs, exact_tensor_ops, on_device]() mutable {
-        metadata->swap_logical_state_from(**prepared_owner);
+        metadata.swap(*prepared_owner);
         LLAMA_LOG_DEBUG(
                 "%s: KVarN state restore: kind=%s version=%u stage_rows=%u stage_bytes=%llu "
                 "payloads=%u tail_bytes=%llu runs=%zu tensor_ops=%zu device=%s\n",
@@ -2947,38 +2941,6 @@ void llama_kv_cache_kvarn::state_read_sinfo(
 
 llama_kv_cache * llama_kv_cache_kvarn::get_metadata_cache() const {
     return metadata.get();
-}
-
-ggml_tensor * llama_kv_cache_kvarn::get_materialization_source(int32_t il, bool value) const {
-    const auto & layer = layer_for(il);
-    return value ? layer.v_stage : layer.k_stage;
-}
-
-std::unique_ptr<llama_kv_cache> llama_kv_cache_kvarn::make_shared_metadata_cache(
-        const llama_model & model_view) const {
-    return std::make_unique<llama_kv_cache>(
-            model_view,
-            model_view.hparams,
-            GGML_TYPE_F16,
-            GGML_TYPE_F16,
-            false,
-            false,
-            n_stream == 1,
-            kv_size,
-            n_seq_max,
-            metadata_n_pad,
-            metadata_n_swa,
-            metadata_swa_type,
-            metadata.get(),
-            [](int32_t) { return false; },
-            nullptr,
-            nullptr,
-            metadata_n_ubatch,
-            0,
-            GGML_TYPE_F16,
-            0,
-            false,
-            0);
 }
 
 int32_t llama_kv_cache_kvarn::mapped_layer_id(int32_t il) const {
@@ -3143,8 +3105,7 @@ ggml_tensor * llama_kv_cache_kvarn::materialize(
         uint32_t n_kv,
         const llama_kv_cache::slot_info & sinfo,
         bool value,
-        ggml_tensor * mat_idxs,
-        bool read_indirect) const {
+        ggml_tensor * mat_idxs) const {
     const auto & layer = layer_for(il);
     const uint32_t stream_start = sinfo.s0;
     const uint32_t stream_count = sinfo.s1 - sinfo.s0 + 1;
@@ -3169,7 +3130,7 @@ ggml_tensor * llama_kv_cache_kvarn::materialize(
     result->op_params[6] = swa ? 1 : 0;
     result->op_params[8] = int32_t(tail_groups);
     result->op_params[9] = 1;
-    result->op_params[10] = !swa && mat_idxs && read_indirect ? 1 : 0;
+    result->op_params[10] = !swa && mat_idxs ? 1 : 0;
     const uint32_t slices = value ? layer.v_slices : layer.k_slices;
     if (slices > 1) {
         result = ggml_reshape_4d(
