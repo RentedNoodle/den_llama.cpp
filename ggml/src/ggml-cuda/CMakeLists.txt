@@ -132,6 +132,13 @@ if (CUDAToolkit_FOUND)
             template-instances/fattn-vec-instance-q4_g64-q8_0.cu)
     endif()
 
+    if (GGML_CUDA_KVARN)
+        add_compile_definitions(GGML_CUDA_KVARN)
+    else()
+        list(FILTER GGML_SOURCES_CUDA EXCLUDE REGEX "kvarn")
+        list(FILTER GGML_HEADERS_CUDA EXCLUDE REGEX "kvarn")
+    endif()
+
     ggml_add_backend_library(ggml-cuda
                              ${GGML_HEADERS_CUDA}
                              ${GGML_SOURCES_CUDA}
