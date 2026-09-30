@@ -1171,6 +1171,7 @@ static __device__ __forceinline__ void flash_attn_ext_f16_process_tile(
         const float  * const __restrict__ sinks_f,
         float2       * const __restrict__ dstk,
         float2       * const __restrict__ dstk_fixup,
+        float2       * const __restrict__ dst_final_meta,
         const float scale,
         const float slope,
         const float logit_softcap,
@@ -1226,6 +1227,13 @@ static __device__ __forceinline__ void flash_attn_ext_f16_process_tile(
     half2 * tile_K    = Q_in_reg              ? tile_Q                             : tile_Q + ncols     * stride_tile_Q;
     half2 * tile_V    =           nstages > 1 ? tile_K + nbatch_fa * stride_tile_K : tile_K;
     half  * tile_mask = (half *) (nstages > 1 ? tile_V + nbatch_fa * stride_tile_V : tile_V + nbatch_fa * stride_tile_KV_max);
+    half * kvarn_smem = tile_mask + ncols1 * (nbatch_fa + 8);
+
+    constexpr bool cache_kvarn_record_axes =
+        type_K == GGML_CUDA_FATTN_KVARN_TYPE && type_V == GGML_CUDA_FATTN_KVARN_TYPE;
+    if constexpr (cache_kvarn_record_axes) {
+        static_assert(DKQ == DV, "rotated KVarN K/V axes require matching attention head dimensions");
+    }
 
     T_B_KQ    Q_B[(Q_in_reg ? DKQ/(2*T_B_KQ::J) : 1)];
 #if defined(TURING_MMA_AVAILABLE)
@@ -1886,12 +1894,12 @@ static __global__ void flash_attn_ext_f16(
         if (kb0_start == 0) {
             constexpr bool needs_fixup = false; // CUDA block is working on an entire tile.
             flash_attn_ext_f16_process_tile<DKQ, DV, ncols1, ncols2, nwarps, use_logit_softcap, V_is_K_view, needs_fixup, is_fixup, output_partial>
-                (Q_f2, K_h2, V_h2, mask_h, sinks_f, dstk, dst_meta_tile, scale, slope, logit_softcap,
+                (Q_f2, K_h2, V_h2, mask_h, sinks_f, dstk, dst_meta_tile, nullptr, scale, slope, logit_softcap,
                  ne01, ne02, gqa_ratio, ne11, stride_Q1, stride_Q2, stride_K, stride_V, stride_mask, jt, zt_gqa, kb0_start, kb0_stop);
         } else {
             constexpr bool needs_fixup = true; // CUDA block is missing the beginning of a tile.
             flash_attn_ext_f16_process_tile<DKQ, DV, ncols1, ncols2, nwarps, use_logit_softcap, V_is_K_view, needs_fixup, is_fixup, output_partial>
-                (Q_f2, K_h2, V_h2, mask_h, sinks_f, dstk, dst_meta_tile, scale, slope, logit_softcap,
+                (Q_f2, K_h2, V_h2, mask_h, sinks_f, dstk, dst_meta_tile, nullptr, scale, slope, logit_softcap,
                  ne01, ne02, gqa_ratio, ne11, stride_Q1, stride_Q2, stride_K, stride_V, stride_mask, jt, zt_gqa, kb0_start, kb0_stop);
         }
 
@@ -1934,7 +1942,7 @@ static __global__ void flash_attn_ext_f16(
     constexpr bool is_fixup = true; // Last index writes its data to fixup buffer to avoid data races with other blocks.
     constexpr bool needs_fixup = false;
     flash_attn_ext_f16_process_tile<DKQ, DV, ncols1, ncols2, nwarps, use_logit_softcap, V_is_K_view, needs_fixup, is_fixup, output_partial>
-        (Q_f2, K_h2, V_h2, mask_h, sinks_f, dstk, dst_meta_tile, scale, slope, logit_softcap,
+        (Q_f2, K_h2, V_h2, mask_h, sinks_f, dstk, dst_meta_tile, nullptr, scale, slope, logit_softcap,
          ne01, ne02, gqa_ratio, ne11, stride_Q1, stride_Q2, stride_K, stride_V, stride_mask, jt, zt_gqa, kb0_start, kb0_stop);
 #else
     GGML_UNUSED_VARS(Q_ptr, K_ptr, V_ptr, mask_ptr, sinks_ptr, KV_max_ptr, dst_ptr, dst_meta_ptr, scale,
