@@ -39,9 +39,10 @@ public:
                      bool   unified,
                             /* layer filters */
     const layer_filter_cb & filter_attn = nullptr,
-    const layer_filter_cb & filter_recr = nullptr,
-                    int32_t   kv_high_precision_layers = 0,
-                     size_t kv_stream_stage_bytes = 0);
+        const layer_filter_cb & filter_recr = nullptr,
+                        int32_t   kv_high_precision_layers = 0,
+                         size_t kv_stream_stage_bytes = 0,
+                         bool   replay = false);
 
     ~llama_memory_hybrid() = default;
 

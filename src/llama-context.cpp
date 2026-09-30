@@ -287,6 +287,8 @@ llama_context::llama_context(
 
     cparams.ctx_other = nullptr;
 
+    // MTP draft context needs the target so KVMem can size the follower
+    // slot-pool from the target pool instead of n_ctx.
     if (params.ctx_type == LLAMA_CONTEXT_TYPE_MTP) {
         cparams.ctx_other = params.ctx_other;
     }
@@ -1663,7 +1665,7 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
     // matching res_alloced is set back to null.
     if (!graph_reuse_disable && res->can_reuse(gparams) && res == res_alloced
 #if defined(LLAMA_KVMEM)
-        && llama_kvmem_capture_can_reuse(ubatch.n_tokens, ubatch.n_pos, ubatch.pos,
+        && llama_kvmem_capture_can_reuse(ubatch.n_tokens, 1, ubatch.logical_pos ? ubatch.logical_pos : ubatch.pos,
                                          gtype == LLM_GRAPH_TYPE_DECODER_MTP)
 #endif
             ) {

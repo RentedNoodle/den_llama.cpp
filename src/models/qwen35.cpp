@@ -284,6 +284,7 @@ ggml_tensor * llama_model_qwen35::graph::build_layer_attn(
     // Apply Q normalization
     Qcur = build_norm(Qcur, model.layers[il].attn_q_norm, nullptr, LLM_NORM_RMS, il);
     cb(Qcur, "Qcur_normed", il);
+    kvmem_capture_q(Qcur, il);
 
     kvmem_capture_q(Qcur, il);
 

@@ -481,6 +481,31 @@ void llama_kv_cache::clear(bool data) {
     }
 }
 
+bool llama_kv_cache::seq_rm_logical(llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
+    p0 = std::max<llama_pos>(p0, 0);
+    p1 = p1 < 0 ? std::numeric_limits<llama_pos>::max() : p1;
+    for (uint32_t s = 0; s < n_stream; ++s) {
+        auto & cells = v_cells[s];
+        for (uint32_t i = 0; i < cells.size(); ++i) {
+            if (cells.is_empty(i)) {
+                continue;
+            }
+            const auto logical = cells.ext_get(i).logical_pos;
+            const auto p = logical >= 0 ? logical : cells.pos_get(i);
+            if (p < p0 || p >= p1 || (seq_id >= 0 && !cells.seq_has(i, seq_id))) {
+                continue;
+            }
+            if (seq_id < 0) {
+                cells.rm(i);
+            } else {
+                cells.seq_rm(i, seq_id);
+            }
+            v_heads[s] = std::min(v_heads[s], i);
+        }
+    }
+    return true;
+}
+
 bool llama_kv_cache::seq_rm(llama_seq_id seq_id, llama_pos p0, llama_pos p1) {
     // TODO: refactor [TAG_KV_CACHE_SHARE_CELLS]
     if (other) {
@@ -1232,8 +1257,9 @@ void llama_kv_cache::apply_ubatch(const slot_info & sinfo, const llama_ubatch & 
 
             cells.pos_set(idx, ubatch.pos[i]);
 
-            if (ubatch.is_pos_2d() || ubatch.token || hparams.ple_n_heads > 0) {
+            if (ubatch.is_pos_2d() || ubatch.token || ubatch.logical_pos || hparams.ple_n_heads > 0) {
                 llama_kv_cell_ext ext;
+                ext.logical_pos = ubatch.logical_pos ? ubatch.logical_pos[i] : ubatch.pos[i];
 
                 if (ubatch.is_pos_2d()) {
                     ext.x = ubatch.pos[i + ubatch.n_tokens*2];
