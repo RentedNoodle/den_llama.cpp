@@ -14,6 +14,9 @@
 #include "llama-ext.h"
 #include "llama-sampler.h"
 #include "llama.h"
+#if defined(LLAMA_KVMEM)
+#include "llama-kvmem-hooks.h"
+#endif
 
 #include <cinttypes>
 #include <cmath>
@@ -1658,7 +1661,12 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
     // res == res_alloced: a matching topology alone is not enough, the graph must also
     // still hold its scheduler allocation. Everywhere the scheduler is reset, the
     // matching res_alloced is set back to null.
-    if (!graph_reuse_disable && res->can_reuse(gparams) && res == res_alloced) {
+    if (!graph_reuse_disable && res->can_reuse(gparams) && res == res_alloced
+#if defined(LLAMA_KVMEM)
+        && llama_kvmem_capture_can_reuse(ubatch.n_tokens, ubatch.n_pos, ubatch.pos,
+                                         gtype == LLM_GRAPH_TYPE_DECODER_MTP)
+#endif
+            ) {
         //LLAMA_LOG_DEBUG("%s: reusing previous graph\n", __func__);
 
         // with pipeline parallelism, the previous graph_compute_async may still be running
@@ -1677,6 +1685,9 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
 
         //const auto t_start_us = ggml_time_us();
 
+#if defined(LLAMA_KVMEM)
+        llama_kvmem_capture_on_new_graph(gtype == LLM_GRAPH_TYPE_DECODER_MTP);
+#endif
         gf = model.build_graph(gparams);
 
         //LLAMA_LOG_INFO("graph build time: %.3f ms\n", (ggml_time_us() - t_start_us)/1000.0);
@@ -1712,6 +1723,10 @@ llm_graph_result * llama_context::process_ubatch(const llama_ubatch & ubatch, ll
         ret = status;
         return nullptr;
     }
+
+#if defined(LLAMA_KVMEM)
+    llama_kvmem_harvest_ubatch(sched.get(), gtype == LLM_GRAPH_TYPE_DECODER_MTP);
+#endif
 
     ret = GGML_STATUS_SUCCESS;
 
