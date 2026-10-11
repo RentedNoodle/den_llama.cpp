@@ -342,20 +342,27 @@ Den builds on open work. Credits, without license tags, per the project's conven
 
 - **[llama.cpp](https://github.com/ggml-org/llama.cpp)** (Georgi Gerganov): ggml, the CUDA backend, and the base inference engine.
 - **[ik_llama.cpp](https://github.com/ikawrakow/ik_llama.cpp)** (Ivan Kawrakow): expert offloading, speculative decode, and the MXFP4 and NVFP4 inference lineage.
+- **[NInfer](https://github.com/Neroued/ninfer)** (Neroued): the sm_120 engine this fork descends from.
 - **[Qwen](https://github.com/QwenLM/Qwen3.8)** (Qwen team): the Qwen3.8 hybrid architecture (gated-delta-net plus attention) and FP4-tolerant KV.
 
-### KV, quantization, and speculation
+### KV, quantization, and prediction
 
-- **[BeeLlama](https://github.com/TNB-AR/beellama.cpp)** (Anbeeld): the KVarN KV cache and precision-tail lineage.
+- **[BeeLlama](https://github.com/Anbeeld/beellama.cpp)** (Anbeeld): the KVarN KV cache, precision-tail lineage, and the reasoning-loop guard.
+- **[Lobo](https://github.com/alectodescent/lobo-qwen38-16gb)** (alectodescent): the KVarN-on-Blackwell build whose kernels this fork carries byte-identical, and its measured K4V2 target-only baseline.
+- **[unsloth](https://github.com/unslothai/unsloth)** (Unsloth): NVFP4 weight-quantization research and the reference quantization of the ship model.
+- **[GSQ](https://github.com/IST-DASLab/GSQ) and [RCO](https://github.com/IST-DASLab/RCO)** (ISTA-DASLab): the mixed-precision GSQ-RCO quantization lineage of the ship model.
 - **[llama.cpp-adaptive-kv-streaming](https://github.com/RaymondHuang210129/llama.cpp-adaptive-kv-streaming)** (Raymond Huang): the adaptive KV streaming path carried in this fork.
-- **[unsloth](https://unsloth.ai/)**: NVFP4 weight-quantization research and the reference quantization of the ship model.
-- **[gem16](https://github.com/Danmoreng/gem16)** (Danmoreng): checkpoint-FP8 KV and resident execution plans on Blackwell.
-- **[AEON-7](https://github.com/AEON-7)**: NVFP4 compression and mixed precision.
-- **[Strata](https://github.com/Niko1221/Strata)** (Niko1221): engine design and documented serving failure modes.
+- **[KVMem](https://github.com/1314521gjy/ninfer-fusion-kvmem)** (1314521gjy): the windowed KV retrieval, prefix-identity digest, and logical-reservation ring.
 
-### Hardware and low-level
+### Speculative decode and MoE offload
 
-- **[sass-king](https://github.com/florianmattana/sass-king)** (Florian Mattana): Blackwell SASS corpus and tensor-core instruction verification.
+- **[gem16](https://github.com/Danmoreng/gem16)** (Danmoreng): checkpoint-FP8 KV, fixed-D2 MTP, and resident execution plans on Blackwell.
+- **[Strata](https://github.com/Niko1221/Strata)** (Niko1221): the KV residency map, MoE expert-cache admission, and documented serving failure modes.
+
+### Kernels and hardware
+
+- **[CUTLASS](https://github.com/NVIDIA/cutlass)** (NVIDIA): the sm120 FP4/FP6/FP8 MMA and 2:4 sparse MMA reference.
+- **[sass-king](https://github.com/florianmattana/sass-king)** (Florian Mattana): the Blackwell SASS corpus and OMMA fragment-layout truth.
 
 ## License
 
