@@ -1,87 +1,154 @@
+<div align="center">
+
 # den_llama.cpp
 
-A llama.cpp fork tuned for one job: **Qwen3.8-27B at up to 196K context with native MTP speculative decoding on a single 16 GB GPU** (RTX 5070 Ti, Blackwell GB203) — plus a MoE serving lane (gemma-4-26B-A4B) that runs on the same card via partial CPU+GPU expert offload. This repo hosts a frozen reference engine (`build2`) and the development engine (`build3`).
+**A llama.cpp fork engineered for one job: Qwen3.8-27B at up to 196K context with native MTP speculative decoding on a single 16 GB GPU, plus a MoE serving lane on the same card.**
 
-[![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)](LICENSE)
-[![Hugging Face](https://img.shields.io/badge/Hugging%20Face-Qwen3.8--27B%20GSQ--RCO%20IQ3__XXS-yellow)](https://huggingface.co/RentedNoodle/Qwen3.8-27B-OrcaRouter-GSQ-RCO-IQ3_XXS-Uncensored)
-![CUDA Blackwell](https://img.shields.io/badge/CUDA-Blackwell%20sm__120a-76B900)
-![Context](https://img.shields.io/badge/context-196K-blue)
-![Speculation](https://img.shields.io/badge/speculation-native%20MTP-purple)
+[![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
+[![Language: C++](https://img.shields.io/badge/language-C%2B%2B-00599C.svg)](#architecture)
+[![CUDA](https://img.shields.io/badge/CUDA-Blackwell%20sm__120a-76B900.svg)](#architecture)
+[![Platform: RTX 5070 Ti 16 GB](https://img.shields.io/badge/platform-16%20GB%20GB203-informational.svg)](#architecture)
+[![Status: build3 working](https://img.shields.io/badge/status-build3%20working-orange.svg)](#status)
 
-Part of [Project Den](https://github.com/RentedNoodle/Project_Den) — this repo is its neural execution engine.
+<sub>
+<a href="#architecture">Architecture</a> &middot;
+<a href="#engine-internals">Engine internals</a> &middot;
+<a href="#benchmarks">Benchmarks</a> &middot;
+<a href="#status">Status</a> &middot;
+<a href="#models">Models</a> &middot;
+<a href="#quick-start">Quick start</a> &middot;
+<a href="#credits">Credits</a>
+</sub>
 
-## Builds
+</div>
 
-| Tree | Role |
-|---|---|
-| `build2` (`abd589d4c`) | Frozen reference engine. Read-only. |
-| `build3` (`build3` branch) | Development engine — `build2` plus the FA fix, the quantized-KV codecs, SER, the MoE placement fix, and the KV headroom guard. |
-| `build-fa` | Dev twin of `build3` (`I:\llama-fa`). |
+---
 
-## What this fork is
+The reference target is one NVIDIA Blackwell GPU (RTX 5070 Ti, GB203, sm_120a, 16 GB) running Qwen3.8-27B with an in-model multi-token-prediction (MTP) head. The fork carries a frozen reference engine (`build2`) and a development engine (`build3`). It is the neural execution engine of [Project Den](https://github.com/RentedNoodle/Project_Den).
 
-- **Qwen3.8 GDN-hybrid focus.** Built around the Qwen3.8-27B hybrid architecture (gated-delta-net + attention). This tree carries a delta-net conv-state snapshot bound fix (`src/models/delta-net-base.cpp`) and the Qwen3.5/3.8 model path (`src/models/qwen35.cpp`, `src/models/qwen35moe.cpp`).
-- **Quantized KV cache — the build3 advance.** `GGML_TYPE_NVFP4` as a KV type (matched + mixed pairs, KLD 0.0151 vs q4_0) and a new **`GGML_TYPE_Q4_G64`** KV codec (signed INT4 + one FP16 scale per 64 = 4.25 bpv; unit-verified byte/bit-exact quantizer + dequantizer; KLD 0.0163). Plus **layer-wise split-KV** (`--kv-high-precision-layers N`: the first N full-attention layers keep `-ctk/-ctv`, the rest drop to NVFP4) and **adaptive KV streaming** (see below).
-- **KV headroom guard.** `--kv-headroom-warn/-block/-force` report the projected free device memory at context creation and surface the VRAM-ceiling cliff (a silent prefill collapse today), naming the maximum safe context.
-- **Smart Expert Reduction (SER).** `-ser MIN,THRESH` + `--ser-top-p` + `--ser-ramp`: a dense-sanitized expert-reduction tool (correct + perf-neutral; a quality/allocation instrument, not a speed lever). Root-caused a CUDA fault inherited from the reference implementation (the `mm_ids_helper` density invariant).
-- **MoE expert placement.** `--fit on` (without `-ngl`) auto-places experts in the fast zone on a 16 GB card after a MoE-aware margin fix; partial CPU+GPU expert offload overlaps and beats full residency by ~8× on a 26B-A4B.
-- **Native MTP / NextN head work.** The pinned golden master adds an MTP carryover-reset fix (`common/speculative.cpp`: zero stale `pending_h`/`verify_h` on a new prompt) plus server-side MTP hidden-state plumbing (`--embeddings-nextn`, `llama_set_embeddings_nextn()`, per-token `h_nextn` emitted in the non-OAI embeddings JSON).
-- **FlashAttention quant-pair enablement.** A 2-file fix (`CMakeLists.txt` + `fattn.cu`, `fa_fix.diff`, +4/−1) compiles the `q8_0-q4_0` FA instance. With `GGML_CUDA_FA_ALL_QUANTS=OFF` — the golden build cache value — the live `-ctk q8_0 -ctv q4_0` pair is not compiled and FA silently falls back to `f16-f16`. The fix lives in a **separate build tree** (same pinned commit + 2-file FA fix), not in this repo's pinned commit; see Results.
-- **IQ3_XXS RCO quant pipeline.** Ships a 9.75 GiB `IQ3_XXS` trunk (~3.06 bpw) with a `Q6_K` MTP draft head, packed from ISTA-DASLab's published per-tensor RCO allocation with a custom OrcaRouter-native importance matrix.
-- **Gated benchmark suite.** Nothing lands on `main` without passing the repo's gates: needle retrieval, toolcall-v2, coherence, and MTP-ladder speed, with medians-of-N and no-regression checks.
-- **Production serving target.** A local long-context assistant served on one 16 GB GPU; the adaptive KV streaming path below is what lets the engine hold a **196K context window** on one card. That is a capacity/placement result, not a deep-recall measurement — deep recall is measured separately, in Results.
+## Architecture
 
-## Results
+```mermaid
+flowchart TD
+    P["Prompt / tokens"] --> G["Qwen3.8 GDN-hybrid graph (qwen35 / qwen35moe)"]
+    G --> A["Attention + gated-delta-net state"]
+    A --> K["KV cache: NVFP4 / Q4_G64 / layer-wise split-KV"]
+    K --> S["Adaptive KV streaming: pinned host pages + VRAM transfer ring"]
+    G --> M["In-model MTP head: draft, then verify"]
+    A --> E["MoE expert placement: --fit, -ncmoe, SER"]
+    M --> O["Sampler / detokenizer"]
+    O --> SV["llama-server (OpenAI-compatible API)"]
+    S --> SV
+```
 
-Only golden-build (`build2`) numbers with recorded conditions are listed. FA-quant-pair numbers are explicitly labeled **experiment (build-fa, not golden)**. Numbers whose conditions are not fully pinned (GPQA-Diamond, toolcall) are intentionally omitted — see the model repo for those.
+The engine schedules four scarce resources at once on one card: model weights, KV state, expert bank placement, and speculative draft work. Each is described under Engine internals below.
 
-> **Context capacity ≠ recall.** The "196K" figure is *context-window capacity* on a 16 GB card (adaptive KV streaming + the KV headroom guard; receipt: `SHIPPABLE_Q4_RESIDENT.md`). Deep-recall quality is measured separately — the needle result below is **6/6 on a 15K-word haystack**, the largest verified retrieval window in-repo; there is no 196K-needle result here. Faster/windowed recall runs exist experimentally: they are **query-dependent** (recall drops for facts outside the active window) and are **not recommended for deep recall**. Receipts with raw conditions: `BUILD2_GOLDEN.md`, `SHIPPABLE_Q4_RESIDENT.md`, `DEN.md`; full eval logs ship in the model repo's `evals/`.
+## Engine internals
+
+<details>
+<summary>NVFP4 weights on Blackwell tensor cores</summary>
+
+The CUDA backend carries the NVFP4 weight type and the Blackwell block-scaled matrix-multiply path. On sm_120a the 4-bit path runs through the `mxf4nvf4` block-scaled MMA with UE4M3 block scales (`mma.sync.aligned.kind::mxf4nvf4.block_scale.scale_vec::4X.m16n8k64`), selected per architecture in `ggml/src/ggml-cuda/mma.cuh` and configured in `mmq-config-blackwell.cuh`, with the NVFP4 MMQ instance in `template-instances/mmq-instance-nvfp4.cu`. The tensor cores do the dequantize-multiply without a separate materialization pass.
+
+</details>
+
+<details>
+<summary>Quantized KV cache: NVFP4, Q4_G64, and layer-wise split-KV</summary>
+
+The KV cache is a first-class memory lever. `GGML_TYPE_NVFP4` is usable as a KV type (matched and mixed pairs, KLD 0.0151 against a q4_0 control). `GGML_TYPE_Q4_G64` is a signed INT4 codec with one FP16 scale per 64 values (4.25 bpv) whose quantizer and dequantizer are unit-verified byte- and bit-exact against a CPU reference (KLD 0.0163). `--kv-high-precision-layers N` keeps the first N full-attention layers on `-ctk`/`-ctv` and drops the rest to NVFP4, so precision sits where the model needs it while memory comes back elsewhere.
+
+</details>
+
+<details>
+<summary>Speculative MTP: in-model draft then verify</summary>
+
+Speculative decoding uses the model's own MTP (NextN) head: the head proposes draft tokens and the trunk verifies them, with no separate draft model. The pinned golden master adds a carryover-reset fix (`common/speculative.cpp`: stale `pending_h`/`verify_h` are zeroed on a new prompt) and server-side hidden-state plumbing (`--embeddings-nextn`, `llama_set_embeddings_nextn()`, a per-token `h_nextn` in the non-OAI embeddings JSON). The ship GGUF pairs the IQ3_XXS trunk with a `Q6_K` MTP draft head.
+
+</details>
+
+<details>
+<summary>Expert staging for MoE models</summary>
+
+The MoE lane places experts across CPU and GPU instead of keeping the full expert bank resident. A MoE-aware margin cap in `common/fit.cpp` makes `--fit on` (without `-ngl`) land experts in the fast zone on a 16 GB card. `-ncmoe` moves a chosen number of expert layers to CPU, and partial offload overlaps and beats full residency by about 8x on a 26B-A4B. Smart Expert Reduction (SER, `-ser MIN,THRESH`, `--ser-top-p`, `--ser-ramp`) is a dense-sanitized expert-reduction instrument in `mmid.cu`, `mmq.cu`, `mmf.cu`, `mmvq.cu`, and `quantize.cu`; it also root-caused a `mm_ids_helper` density-invariant CUDA fault inherited from the reference implementation.
+
+</details>
+
+<details>
+<summary>Long-context placement on one card</summary>
+
+Two mechanisms hold long context on 16 GB. Adaptive KV streaming (`--kv-stream-stage-mib N`) keeps the authoritative KV tensors in pinned host memory with a bounded CUDA pool shared by resident pages and a transfer ring; the runtime grows the resident split as budget allows and prefetches later layers while the current layer computes. The KV headroom guard (`--kv-headroom-warn/-block/-force`) projects free device memory at context creation and surfaces the VRAM-ceiling cliff (a silent prefill collapse today), naming the maximum safe context. Together they are what lets the engine hold a 196K context window on one card. That is a capacity and placement result, not a deep-recall measurement; deep recall is measured separately under Benchmarks.
+
+</details>
+
+## Benchmarks
+
+Only golden-build (`build2`) numbers with recorded conditions are listed. FA-quant-pair numbers are labeled **experiment (build-fa, not golden)**. Numbers whose conditions are not fully pinned (GPQA-Diamond, toolcall) are intentionally omitted; see the model repo for those.
+
+> [!NOTE]
+> Context capacity is not recall. The 196K figure is context-window capacity on a 16 GB card (adaptive KV streaming plus the KV headroom guard; receipt `SHIPPABLE_Q4_RESIDENT.md`). Deep-recall quality is measured separately. The needle result below is 6/6 on a 15K-word haystack, the largest verified retrieval window in-repo; there is no 196K-needle result here. Windowed recall runs exist experimentally, are query-dependent, and are not recommended for deep recall. Receipts with raw conditions: `BUILD2_GOLDEN.md`, `SHIPPABLE_Q4_RESIDENT.md`, `DEN.md`; full eval logs ship in the model repo's `evals/`.
 
 | Metric | Value | Conditions |
 |---|---|---|
-| Needle retrieval | **6/6** | golden build2; `Qwen3.8-27B-OrcaRouter-GSQ-RCO-IQ3_XXS-v2.0.gguf`; 15K-word haystack, depths 0.1–0.9, temp 0.0.¹ |
-| WikiText-2 perplexity | **6.1745 ± 0.14889** | golden build2 `llama-perplexity.exe`; ship file; 40×512 chunks; `-fa on`; KV default (no `-ctk`/`-ctv` passed).² |
-| Serve t/s @ 32K ctx | **82.73 t/s** (median; 79.4–89.6) | golden build2; ctx 32768; 5 prompts × 300 tok × 2 reps; temp 0.6; seed 424242; np=1; MTP n-max 2; accept 0.6703; prefill 706 t/s.³ |
-| Serve t/s @ 65K ctx | **64.16 t/s** (median ALL; 51.11–72.48) | golden build2 (FA A/B control); ship file; ctx 65536; `-b 2048 -ub 2048 -fa on -ctk q8_0 -ctv q4_0 -ngl 99 -t 8 -tb 8`; MTP n-max 2; median accept ALL 0.7675 / CUM 0.7010.⁴ |
-| FA build — t/s | **79.48 t/s** (median) | *experiment (build-fa, not golden)*: HEAD `abd589d4c` + `fa_fix.diff`; same flags as the 65K control; +23.9% vs control.⁵ |
-| FA build — acceptance | **0.7018 ALL / 0.6768 CUM** | *experiment (build-fa, not golden)*; control 0.7675 / 0.7010.⁵ |
-| FA build — ppl / needle | **6.1745 ± 0.14889 / 6/6** | *experiment (build-fa, not golden)*; ppl Δ 0.00% vs control; control needle 5/6 (needle-05 miss).⁵ |
+| Needle retrieval | **6/6** | golden build2; `Qwen3.8-27B-OrcaRouter-GSQ-RCO-IQ3_XXS-v2.0.gguf`; 15K-word haystack, depths 0.1-0.9, temp 0.0.[1] |
+| WikiText-2 perplexity | **6.1745 +/- 0.14889** | golden build2 `llama-perplexity.exe`; ship file; 40x512 chunks; `-fa on`; KV default (no `-ctk`/`-ctv` passed).[2] |
+| Serve t/s @ 32K ctx | **82.73 t/s** (median; 79.4-89.6) | golden build2; ctx 32768; 5 prompts x 300 tok x 2 reps; temp 0.6; seed 424242; np=1; MTP n-max 2; accept 0.6703; prefill 706 t/s.[3] |
+| Serve t/s @ 65K ctx | **64.16 t/s** (median ALL; 51.11-72.48) | golden build2 (FA A/B control); ship file; ctx 65536; `-b 2048 -ub 2048 -fa on -ctk q8_0 -ctv q4_0 -ngl 99 -t 8 -tb 8`; MTP n-max 2; median accept ALL 0.7675 / CUM 0.7010.[4] |
+| FA build, t/s | **79.48 t/s** (median) | *experiment (build-fa, not golden)*: HEAD `abd589d4c` plus `fa_fix.diff`; same flags as the 65K control; +23.9% vs control.[5] |
+| FA build, acceptance | **0.7018 ALL / 0.6768 CUM** | *experiment (build-fa, not golden)*; control 0.7675 / 0.7010.[5] |
+| FA build, ppl / needle | **6.1745 +/- 0.14889 / 6/6** | *experiment (build-fa, not golden)*; ppl delta 0.00% vs control; control needle 5/6 (needle-05 miss).[5] |
 
-### build3 (working engine) — additions
+### build3 (working engine) additions
 
 | Metric | Value | Conditions |
 |---|---|---|
-| NVFP4 KV — decode / KLD | **88.6 t/s / 0.0151** | build3; matched `-ctk nvfp4 -ctv nvfp4`; vs q4_0-KV control (KLD 0.104 bound); ~1 GiB KV saved @131K.⁶ |
-| Q4_G64 KV — NIAH / KLD | **6/6 / 0.0163** | build3 `feat/q4-g64-kv`; matched + mixed pairs; unit harness: quantizer byte-identical vs CPU ref, dequant bit-identical.⁷ |
-| Layer-wise split-KV — NIAH | **6/6** | build3; `--kv-high-precision-layers 8` @64K; prefill 1059 t/s.⁸ |
-| MoE 26B-A4B — decode (offload) | **94–117 t/s** | build3; gemma-4-26B-A4B Q4_K_M; `-ncmoe 4` (full-resident collapses to 11–15 t/s at the VRAM ceiling).⁹ |
-| MoE KV×offload — decode | **129 t/s** | build3; `-ctk q8_0 -ctv q4_0 -ncmoe 2` (+11% vs f16/ncmoe4); **knife-edge** — 6 MiB more VRAM (ncmoe 1) collapses to 21.5 t/s.¹⁰ |
-| KV headroom guard | **verified** | build3; dense 32K → 4585 MiB free (clean); dense 196K → 653 MiB free, warns + reports max safe ctx; offloaded MoE → accurate, warn-only.¹¹ |
-
-⁶ NVFP4-KV validation record (`docs/superpowers/specs/2026-09-24-nvfp4-kv-validated.md`).
-⁷ Q4_G64 record (`…/2026-09-24-q4-g64-kv-type.md`) + unit harness.
-⁸ Split-KV record (`…/layer-wise-split-kv.md`, 64K needle result).
-⁹ MoE placement record (`…/2026-09-24-moe-expert-placement-build3.md`).
-¹⁰ KV×MoE record (`…/2026-09-24-kv-moe-interaction.md`).
-¹¹ Headroom-guard commits `c1a0fa815` + `9cd4febbb`.
+| NVFP4 KV, decode / KLD | **88.6 t/s / 0.0151** | build3; matched `-ctk nvfp4 -ctv nvfp4`; vs q4_0-KV control (KLD 0.104 bound); about 1 GiB KV saved @131K.[6] |
+| Q4_G64 KV, NIAH / KLD | **6/6 / 0.0163** | build3 `feat/q4-g64-kv`; matched and mixed pairs; unit harness: quantizer byte-identical vs CPU ref, dequant bit-identical.[7] |
+| Layer-wise split-KV, NIAH | **6/6** | build3; `--kv-high-precision-layers 8` @64K; prefill 1059 t/s.[8] |
+| MoE 26B-A4B, decode (offload) | **94-117 t/s** | build3; gemma-4-26B-A4B Q4_K_M; `-ncmoe 4` (full-resident collapses to 11-15 t/s at the VRAM ceiling).[9] |
+| MoE KV x offload, decode | **129 t/s** | build3; `-ctk q8_0 -ctv q4_0 -ncmoe 2` (+11% vs f16/ncmoe4); knife-edge: 6 MiB more VRAM (ncmoe 1) collapses to 21.5 t/s.[10] |
+| KV headroom guard | **verified** | build3; dense 32K gives 4585 MiB free (clean); dense 196K gives 653 MiB free, warns and reports max safe ctx; offloaded MoE is accurate, warn-only.[11] |
 
 Notes from building these:
 
-- **V precision vs MTP acceptance is context-state dependent, not a fixed property.** With a fixed prompt
-  and seed on a fresh short context the figure is stable (q4_0 V 0.7563 vs q8_0 V 0.7417, identical
-  across runs), but after a long-context ingest the direction flips (q8_0 V 0.819 vs q4_0 V 0.742). Pick
-  V precision per deployment by measuring; q8_0 V fits ≤64K, q4_0 V for long context.
-- **MoE + CUDA graphs is high-risk** (dynamic expert destinations break capture / replay stale pointers).
-  Capture dense-lane graphs only, if at all.
-- **Thread count does not move the MoE offload path** (114–117 t/s across `-t 4/8/16`).
-- **Each of these results was reproduced on the same card**; numbers without recorded conditions are not
-  listed.
+- **V precision vs MTP acceptance is context-state dependent.** With a fixed prompt and seed on a fresh short context the figure is stable (q4_0 V 0.7563 vs q8_0 V 0.7417, identical across runs), but after a long-context ingest the direction flips (q8_0 V 0.819 vs q4_0 V 0.742). Pick V precision per deployment by measuring; q8_0 V fits at or below 64K, q4_0 V for long context.
+- **MoE with CUDA graphs is high-risk.** Dynamic expert destinations break capture and replay stale pointers. Capture dense-lane graphs only, if at all.
+- **Thread count does not move the MoE offload path** (114-117 t/s across `-t 4/8/16`).
+- **Each result was reproduced on the same card.** Numbers without recorded conditions are not listed.
 
-¹ Model card (Hugging Face / ModelScope).
-² Project perplexity log (build2 `llama-perplexity.exe`, 40×512-chunk run on the ship file).
-³ Project A/B record: model file at run time was `…v2.0-s1-orcaim.gguf`, later consolidated into `v2.0.gguf`; short-ctx KV type was not recorded in the AB source.
-⁴ FA A/B battery log (control leg, median-of-3).
-⁵ Project FA A/B verdict record §2. Disposition: the pre-registered gate recorded **TESTED-NEGATIVE** (acceptance CUM −0.0242, exceeding the 0.02 bound) and build2 stayed golden; on 2026-09-10 an executive override promoted build-fa to **>128K-regime golden**, retaining build2 as the immutable ≤128K default (override record).
+[1] Model card (Hugging Face / ModelScope).
+[2] Project perplexity log (build2 `llama-perplexity.exe`, 40x512-chunk run on the ship file).
+[3] Project A/B record: model file at run time was `...v2.0-s1-orcaim.gguf`, later consolidated into `v2.0.gguf`; short-ctx KV type was not recorded in the AB source.
+[4] FA A/B battery log (control leg, median-of-3).
+[5] Project FA A/B verdict record section 2. Disposition: the pre-registered gate recorded TESTED-NEGATIVE (acceptance CUM -0.0242, exceeding the 0.02 bound) and build2 stayed golden; on 2026-09-10 an executive override promoted build-fa to >128K-regime golden, retaining build2 as the immutable at-or-below-128K default (override record).
+[6] NVFP4-KV validation record (`docs/superpowers/specs/2026-09-24-nvfp4-kv-validated.md`).
+[7] Q4_G64 record (`.../2026-09-24-q4-g64-kv-type.md`) and unit harness.
+[8] Split-KV record (`.../layer-wise-split-kv.md`, 64K needle result).
+[9] MoE placement record (`.../2026-09-24-moe-expert-placement-build3.md`).
+[10] KV x MoE record (`.../2026-09-24-kv-moe-interaction.md`).
+[11] Headroom-guard commits `c1a0fa815` and `9cd4febbb`.
+
+## Status
+
+| Label | Meaning |
+|---|---|
+| Built | code exists and is tested |
+| Prototype | runs, unstable |
+| Spec | design only |
+| Hypothesis | untested idea |
+
+| Component | Status |
+|---|:--:|
+| Reference engine (build2, Qwen3.8-27B plus MTP) | Built |
+| Development engine (build3) | Built |
+| Quantized KV cache (NVFP4, Q4_G64) | Built |
+| Layer-wise split-KV | Built |
+| KV headroom guard | Built |
+| MoE expert placement (`--fit`, `-ncmoe`) | Built |
+| Smart Expert Reduction (SER) | Built |
+| MTP speculative decode | Built |
+| Adaptive KV streaming | Prototype |
+| FlashAttention quant-pair enablement | Prototype |
+| NVFP4 weight MMA on Blackwell tensor cores | Prototype |
 
 ## Models
 
@@ -89,20 +156,20 @@ All repos verified live via the Hugging Face and ModelScope public APIs.
 
 | Artifact | File | Size | SHA256 (prefix) |
 |---|---|---|---|
-| Main quant — [Hugging Face](https://huggingface.co/RentedNoodle/Qwen3.8-27B-OrcaRouter-GSQ-RCO-IQ3_XXS-Uncensored) · [ModelScope](https://modelscope.cn/models/RentedNoodle/Qwen3.8-27B-OrcaRouter-GSQ-RCO-IQ3_XXS-Uncensored) | `Qwen3.8-27B-OrcaRouter-GSQ-RCO-IQ3_XXS-v2.0.gguf` | 10,466,439,424 B (9.75 GiB) | `41ad7dfb…` |
-| Vision projector (BF16) | `mmproj/mmproj-Qwen3.8-27B-BF16.gguf` | 931,146,528 B (~0.87 GiB) | `13cb7beb…` |
-| Vision projector (Q8_0) | `mmproj/mmproj-Qwen3.8-27B-Q8_0.gguf` | 629,247,648 B (~0.60 GiB) | `b280c2cb…` |
-| Chat template | `froggeric-qwen3.8-tool-use.jinja` | 28,234 B | `e57684ba…` |
-| RCO allocation map | `REF-IQ3_XXS-mtp.rco-allocation.txt` | 24,583 B | `2e690030…` |
-| imatrix | `imatrix.dat` | 13,642,656 B | `e0fcab28…` |
+| Main quant, [Hugging Face](https://huggingface.co/RentedNoodle/Qwen3.8-27B-OrcaRouter-GSQ-RCO-IQ3_XXS-Uncensored) &middot; [ModelScope](https://modelscope.cn/models/RentedNoodle/Qwen3.8-27B-OrcaRouter-GSQ-RCO-IQ3_XXS-Uncensored) | `Qwen3.8-27B-OrcaRouter-GSQ-RCO-IQ3_XXS-v2.0.gguf` | 10,466,439,424 B (9.75 GiB) | `41ad7dfb...` |
+| Vision projector (BF16) | `mmproj/mmproj-Qwen3.8-27B-BF16.gguf` | 931,146,528 B (about 0.87 GiB) | `13cb7beb...` |
+| Vision projector (Q8_0) | `mmproj/mmproj-Qwen3.8-27B-Q8_0.gguf` | 629,247,648 B (about 0.60 GiB) | `b280c2cb...` |
+| Chat template | `froggeric-qwen3.8-tool-use.jinja` | 28,234 B | `e57684ba...` |
+| RCO allocation map | `REF-IQ3_XXS-mtp.rco-allocation.txt` | 24,583 B | `2e690030...` |
+| imatrix | `imatrix.dat` | 13,642,656 B | `e0fcab28...` |
 
-Base and reference repos: [`orcarouter/Qwen3.8-27B-Uncensored`](https://huggingface.co/orcarouter/Qwen3.8-27B-Uncensored) (uncensored base), [`Qwen/Qwen3.8-27B`](https://huggingface.co/Qwen/Qwen3.8-27B) (architecture + pretrained weights), [`ISTA-DASLab/Qwen3.8-27B-GSQ-RCO-GGUF`](https://huggingface.co/ISTA-DASLab/Qwen3.8-27B-GSQ-RCO-GGUF) (RCO allocation source), [`froggeric/Qwen-Fixed-Chat-Templates`](https://huggingface.co/froggeric/Qwen-Fixed-Chat-Templates) (tool-use template). All hashes are from the model repo's `SHA256SUMS.txt`; `REF-…` and `imatrix.dat` prefixes are from the upload record.
+Base and reference repos: [`orcarouter/Qwen3.8-27B-Uncensored`](https://huggingface.co/orcarouter/Qwen3.8-27B-Uncensored) (uncensored base), [`Qwen/Qwen3.8-27B`](https://huggingface.co/Qwen/Qwen3.8-27B) (architecture and pretrained weights), [`ISTA-DASLab/Qwen3.8-27B-GSQ-RCO-GGUF`](https://huggingface.co/ISTA-DASLab/Qwen3.8-27B-GSQ-RCO-GGUF) (RCO allocation source), [`froggeric/Qwen-Fixed-Chat-Templates`](https://huggingface.co/froggeric/Qwen-Fixed-Chat-Templates) (tool-use template). All hashes are from the model repo's `SHA256SUMS.txt`; `REF-...` and `imatrix.dat` prefixes are from the upload record.
 
 ## Quick start
 
 ### Golden build (Windows, CUDA 13.3 + VS2022 + Ninja)
 
-Pin the golden master commit, then configure with `GGML_CUDA_FA_ALL_QUANTS=OFF` (this is the value the golden `build2` was actually built with):
+Pin the golden master commit, then configure with `GGML_CUDA_FA_ALL_QUANTS=OFF` (the value the golden `build2` was built with):
 
 ```powershell
 git clone https://github.com/RentedNoodle/den_llama.cpp.git
@@ -139,13 +206,13 @@ build2\bin\llama-server.exe `
 
 For depth-0.5 retrieval fidelity, use `-b 2048 -ub 2048` (a documented chunking artifact of the model, not this fork).
 
-### Build3 (working engine) — same command, plus the new flags
+### Build3 (working engine)
 
-`build3` is source-compatible with the ship command above; it adds:
+`build3` is source-compatible with the ship command above and adds:
 
 ```powershell
 # quantized KV + split-KV (memory / capacity levers)
--ctk q8_0 -ctv nvfp4                       # NVFP4 KV (validated <=96K; KLD 0.0151)
+-ctk q8_0 -ctv nvfp4                       # NVFP4 KV (validated at or below 96K; KLD 0.0151)
 -ctk q8_0 -ctv q4_g64                      # Q4_G64 KV (4.25 bpv, KLD 0.0163)
 --kv-high-precision-layers 8               # first 8 full-attn layers keep -ctk/-ctv, rest NVFP4
 
@@ -154,52 +221,59 @@ For depth-0.5 retrieval fidelity, use `-b 2048 -ub 2048` (a documented chunking 
 --kv-headroom-block 512                    # opt-in refusal (0 = off, warn-only)
 --kv-headroom-force                        # continue anyway (warn only)
 
-# MoE lane (gemma-4-26B-A4B) — partial expert offload; do NOT add --fit together with -ngl
--ngl 999 -ncmoe 4                          # ~94-117 t/s; full-resident collapses at the VRAM ceiling
+# MoE lane (gemma-4-26B-A4B), partial expert offload; do NOT add --fit together with -ngl
+-ngl 999 -ncmoe 4                          # about 94-117 t/s; full-resident collapses at the VRAM ceiling
 ```
 
-Build it the same way (or use the snapshot binaries under
-`DEN_CANONICAL/engine/build3_snapshots/2026-09-24/bin`), and read the KV headroom report at load with
-`-lv 4`.
+Build it the same way (or use the snapshot binaries under `DEN_CANONICAL/engine/build3_snapshots/2026-09-24/bin`), and read the KV headroom report at load with `-lv 4`.
 
 ## What's in the fork
+
+### Builds
+
+| Tree | Role |
+|---|---|
+| `build2` (`abd589d4c`) | Frozen reference engine. Read-only. |
+| `build3` (`build3` branch) | Development engine: `build2` plus the FA fix, the quantized-KV codecs, SER, the MoE placement fix, and the KV headroom guard. |
+| `build-fa` | Dev twin of `build3`. |
+
+### Files
 
 | Location | What |
 |---|---|
 | `common/speculative.cpp` | MTP carryover-reset on a new prompt (zeroes stale `pending_h`/`verify_h`), plus an env-gated (`LLAMA_DUMP_MTP`) debug dump. |
 | `common/arg.cpp`, `common/common.h`, `common/common.cpp` | `--embeddings-nextn` flag and `common_params::embeddings_nextn`. |
-| `include/llama.h`, `src/llama-context.cpp` | `llama_set_embeddings_nextn()` / `llama_get_embeddings_nextn_ith()`; NULL-safe wrapper and env-gated MTP tensor dump. |
+| `include/llama.h`, `src/llama-context.cpp` | `llama_set_embeddings_nextn()` and `llama_get_embeddings_nextn_ith()`; NULL-safe wrapper and env-gated MTP tensor dump. |
 | `tools/server/server-task.{h,cpp}`, `tools/server/server-context.cpp` | Server emits per-token MTP head input hidden as `"nextn"` when `embeddings_nextn` is enabled. |
 | `src/models/delta-net-base.cpp` | Gated-delta-net conv-state snapshot bound fix (`K = min(n_rs_seq, n_tok)+1`). |
-| `benchmarks/` | Adaptive KV streaming benchmark driver (`benchmark_kv_stream.py`) — sweeps context capacity 8K→max, auto-selects the largest practical KV pool, and emits CSV/PNG/SVG. See `benchmarks/README.md`. |
-| `BUILD2_GOLDEN.md` | Rebuild/repro record for the golden engine (toolchain, configure command, patch stack). Note: its "Source of truth" commit field names `0875eab41`, one commit behind the current golden HEAD `abd589d4c`. |
-| FA quant-pair work | Not in this repo's pinned commit: same HEAD `abd589d4c` + 2-file FA fix (`fa_fix.diff`, +4/−1), maintained in a separate build tree. See Results. |
-| `ggml/src/ggml-cuda/mmid.cu`, `mmq.cu`, `mmf.cu`, `mmvq.cu`, `quantize.cu` | SER v2 — dense-sanitized expert reduction; `mm_ids_helper` density-invariant fix (the reference implementation's CUDA follow-up never landed). |
-| `ggml/src/ggml-quants.c`, `ggml-common.h`, `ggml-cuda/convert.cu`, `fattn-common.cuh`, `fattn.cu`, `cpy-utils.cuh`, `set-rows.cu` + `template-instances/fattn-vec-instance-q4_g64-*.cu` | `GGML_TYPE_Q4_G64` KV codec (INT4 + FP16 scale per 64). |
-| `src/llama-kv-cache.{h,cpp}`, `src/llama-context.cpp`, `src/llama-graph.cpp` | Layer-wise split-KV (`--kv-high-precision-layers`) + the KV headroom guard + SER plumbing. |
-| `common/fit.cpp` | MoE-aware margin cap — `--fit` auto-placement lands in the fast zone. |
+| `benchmarks/` | Adaptive KV streaming benchmark driver (`benchmark_kv_stream.py`): sweeps context capacity 8K to max, auto-selects the largest practical KV pool, and emits CSV/PNG/SVG. See `benchmarks/README.md`. |
+| `BUILD2_GOLDEN.md` | Rebuild/repro record for the golden engine (toolchain, configure command, patch stack). Its "Source of truth" commit field names `0875eab41`, one commit behind the current golden HEAD `abd589d4c`. |
+| FA quant-pair work | Not in this repo's pinned commit: same HEAD `abd589d4c` plus a 2-file FA fix (`fa_fix.diff`, +4/-1), maintained in a separate build tree. See Benchmarks. |
+| `ggml/src/ggml-cuda/mmid.cu`, `mmq.cu`, `mmf.cu`, `mmvq.cu`, `quantize.cu` | SER v2, dense-sanitized expert reduction; `mm_ids_helper` density-invariant fix (the reference implementation's CUDA follow-up never landed). |
+| `ggml/src/ggml-quants.c`, `ggml-common.h`, `ggml-cuda/convert.cu`, `fattn-common.cuh`, `fattn.cu`, `cpy-utils.cuh`, `set-rows.cu` plus `template-instances/fattn-vec-instance-q4_g64-*.cu` | `GGML_TYPE_Q4_G64` KV codec (INT4 plus FP16 scale per 64). |
+| `src/llama-kv-cache.{h,cpp}`, `src/llama-context.cpp`, `src/llama-graph.cpp` | Layer-wise split-KV (`--kv-high-precision-layers`), the KV headroom guard, and SER plumbing. |
+| `common/fit.cpp` | MoE-aware margin cap so `--fit` auto-placement lands in the fast zone. |
 
-Branches:
+### Branches
 
 | Branch | Role |
 |---|---|
-| `main` | Golden master HEAD `abd589d4c` ("MTP carryover fix + server MTP/reasoning plumbing + delta-net fixes + build repro doc"). |
-| `build3` | Development engine (`a22b5fea0`) — FA fix + NVFP4/Q4_G64 KV + split-KV + SER + `--fit` MoE fix + KV headroom guard. Tag `build3-golden-20260924`. |
-| `feat/q4-g64-kv` | Build3 + the `GGML_TYPE_Q4_G64` codec + the KV headroom guard (`9cd4febbb`). |
+| `main` | Golden master HEAD `abd589d4c` (MTP carryover fix + server MTP/reasoning plumbing + delta-net fixes + build repro doc). |
+| `build3` | Development engine (`a22b5fea0`): FA fix + NVFP4/Q4_G64 KV + split-KV + SER + `--fit` MoE fix + KV headroom guard. Tag `build3-golden-20260924`. |
+| `feat/q4-g64-kv` | Build3 plus the `GGML_TYPE_Q4_G64` codec and the KV headroom guard (`9cd4febbb`). |
 | `archive/stage1-nvfp4-abd589d4c` | Pre-consolidation archive (`42bf457d5`). |
-| `den-legacy` | Retired engine history (`a99ff8f9…`). |
+| `den-legacy` | Retired engine history (`a99ff8f9...`). |
 
-## Adaptive KV streaming (contributed)
+## Adaptive KV streaming
 
 This branch adds an experimental, block-granular KV cache streaming path to the CUDA `llama-server`. It is intended for running long contexts when model weights leave too little VRAM for the complete KV cache.
 
 With `--kv-stream-stage-mib N`, the authoritative KV tensors are stored in pinned host memory while a bounded CUDA pool is shared by resident KV pages and a transfer ring. The runtime adapts that split as the context grows: it keeps as many pages resident as the budget allows, reclaims resident space for staging when more streaming is required, and prefetches later layers while the current layer computes. This avoids relying on uncontrolled Unified Memory page thrashing and preserves exact attention over the full context.
 
-Detailed project story, design, implementation, and benchmark results are in
-[Running Qwen 27B on 16G VRAM with Full Context Length: Building Adaptive KV Cache Streaming for llama.cpp](https://medium.com/@raymond860909/running-qwen-27b-on-16g-vram-with-full-context-length-building-adaptive-kv-cache-streaming-for-bf1e819116e9).
+Detailed project story, design, implementation, and benchmark results are in [Running Qwen 27B on 16G VRAM with Full Context Length: Building Adaptive KV Cache Streaming for llama.cpp](https://medium.com/@raymond860909/running-qwen-27b-on-16g-vram-with-full-context-length-building-adaptive-kv-cache-streaming-for-bf1e819116e9).
 
 > [!WARNING]
-> This is research code tailored to our current NVIDIA CUDA configuration: an RTX 5070 Ti with 16 GB VRAM, `unsloth/Qwen3.8-27B-GGUF` `UD-Q3_K_XL`, a 262144-token context, Flash Attention, a Q8_0 K cache, a Q4_0 V cache, and one server slot. Other models, KV cache quantization combinations, parallel slots, and non-CUDA backends are not yet supported or validated. Expanding model and KV quantization support is follow-up work.
+> This is research code tailored to the current NVIDIA CUDA configuration: an RTX 5070 Ti with 16 GB VRAM, `unsloth/Qwen3.8-27B-GGUF` `UD-Q3_K_XL`, a 262144-token context, Flash Attention, a Q8_0 K cache, a Q4_0 V cache, and one server slot. Other models, KV cache quantization combinations, parallel slots, and non-CUDA backends are not yet supported or validated. Expanding model and KV quantization support is follow-up work.
 
 ### Build the modified server
 
@@ -227,7 +301,7 @@ Example using the tested cache configuration:
 
 The best value for `--kv-stream-stage-mib` depends on the model, context capacity, GPU, and other VRAM consumers. Start conservatively and increase it while checking startup and peak VRAM use.
 
-#### Optional Unified Memory for model weights
+### Optional Unified Memory for model weights
 
 Adaptive KV streaming works with or without Unified Memory. Leave `GGML_CUDA_ENABLE_UNIFIED_MEMORY` unset for ordinary CUDA device allocations. To make GPU-offloaded model buffers CUDA managed allocations, launch the same server with the environment variable enabled:
 
@@ -244,7 +318,7 @@ GGML_CUDA_ENABLE_UNIFIED_MEMORY=1 \
   --kv-stream-stage-mib 2304
 ```
 
-With this flag, CUDA-backed model buffers, including GPU-offloaded weights, are allocated with `cudaMallocManaged` and their pages can migrate between VRAM and host memory. The adaptive resident-page and transfer-ring pool is intentionally different: it is still allocated with `cudaMalloc`, so that fixed-size pool remains physically allocated in VRAM instead of becoming managed memory. UVM is therefore optional for this branch and does not change the KV streaming pool into pageable storage.
+With this flag, CUDA-backed model buffers, including GPU-offloaded weights, are allocated with `cudaMallocManaged` and their pages can migrate between VRAM and host memory. The adaptive resident-page and transfer-ring pool is intentionally different: it is still allocated with `cudaMalloc`, so that fixed-size pool remains physically allocated in VRAM instead of becoming managed memory. UVM is therefore optional for this branch and does not turn the KV streaming pool into pageable storage.
 
 ### Recreate the benchmark graph
 
@@ -258,142 +332,31 @@ python3 benchmarks/benchmark_kv_stream.py \
   --max-context 192K
 ```
 
-The only required arguments are the model GGUF and maximum context. See [benchmarks/README.md](benchmarks/README.md) for the pool-probing algorithm, generated files, optional settings, and resumable output directories.
+The only required arguments are the model GGUF and the maximum context. See [benchmarks/README.md](benchmarks/README.md) for the pool-probing algorithm, generated files, optional settings, and resumable output directories.
 
----
+## Credits
 
-This fork builds on [ggml-org/llama.cpp](https://github.com/ggml-org/llama.cpp) (MIT). The upstream README is included unmodified below for attribution.
+Den builds on open work. Credits, without license tags, per the project's convention.
 
-<details>
-<summary>Upstream llama.cpp README (unmodified)</summary>
+### Foundation
 
-## Upstream llama.cpp README
+- **[llama.cpp](https://github.com/ggml-org/llama.cpp)** (Georgi Gerganov): ggml, the CUDA backend, and the base inference engine.
+- **[ik_llama.cpp](https://github.com/ikawrakow/ik_llama.cpp)** (Ivan Kawrakow): expert offloading, speculative decode, and the MXFP4 and NVFP4 inference lineage.
+- **[Qwen](https://github.com/QwenLM/Qwen3.8)** (Qwen team): the Qwen3.8 hybrid architecture (gated-delta-net plus attention) and FP4-tolerant KV.
 
-# llama.cpp
+### KV, quantization, and speculation
 
-![llama](https://raw.githubusercontent.com/ggml-org/llama.brand/refs/heads/master/cover/llama-cpp/cover-llama-cpp-dark.svg)
+- **[BeeLlama](https://github.com/TNB-AR/beellama.cpp)** (Anbeeld): the KVarN KV cache and precision-tail lineage.
+- **[llama.cpp-adaptive-kv-streaming](https://github.com/RaymondHuang210129/llama.cpp-adaptive-kv-streaming)** (Raymond Huang): the adaptive KV streaming path carried in this fork.
+- **[unsloth](https://unsloth.ai/)**: NVFP4 weight-quantization research and the reference quantization of the ship model.
+- **[gem16](https://github.com/Danmoreng/gem16)** (Danmoreng): checkpoint-FP8 KV and resident execution plans on Blackwell.
+- **[AEON-7](https://github.com/AEON-7)**: NVFP4 compression and mixed precision.
+- **[Strata](https://github.com/Niko1221/Strata)** (Niko1221): engine design and documented serving failure modes.
 
-<div align="center">
+### Hardware and low-level
 
-<b>LLM inference in C/C++</b>
+- **[sass-king](https://github.com/florianmattana/sass-king)** (Florian Mattana): Blackwell SASS corpus and tensor-core instruction verification.
 
-[![License: MIT](https://img.shields.io/badge/license-MIT-blue.svg)](https://opensource.org/licenses/MIT)
-[![Release](https://img.shields.io/github/v/release/ggml-org/llama.cpp?filter=v*&color=brightgreen)](https://github.com/ggml-org/llama.cpp/releases?q=tag:v0)
-[![Nightly](https://img.shields.io/github/v/release/ggml-org/llama.cpp?label=nightly&filter=b*&color=orange)](https://github.com/ggml-org/llama.cpp/releases?q=b)
-[![Server](https://img.shields.io/github/actions/workflow/status/ggml-org/llama.cpp/server.yml?label=Server)](https://github.com/ggml-org/llama.cpp/actions/workflows/server.yml)
-[![Docker](https://img.shields.io/github/actions/workflow/status/ggml-org/llama.cpp/docker.yml?label=Docker)](https://github.com/ggml-org/llama.cpp/actions/workflows/docker.yml)
-[![Winget](https://img.shields.io/github/actions/workflow/status/ggml-org/llama.cpp/winget.yml?label=Winget)](https://github.com/ggml-org/llama.cpp/actions/workflows/winget.yml)
+## License
 
-[ggml](https://github.com/ggml-org/ggml) / [ops](https://github.com/ggml-org/llama.cpp/blob/master/docs/ops.md) / [maintainer PRs](https://github.com/ggml-org/llama.cpp/issues?q=is%3Apr%20is%3Aopen%20draft%3AFalse%20(author%3Argerganov%20OR%20author%3AKitaitiMakoto%20OR%20author%3Adanbev%20OR%20author%3Aaldehir%20OR%20author%3Amax-krasnyansky%20OR%20author%3ACISC%20OR%20author%3Aggerganov%20OR%20author%3Aam17an%20OR%20author%3Abartowski1182%20OR%20author%3Anikwen%20OR%20author%3Ahipudding%20OR%20author%3AServeurpersoCom%20OR%20author%3Apwilkin%20OR%20author%3Areeselevine%20OR%20author%3Angxson%20OR%20author%3Ajeffbolznv%20OR%20author%3Amarty1885%20OR%20author%3A0cc4m%20OR%20author%3ATitaniumtown%20OR%20author%3Aangt%20OR%20author%3AIMbackK%20OR%20author%3Aarthw%20OR%20author%3AJohannesGaessler%20OR%20author%3AORippler%20OR%20author%3Aruixiang63%20OR%20author%3Axctan%20OR%20author%3Aallozaur%20OR%20author%3Ayomaytk%20OR%20author%3Aaendk%20OR%20author%3Agaugarg-nv%20OR%20author%3Ataronaeo%20OR%20author%3Aforforever73%20OR%20author%3Alhez%20OR%20author%3Anetrunnereve%20OR%20author%3Afairydreaming)%20sort%3Aupdated-desc) / [dev stats](https://github.com/ggml-org/llama.cpp-dev) / [lib llama API](https://github.com/ggml-org/llama.cpp/issues/9289) / [llama-server REST API](https://github.com/ggml-org/llama.cpp/issues/9291)
-
-</div>
-
-## Quick start
-
-A few options to get `llama.cpp` installed on your machine:
-
-- Visit https://llama.app and follow the instructions
-- Run with Docker - see our [Docker documentation](docs/docker.md)
-- Download pre-built binaries from the [releases page](https://github.com/ggml-org/llama.cpp/releases)
-- Build from source by cloning this repository - check out [our build guide](docs/build.md)
-
-Once installed:
-
-```sh
-# Download and run a model directly from Hugging Face
-llama cli -hf ggml-org/Qwen3.5-0.8B-GGUF
-
-# Launch OpenAI-compatible API server
-llama serve -hf ggml-org/Qwen3.5-0.8B-GGUF
-```
-
-<table align="center">
-    <tr>
-        <td align="center" width=50%>
-            <img width="1310" height="888" alt="VLM session with `llama cli`" src="https://github.com/user-attachments/assets/88726b48-1713-48aa-a525-95a02e78afc4" />
-            <i>VLM session with <b>llama cli</b></i>
-        </td>
-        <td align="center">
-            <img width="1392" height="958" alt="Built-in web UI against `llama serve` running Qwen 3.6" src="https://github.com/user-attachments/assets/b402f972-2e32-4def-8771-8d849f08cf2e" />
-            <i>Built-in web UI against <b>llama serve</b></i>
-        </td>
-    </tr>
-<table>
-
-## Description
-
-The main goal of `llama.cpp` is to enable LLM (and VLM) inference with minimal setup and state-of-the-art performance on
-a wide range of hardware - locally and in the cloud.
-
-- Plain C/C++ implementation without any dependencies
-- Apple silicon is a first-class citizen - optimized via ARM NEON, Accelerate and Metal frameworks
-- AVX, AVX2, AVX512 and AMX support for x86 architectures
-- RVV, ZVFH, ZFH, ZICBOP and ZIHINTPAUSE support for RISC-V architectures
-- 1.5-bit, 2-bit, 3-bit, 4-bit, 5-bit, 6-bit, and 8-bit integer quantization for faster inference and reduced memory use
-- Custom CUDA kernels for running LLMs on NVIDIA GPUs (support for AMD GPUs via HIP and Moore Threads GPUs via MUSA)
-- Vulkan and SYCL backend support
-- CPU+GPU hybrid inference to partially accelerate models larger than the total VRAM capacity
-
-The `llama.cpp` project is build on top of the [ggml](https://github.com/ggml-org/ggml) library.
-
-## Supported backends
-
-| Backend | Target devices |
-| --- | --- |
-| [BLAS](docs/build.md#blas-build) | All |
-| [BLIS](docs/backend/BLIS.md) | All |
-| [CANN](docs/build.md#cann) | Ascend NPU |
-| [CUDA](docs/build.md#cuda) | Nvidia GPU |
-| [HIP](docs/build.md#hip) | AMD GPU |
-| [Hexagon [In Progress]](docs/backend/snapdragon/README.md) | Snapdragon |
-| [IBM zDNN](docs/backend/zDNN.md) | IBM Z & LinuxONE |
-| [MUSA](docs/build.md#musa) | Moore Threads GPU |
-| [Metal](docs/build.md#metal-build) | Apple Silicon |
-| [OpenCL](docs/backend/OPENCL.md) | Adreno GPU |
-| [OpenVINO [In Progress]](docs/backend/OPENVINO.md) | Intel CPUs, GPUs, and NPUs |
-| [RPC](https://github.com/ggml-org/llama.cpp/tree/master/tools/rpc) | All |
-| [SYCL](docs/backend/SYCL.md) | Intel GPU |
-| [VirtGPU](docs/backend/VirtGPU.md) | VirtGPU APIR |
-| [Vulkan](docs/build.md#vulkan) | GPU |
-| [WebGPU](docs/build.md#webgpu) | All |
-| [ZenDNN](docs/build.md#zendnn) | AMD CPU |
-
-## Documentation
-
-#### Tools
-
-- [cli](tools/cli/README.md)
-- [completion](tools/completion/README.md)
-- [server](tools/server/README.md)
-- [GBNF grammars](grammars/README.md)
-
-#### Development
-
-- [How to build](docs/build.md)
-- [Running on Docker](docs/docker.md)
-- [Build on Android](docs/android.md)
-- [Multi-GPU usage](docs/multi-gpu.md)
-- [Performance troubleshooting](docs/development/token_generation_performance_tips.md)
-- [GGML tips & tricks](https://github.com/ggml-org/llama.cpp/wiki/GGML-Tips-&-Tricks)
-- [XCFramework](docs/xcframework.md)
-- [Completions](docs/completions.md)
-- [Models](docs/models.md)
-- [Release process](docs/release.md)
-
-## Contributing
-
-- Contributors can open PRs
-- Collaborators will be invited based on contributions
-- Maintainers can push to branches in the `llama.cpp` repo and merge PRs into the `master` branch
-- Any help with managing issues, PRs and projects is very appreciated!
-- Read the [CONTRIBUTING.md](CONTRIBUTING.md) for more information
-
-## Acknowledgements
-
-- [yhirose/cpp-httplib](https://github.com/yhirose/cpp-httplib) - Single-header HTTP server, used by `llama-server` - MIT license
-- [nothings/stb](https://github.com/nothings/stb) - Single-header image format decoder, used by multimodal subsystem - Public domain
-- [nlohmann/json](https://github.com/nlohmann/json) - Single-header JSON library, used by various tools/examples - MIT License
-- [mackron/miniaudio](https://github.com/mackron/miniaudio) - Single-header audio format decoder, used by multimodal subsystem - Public domain
-- [sheredom/subprocess.h](https://github.com/sheredom/subprocess.h) - Single-header process launching solution for C and C++ - Public domain
-
-</details>
+MIT. This fork builds on [ggml-org/llama.cpp](https://github.com/ggml-org/llama.cpp), also MIT.
