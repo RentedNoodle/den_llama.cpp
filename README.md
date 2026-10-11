@@ -8,7 +8,7 @@ A llama.cpp fork tuned for one job: **Qwen3.8-27B at up to 196K context with nat
 ![Context](https://img.shields.io/badge/context-196K-blue)
 ![Speculation](https://img.shields.io/badge/speculation-native%20MTP-purple)
 
-Part of [Project Den](https://github.com/RentedNoodle/Project_Den) — a framework for persistent AI companions; this repo is its neural execution engine.
+Part of [Project Den](https://github.com/RentedNoodle/Project_Den) — this repo is its neural execution engine.
 
 ## Builds
 
@@ -29,11 +29,13 @@ Part of [Project Den](https://github.com/RentedNoodle/Project_Den) — a framewo
 - **FlashAttention quant-pair enablement.** A 2-file fix (`CMakeLists.txt` + `fattn.cu`, `fa_fix.diff`, +4/−1) compiles the `q8_0-q4_0` FA instance. With `GGML_CUDA_FA_ALL_QUANTS=OFF` — the golden build cache value — the live `-ctk q8_0 -ctv q4_0` pair is not compiled and FA silently falls back to `f16-f16`. The fix lives in a **separate build tree** (same pinned commit + 2-file FA fix), not in this repo's pinned commit; see Results.
 - **IQ3_XXS RCO quant pipeline.** Ships a 9.75 GiB `IQ3_XXS` trunk (~3.06 bpw) with a `Q6_K` MTP draft head, packed from ISTA-DASLab's published per-tensor RCO allocation with a custom OrcaRouter-native importance matrix.
 - **Gated benchmark suite.** Nothing lands on `main` without passing the repo's gates: needle retrieval, toolcall-v2, coherence, and MTP-ladder speed, with medians-of-N and no-regression checks.
-- **Dreya serving target.** The production consumer is a local long-context assistant served on one 16 GB GPU; the adaptive KV streaming path below is what makes 196K fit.
+- **Production serving target.** A local long-context assistant served on one 16 GB GPU; the adaptive KV streaming path below is what lets the engine hold a **196K context window** on one card. That is a capacity/placement result, not a deep-recall measurement — deep recall is measured separately, in Results.
 
 ## Results
 
 Only golden-build (`build2`) numbers with recorded conditions are listed. FA-quant-pair numbers are explicitly labeled **experiment (build-fa, not golden)**. Numbers whose conditions are not fully pinned (GPQA-Diamond, toolcall) are intentionally omitted — see the model repo for those.
+
+> **Context capacity ≠ recall.** The "196K" figure is *context-window capacity* on a 16 GB card (adaptive KV streaming + the KV headroom guard; receipt: `SHIPPABLE_Q4_RESIDENT.md`). Deep-recall quality is measured separately — the needle result below is **6/6 on a 15K-word haystack**, the largest verified retrieval window in-repo; there is no 196K-needle result here. Faster/windowed recall runs exist experimentally: they are **query-dependent** (recall drops for facts outside the active window) and are **not recommended for deep recall**. Receipts with raw conditions: `BUILD2_GOLDEN.md`, `SHIPPABLE_Q4_RESIDENT.md`, `DEN.md`; full eval logs ship in the model repo's `evals/`.
 
 | Metric | Value | Conditions |
 |---|---|---|
