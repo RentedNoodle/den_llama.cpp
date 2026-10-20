@@ -40,16 +40,16 @@ static inline fattn_kernel_t ggml_cuda_flash_attn_ext_mma_kvarn_select_kernel(
 
     if (k_original_domain) {
         GGML_ASSERT(v_original_domain);
-        return flash_attn_ext_f16<DKQ, DV, ncols1, ncols2, use_logit_softcap, V_is_K_view,
+        return flash_attn_ext_f16<DKQ, DV, ncols1, ncols2, use_logit_softcap, V_is_K_view, false,
             GGML_CUDA_FATTN_KVARN_ORIGINAL_TYPE, GGML_CUDA_FATTN_KVARN_ORIGINAL_TYPE>;
     }
 
     if (v_original_domain) {
-        return flash_attn_ext_f16<DKQ, DV, ncols1, ncols2, use_logit_softcap, V_is_K_view,
+        return flash_attn_ext_f16<DKQ, DV, ncols1, ncols2, use_logit_softcap, V_is_K_view, false,
             GGML_CUDA_FATTN_KVARN_TYPE, GGML_CUDA_FATTN_KVARN_ORIGINAL_TYPE>;
     }
 
-    return flash_attn_ext_f16<DKQ, DV, ncols1, ncols2, use_logit_softcap, V_is_K_view,
+    return flash_attn_ext_f16<DKQ, DV, ncols1, ncols2, use_logit_softcap, V_is_K_view, false,
         GGML_CUDA_FATTN_KVARN_TYPE, GGML_CUDA_FATTN_KVARN_TYPE>;
 }
 
@@ -175,7 +175,7 @@ static __global__ void ggml_cuda_fattn_kvarn_window_f16_partial_kernel(
     constexpr bool V_is_K_view = false;
     constexpr bool needs_fixup = false;
     constexpr bool is_fixup = true;
-    flash_attn_ext_f16_process_tile<DKQ, DV, ncols1, ncols2, nwarps, use_logit_softcap, V_is_K_view, needs_fixup, is_fixup>
+    flash_attn_ext_f16_process_tile<DKQ, DV, ncols1, ncols2, nwarps, use_logit_softcap, V_is_K_view, needs_fixup, is_fixup, false, GGML_TYPE_F16, GGML_TYPE_F16>
         (Q_f2, K_h2, V_h2, mask_h, sinks_f, dstk, partial_ptr, nullptr, scale, slope, logit_softcap,
          ne01, ne02, gqa_ratio, ne11, nb01 / (int32_t) sizeof(float2), nb02 / (int32_t) sizeof(float2),
          nb11 / (int32_t) sizeof(half2), nb21 / (int32_t) sizeof(half2), nb31 / (int32_t) sizeof(half),
@@ -242,7 +242,7 @@ static __global__ void ggml_cuda_fattn_kvarn_window_f16_direct_kernel(
     constexpr bool V_is_K_view = false;
     constexpr bool needs_fixup = false;
     constexpr bool is_fixup = false;
-    flash_attn_ext_f16_process_tile<DKQ, DV, ncols1, ncols2, nwarps, use_logit_softcap, V_is_K_view, needs_fixup, is_fixup>
+    flash_attn_ext_f16_process_tile<DKQ, DV, ncols1, ncols2, nwarps, use_logit_softcap, V_is_K_view, needs_fixup, is_fixup, false, GGML_TYPE_F16, GGML_TYPE_F16>
         (Q_f2, K_h2, V_h2, mask_h, sinks_f, dstk, nullptr, nullptr, scale, slope, logit_softcap,
          ne01, ne02, gqa_ratio, ne11, nb01 / (int32_t) sizeof(float2), nb02 / (int32_t) sizeof(float2),
          nb11 / (int32_t) sizeof(half2), nb21 / (int32_t) sizeof(half2), nb31 / (int32_t) sizeof(half),

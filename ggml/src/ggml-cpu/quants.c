@@ -66,6 +66,14 @@ void quantize_row_q4_g64(const float * GGML_RESTRICT x, void * GGML_RESTRICT y, 
     quantize_row_q4_g64_ref(x, y, k);
 }
 
+void quantize_row_tq4_0(const float * GGML_RESTRICT x, void * GGML_RESTRICT y, int64_t k) {
+    quantize_row_tq4_0_ref(x, y, k);
+}
+
+void quantize_row_tq3_0(const float * GGML_RESTRICT x, void * GGML_RESTRICT y, int64_t k) {
+    quantize_row_tq3_0_ref(x, y, k);
+}
+
 //
 // 2-6 bit quantization in super-blocks
 //

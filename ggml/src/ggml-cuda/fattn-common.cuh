@@ -5,6 +5,19 @@
 #include "vecdotq.cuh"
 
 #include <cstdint>
+#include <cstdlib>
+#include <cstdio>
+
+// DEN_FA_SPLITKV: env override for the number of KV splits (parallel_blocks) in
+// the non-stream-k decode path (VEC/TILE). 0 or unset = upstream auto-selection
+// (byte-identical). >0 forces exactly that many splits, clamped to ntiles_KV.
+static inline int ggml_cuda_fattn_splitkv_env() {
+    static const int value = []() {
+        const char * e = std::getenv("DEN_FA_SPLITKV");
+        return e != nullptr ? atoi(e) : 0;
+    }();
+    return value;
+}
 
 // Q4_G64 four-bit values: two's-complement signed, index n -> n >= 8 ? n - 16 : n.
 // Mirrors kvalues_mxfp4 (ggml-common.h:1136); sign-extension LUT for vec_dot_fattn_vec_KQ_q4_g64
@@ -12,6 +25,12 @@
 GGML_TABLE_BEGIN(int8_t, kvalues_q4_g64, 16)
     0, 1, 2, 3, 4, 5, 6, 7, -8, -7, -6, -5, -4, -3, -2, -1,
 GGML_TABLE_END()
+
+// TurboQuant codec (FA-VEC). The Lloyd-Max centroids are irrational; to keep the K-dot
+// dp4a-foldable this file uses the signed-int8 image of the codebook (tq4_0_codes / tq3_0_codes,
+// with the single global scales TQ4_0_CODE_SCALE / TQ3_0_CODE_SCALE) declared in ggml-common.h.
+// Dequant = d (stored L2 norm) * scale * code[idx]; the K-dot folds scale*d*Q_ds.x out of the
+// integer dot. Centroid indices come from the packed nibbles / little-endian 3-bit bitstream.
 
 #define FATTN_KQ_STRIDE       256
 #define HALF_MAX_HALF         __float2half(65504.0f/2) // Use neg. of this instead of -INFINITY to initialize KQ max vals to avoid NaN upon subtraction.
@@ -420,6 +439,90 @@ static __device__ __forceinline__ float vec_dot_fattn_vec_KQ_q4_g64(
     return sum;
 }
 
+// FA-VEC K-dot for TurboQuant K (block_tq4_0 / block_tq3_0, QK=256 = one head vector, one fp16
+// L2 norm per block). Signed-symmetric, so only Q_ds.x is used (no zero-point term). The four
+// centroid indices of one int are decoded branch-free and mapped to their signed-int8 codebook
+// codes, then one dp4a folds them against the int8 Q; d_K * TQ*_CODE_SCALE * Q_ds.x is the scalar
+// fold. Numeric target: dequantize_row_tq4_0 / tq3_0 (ggml-quants.c).
+template <int D, int nthreads>
+static __device__ __forceinline__ float vec_dot_fattn_vec_KQ_tq4_0(
+    const char * __restrict__ K_c, const void * __restrict__ Q_v, const int * __restrict__ Q_q8, const void * __restrict__ Q_ds_v) {
+
+    const block_tq4_0 * K = (const block_tq4_0 *) K_c;
+    GGML_UNUSED(Q_v);
+
+    float sum = 0.0f;
+
+#pragma unroll
+    for (int k_KQ_0 = 0; k_KQ_0 < int(D/sizeof(int)); k_KQ_0 += nthreads) {
+        const int k_KQ = k_KQ_0 + (nthreads == WARP_SIZE ? threadIdx.x : threadIdx.x % nthreads);
+
+        const int e0   = 4*k_KQ;               // first element covered by this int
+        const int ib   = e0 / QK_TQ;           // block index
+        const int eb   = e0 % QK_TQ;           // element offset inside the block
+        const int byte = eb / 2;               // first of the two nibble-pair source bytes
+
+        uint16_t w;
+        ggml_cuda_memcpy_1<sizeof(w)>(&w, K[ib].qs + byte);
+        // spread the four nibbles to even byte positions so get_int_from_table_16 returns them in order
+        const int kraw = (w & 0x000F) | ((w & 0x00F0) << 4) | ((w & 0x0F00) << 8) | ((w & 0xF000) << 12);
+
+        const int2 v = get_int_from_table_16(kraw, tq4_0_codes);
+        const int  u = Q_q8[k_KQ_0/nthreads];
+
+        const int sumi = ggml_cuda_dp4a(v.x, u, 0);
+
+        const float2 Q_ds = ((const float2 *) Q_ds_v)[k_KQ_0/nthreads];
+        const float  d_K  = __half2float(K[ib].d);
+
+        sum += d_K * TQ4_0_CODE_SCALE * Q_ds.x * float(sumi);
+    }
+
+    return sum;
+}
+
+template <int D, int nthreads>
+static __device__ __forceinline__ float vec_dot_fattn_vec_KQ_tq3_0(
+    const char * __restrict__ K_c, const void * __restrict__ Q_v, const int * __restrict__ Q_q8, const void * __restrict__ Q_ds_v) {
+
+    const block_tq3_0 * K = (const block_tq3_0 *) K_c;
+    GGML_UNUSED(Q_v);
+
+    float sum = 0.0f;
+
+#pragma unroll
+    for (int k_KQ_0 = 0; k_KQ_0 < int(D/sizeof(int)); k_KQ_0 += nthreads) {
+        const int k_KQ = k_KQ_0 + (nthreads == WARP_SIZE ? threadIdx.x : threadIdx.x % nthreads);
+
+        const int e0   = 4*k_KQ;               // first element covered by this int (multiple of 4)
+        const int ib   = e0 / QK_TQ;           // block index
+        const int eb   = e0 % QK_TQ;           // element offset inside the block
+        const int bit  = 3*eb;                 // first bit of the four 3-bit codes
+        const int byte = bit >> 3;
+
+        // The four 3-bit codes (12 bits) always fit in one aligned 16-bit load: for eb % 4 == 0
+        // (3*eb) & 7 is 0 or 4, so bit&7 + 12 <= 16 and byte <= (3*(QK_TQ-4))>>3 = 94 < sizeof(qs)-1.
+        uint16_t w;
+        ggml_cuda_memcpy_1<sizeof(w)>(&w, K[ib].qs + byte);
+        const uint32_t field = ((uint32_t) w >> (bit & 7)) & 0xFFFu;
+
+        const int kc = (uint32_t) (uint8_t) tq3_0_codes[(field     ) & 0x7]
+                     | ((uint32_t) (uint8_t) tq3_0_codes[(field >> 3) & 0x7] <<  8)
+                     | ((uint32_t) (uint8_t) tq3_0_codes[(field >> 6) & 0x7] << 16)
+                     | ((uint32_t) (uint8_t) tq3_0_codes[(field >> 9) & 0x7] << 24);
+
+        const int u = Q_q8[k_KQ_0/nthreads];
+        const int sumi = ggml_cuda_dp4a(kc, u, 0);
+
+        const float2 Q_ds = ((const float2 *) Q_ds_v)[k_KQ_0/nthreads];
+        const float  d_K  = __half2float(K[ib].d);
+
+        sum += d_K * TQ3_0_CODE_SCALE * Q_ds.x * float(sumi);
+    }
+
+    return sum;
+}
+
 template <typename Tds, int ni>
 static __device__ __forceinline__ void quantize_q8_1_to_shared(
     const float * __restrict__ x, const float scale, int * __restrict__ yq32, void * __restrict__ yds) {
@@ -807,6 +910,109 @@ static __device__ __forceinline__ void dequantize_V_q4_g64(const void * __restri
     }
 }
 
+// FA-VEC V-dequant for TurboQuant V. Each of the ne consecutive elements at i0 is
+// d (block L2 norm) * centroid[idx]; idx comes from the nibble / 3-bit bitstream.
+// CONTRACT: i0 is a multiple of ne; ne=4 (V_rows_per_thread) is the live path, ne=2 compiles.
+template <typename T, int ne>
+static __device__ __forceinline__ void dequantize_V_tq4_0(const void * __restrict__ vx, void * __restrict__ dst, const int64_t i0) {
+    const block_tq4_0 * x = (const block_tq4_0 *) vx;
+
+    static_assert(ne == 2 || ne == 4, "bad ne");
+
+    const int64_t ib   = i0          / QK_TQ;
+    const int     e0   = (int) (i0 % QK_TQ);
+    const int     byte = e0 / 2;                 // first of the nibble-pair source bytes (e0 is even)
+
+    int q;
+    if constexpr (ne == 4) {
+        uint16_t w;
+        ggml_cuda_memcpy_1<sizeof(w)>(&w, x[ib].qs + byte);
+        q = (w & 0x000F) | ((w & 0x00F0) << 4) | ((w & 0x0F00) << 8) | ((w & 0xF000) << 12);
+    } else {
+        const uint8_t b = x[ib].qs[byte];
+        q = (b & 0x0F) | ((b & 0xF0) << 4);
+    }
+
+    const int2     q8i = get_int_from_table_16(q, tq4_0_codes);
+    const int8_t * q8  = (const int8_t *) &q8i.x;
+
+    const float d = __half2float(x[ib].d) * TQ4_0_CODE_SCALE;
+
+#ifdef FP16_AVAILABLE
+    if constexpr (std::is_same<T, half>::value) {
+        const half2 d2 = __half2half2(__float2half(d));
+
+#pragma unroll
+        for (int l0 = 0; l0 < ne; l0 += 2) {
+            ((half2 *) dst)[l0/2] = d2 * make_half2(q8[l0 + 0], q8[l0 + 1]);
+        }
+    } else
+#endif // FP16_AVAILABLE
+    if constexpr (std::is_same<T, float>::value) {
+#pragma unroll
+        for (int l = 0; l < ne; ++l) {
+            ((float *) dst)[l] = d * float(q8[l]);
+        }
+    } else {
+        static_assert(std::is_same_v<T, void>, "unsupported type");
+    }
+}
+
+template <typename T, int ne>
+static __device__ __forceinline__ void dequantize_V_tq3_0(const void * __restrict__ vx, void * __restrict__ dst, const int64_t i0) {
+    const block_tq3_0 * x = (const block_tq3_0 *) vx;
+
+    static_assert(ne == 2 || ne == 4, "bad ne");
+
+    const int64_t ib   = i0          / QK_TQ;
+    const int     e0   = (int) (i0 % QK_TQ);
+    const int     bit  = 3*e0;
+    const int     byte = bit >> 3;
+
+    int kc;
+    if constexpr (ne == 4) {
+        // 12 bits (4 codes) fit in one aligned uint16: (3*e0)&7 is 0 or 4 for e0 % 4 == 0.
+        uint16_t w;
+        ggml_cuda_memcpy_1<sizeof(w)>(&w, x[ib].qs + byte);
+        const uint32_t field = ((uint32_t) w >> (bit & 7)) & 0xFFFu;
+        kc = (uint32_t) (uint8_t) tq3_0_codes[(field     ) & 0x7]
+           | ((uint32_t) (uint8_t) tq3_0_codes[(field >> 3) & 0x7] <<  8)
+           | ((uint32_t) (uint8_t) tq3_0_codes[(field >> 6) & 0x7] << 16)
+           | ((uint32_t) (uint8_t) tq3_0_codes[(field >> 9) & 0x7] << 24);
+    } else {
+        // 6 bits (2 codes); load the second byte only when the span crosses it (address-only branch).
+        uint32_t w = x[ib].qs[byte];
+        if ((bit & 7) > 2) {
+            w |= (uint32_t) x[ib].qs[byte + 1] << 8;
+        }
+        const uint32_t field = (w >> (bit & 7)) & 0x3Fu;
+        kc = (uint32_t) (uint8_t) tq3_0_codes[(field     ) & 0x7]
+           | ((uint32_t) (uint8_t) tq3_0_codes[(field >> 3) & 0x7] <<  8);
+    }
+
+    const int8_t * q8 = (const int8_t *) &kc;
+    const float    d  = __half2float(x[ib].d) * TQ3_0_CODE_SCALE;
+
+#ifdef FP16_AVAILABLE
+    if constexpr (std::is_same<T, half>::value) {
+        const half2 d2 = __half2half2(__float2half(d));
+
+#pragma unroll
+        for (int l0 = 0; l0 < ne; l0 += 2) {
+            ((half2 *) dst)[l0/2] = d2 * make_half2(q8[l0 + 0], q8[l0 + 1]);
+        }
+    } else
+#endif // FP16_AVAILABLE
+    if constexpr (std::is_same<T, float>::value) {
+#pragma unroll
+        for (int l = 0; l < ne; ++l) {
+            ((float *) dst)[l] = d * float(q8[l]);
+        }
+    } else {
+        static_assert(std::is_same_v<T, void>, "unsupported type");
+    }
+}
+
 template <ggml_type type_K, int D, int nthreads>
 constexpr __device__ vec_dot_KQ_t get_vec_dot_KQ() {
     if constexpr (type_K == GGML_TYPE_F16) {
@@ -827,6 +1033,10 @@ constexpr __device__ vec_dot_KQ_t get_vec_dot_KQ() {
         return vec_dot_fattn_vec_KQ_nvfp4<D, nthreads>;
     } else if constexpr (type_K == GGML_TYPE_Q4_G64) {
         return vec_dot_fattn_vec_KQ_q4_g64<D, nthreads>;
+    } else if constexpr (type_K == GGML_TYPE_TQ4_0) {
+        return vec_dot_fattn_vec_KQ_tq4_0<D, nthreads>;
+    } else if constexpr (type_K == GGML_TYPE_TQ3_0) {
+        return vec_dot_fattn_vec_KQ_tq3_0<D, nthreads>;
     } else {
         static_assert(type_K == -1, "bad type");
         return nullptr;
@@ -853,6 +1063,10 @@ constexpr __device__ dequantize_V_t get_dequantize_V() {
         return dequantize_V_nvfp4<T, ne>;
     } else if constexpr (type_V == GGML_TYPE_Q4_G64) {
         return dequantize_V_q4_g64<T, ne>;
+    } else if constexpr (type_V == GGML_TYPE_TQ4_0) {
+        return dequantize_V_tq4_0<T, ne>;
+    } else if constexpr (type_V == GGML_TYPE_TQ3_0) {
+        return dequantize_V_tq3_0<T, ne>;
     } else {
         static_assert(type_V == -1, "bad type");
         return nullptr;
@@ -1167,11 +1381,11 @@ static __global__ void flash_attn_combine_results(
     dst[tid] = VKQ_numerator / VKQ_denominator;
 }
 
-template <int DV, int ncols1, int ncols2>
+template <int DV, int ncols1, int ncols2, bool gqa_pack = false>
 void launch_fattn(
     ggml_backend_cuda_context & ctx, ggml_tensor * dst, fattn_kernel_t fattn_kernel, const int nwarps, const size_t nbytes_shared,
     const int nbatch_fa, const bool need_f16_K, const bool need_f16_V, const bool stream_k, const int warp_size = WARP_SIZE,
-    float * partial_dst = nullptr, float2 * partial_meta = nullptr
+    float * partial_dst = nullptr, float2 * partial_meta = nullptr, const int split_override = 0
 ) {
     constexpr int ncols = ncols1 * ncols2;
 
@@ -1288,7 +1502,10 @@ void launch_fattn(
     const int ntiles_x     = ((Q->ne[1] + ncols1 - 1) / ncols1);
     const int gqa_ratio    = Q->ne[2] / K->ne[2];
     const int ntiles_z_gqa = ((gqa_ratio + ncols2 - 1) / ncols2);
-    const int ntiles_dst   = ntiles_x * ntiles_z_gqa * K->ne[2] * Q->ne[3];
+    // gqa_pack: one block per (sequence, K/V head) processes the whole GQA group,
+    // so the GQA factor is folded into ncols1 (== group size) and does NOT tile z.
+    const int ntiles_z_eff = gqa_pack ? 1 : ntiles_z_gqa;
+    const int ntiles_dst   = ntiles_x * ntiles_z_eff * K->ne[2] * Q->ne[3];
 
     // Optional optimization where the mask is scanned to determine whether part of the calculation can be skipped.
     // Only worth the overhead if there is at lease one FATTN_KQ_STRIDE x FATTN_KQ_STRIDE square to be skipped or
@@ -1354,6 +1571,12 @@ void launch_fattn(
         // parallel_blocks must not be larger than what the tensor size allows:
         parallel_blocks = output_partial ? 1 : std::min(parallel_blocks, ntiles_KV);
 
+        // DEN_FA_SPLITKV: force the split count for measurement/retuning. Bypasses
+        // the wave-efficiency ramp below (which otherwise never exceeds occupancy
+        // and can leave the SMs underfilled at long context on a small-SM part).
+        if (!output_partial && split_override > 0) {
+            parallel_blocks = std::min(split_override, ntiles_KV);
+        } else {
         // If ntiles_total % blocks_per_wave != 0 then some efficiency is lost due to tail effects.
         // Test whether parallel_blocks can be set to a higher value for better efficiency.
         const int blocks_per_wave = nsm * max_blocks_per_sm;
@@ -1376,6 +1599,7 @@ void launch_fattn(
                 parallel_blocks = parallel_blocks_test;
             }
         }
+        }
 
         if (output_partial) {
             // MMA kernels flatten Q tiles, GQA groups, KV heads, and sequences
@@ -1388,12 +1612,31 @@ void launch_fattn(
         } else {
             blocks_num.x = ntiles_x;
             blocks_num.y = parallel_blocks;
-            blocks_num.z = ntiles_z_gqa*K->ne[2]*Q->ne[3];
+            blocks_num.z = ntiles_z_eff*K->ne[2]*Q->ne[3];
         }
 
         if (parallel_blocks > 1) {
             dst_tmp.alloc(parallel_blocks*ggml_nelements(KQV));
             dst_tmp_meta.alloc(parallel_blocks*ggml_nrows(KQV));
+        }
+    }
+
+    // DEN_FA_SPLITKV one-shot geometry log: emitted on the first launch after the
+    // env var is seen (any value, incl. 0 = auto), so the auto-selected split is
+    // observable. One line per process; no per-token cost.
+    {
+        static bool split_logged = false;
+        if (!split_logged && std::getenv("DEN_FA_SPLITKV") != nullptr &&
+                !stream_k && !output_partial && Q->ne[1] <= 2 && K->ne[1] > 1024) {
+            split_logged = true;
+            fprintf(stderr,
+                "[DEN_FA_SPLITKV] auto_env=%d stream_k=%d override=%d parallel_blocks=%d "
+                "grid=(%u,%u,%u) ntiles_KV=%d ntiles_dst=%d max_blocks_per_sm=%d nsm=%d n_q=%lld gqa_ratio=%d\n",
+                ggml_cuda_fattn_splitkv_env(), (int) stream_k, split_override,
+                parallel_blocks, blocks_num.x, blocks_num.y, blocks_num.z,
+                ntiles_KV, ntiles_dst, max_blocks_per_sm, nsm,
+                (long long) Q->ne[1], gqa_ratio);
+            fflush(stderr);
         }
     }
 

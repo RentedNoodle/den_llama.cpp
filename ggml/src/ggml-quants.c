@@ -703,6 +703,126 @@ void dequantize_row_q4_g64(const block_q4_g64 * GGML_RESTRICT x, float * GGML_RE
     }
 }
 
+// ===================== TurboQuant (TQ) KV codec =====================
+// One head-dim (QK_TQ = 256) vector per block. The graph path applies an orthonormal
+// Hadamard rotation to K/V before the KV store, so each coordinate of a unit-norm vector
+// ~ N(0, 1/QK_TQ). We store the L2 norm (fp16) plus, per coordinate, the index of the
+// nearest Lloyd-Max centroid (tq4_0_centroids / tq3_0_centroids, ggml-common.h).
+// Dequant = norm * centroid[idx].
+
+static inline int tq_nearest_centroid(const float * c, int nlev, float x) {
+    int best = 0;
+    float bd = fabsf(x - c[0]);
+    for (int i = 1; i < nlev; ++i) {
+        const float d = fabsf(x - c[i]);
+        if (d < bd) { bd = d; best = i; }
+    }
+    return best;
+}
+
+// 3-bit little-endian bitstream: element e occupies bits [3e, 3e+3).
+static inline void tq3_set(uint8_t * qs, int e, int v) {
+    const int bit = 3*e;
+    const uint32_t w = (uint32_t) v << (bit & 7);
+    qs[bit >> 3] |= (uint8_t) (w & 0xFF);
+    if ((bit & 7) > 5) {
+        qs[(bit >> 3) + 1] |= (uint8_t) ((w >> 8) & 0xFF);
+    }
+}
+
+static inline int tq3_get(const uint8_t * qs, int e) {
+    const int bit = 3*e;
+    uint32_t w = qs[bit >> 3];
+    if ((bit & 7) > 5) {
+        w |= (uint32_t) qs[(bit >> 3) + 1] << 8;
+    }
+    return (int) ((w >> (bit & 7)) & 0x7);
+}
+
+static float tq_block_norm(const float * xb, int qk) {
+    float ss = 0.0f;
+    for (int j = 0; j < qk; ++j) {
+        ss += xb[j]*xb[j];
+    }
+    return sqrtf(ss);
+}
+
+void quantize_row_tq4_0_ref(const float * GGML_RESTRICT x, block_tq4_0 * GGML_RESTRICT y, int64_t k) {
+    static const int qk = QK_TQ;
+    assert(k % qk == 0);
+
+    const int nb = k / qk;
+
+    for (int i = 0; i < nb; i++) {
+        const float * xb = x + i*qk;
+        const float r = tq_block_norm(xb, qk);
+        y[i].d = GGML_FP32_TO_FP16(r);
+        if (r == 0.0f) {
+            memset(y[i].qs, 0, sizeof(y[i].qs));
+            continue;
+        }
+        const float inv = 1.0f / r;
+        for (int j = 0; j < qk/2; ++j) {
+            const int i0 = tq_nearest_centroid(tq4_0_centroids, 16, xb[2*j + 0]*inv);
+            const int i1 = tq_nearest_centroid(tq4_0_centroids, 16, xb[2*j + 1]*inv);
+            y[i].qs[j] = (uint8_t) (i0 | (i1 << 4));
+        }
+    }
+}
+
+void quantize_row_tq3_0_ref(const float * GGML_RESTRICT x, block_tq3_0 * GGML_RESTRICT y, int64_t k) {
+    static const int qk = QK_TQ;
+    assert(k % qk == 0);
+
+    const int nb = k / qk;
+
+    for (int i = 0; i < nb; i++) {
+        const float * xb = x + i*qk;
+        const float r = tq_block_norm(xb, qk);
+        y[i].d = GGML_FP32_TO_FP16(r);
+        memset(y[i].qs, 0, sizeof(y[i].qs));
+        if (r == 0.0f) {
+            continue;
+        }
+        const float inv = 1.0f / r;
+        for (int j = 0; j < qk; ++j) {
+            const int idx = tq_nearest_centroid(tq3_0_centroids, 8, xb[j]*inv);
+            tq3_set(y[i].qs, j, idx);
+        }
+    }
+}
+
+void dequantize_row_tq4_0(const block_tq4_0 * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k) {
+    static const int qk = QK_TQ;
+    assert(k % qk == 0);
+
+    const int nb = k / qk;
+
+    for (int i = 0; i < nb; i++) {
+        const float d = GGML_FP16_TO_FP32(x[i].d);
+        for (int j = 0; j < qk/2; ++j) {
+            const int i0 = x[i].qs[j] & 0x0F;
+            const int i1 = x[i].qs[j] >>   4;
+            y[i*qk + 2*j + 0] = d * (TQ4_0_CODE_SCALE * tq4_0_codes[i0]);
+            y[i*qk + 2*j + 1] = d * (TQ4_0_CODE_SCALE * tq4_0_codes[i1]);
+        }
+    }
+}
+
+void dequantize_row_tq3_0(const block_tq3_0 * GGML_RESTRICT x, float * GGML_RESTRICT y, int64_t k) {
+    static const int qk = QK_TQ;
+    assert(k % qk == 0);
+
+    const int nb = k / qk;
+
+    for (int i = 0; i < nb; i++) {
+        const float d = GGML_FP16_TO_FP32(x[i].d);
+        for (int j = 0; j < qk; ++j) {
+            y[i*qk + j] = d * (TQ3_0_CODE_SCALE * tq3_0_codes[tq3_get(x[i].qs, j)]);
+        }
+    }
+}
+
 //
 // 2-6 bit quantization in super-blocks
 //
@@ -5668,6 +5788,14 @@ bool ggml_validate_row_data(enum ggml_type type, const void * data, size_t nbyte
         case GGML_TYPE_Q4_G64:
             {
                 VALIDATE_ROW_DATA_D_F16_IMPL(block_q4_g64, data, nb);
+            } break;
+        case GGML_TYPE_TQ4_0:
+            {
+                VALIDATE_ROW_DATA_D_F16_IMPL(block_tq4_0, data, nb);
+            } break;
+        case GGML_TYPE_TQ3_0:
+            {
+                VALIDATE_ROW_DATA_D_F16_IMPL(block_tq3_0, data, nb);
             } break;
         case GGML_TYPE_Q2_K:
             {

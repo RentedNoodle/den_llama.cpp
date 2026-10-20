@@ -129,7 +129,14 @@ if (CUDAToolkit_FOUND)
             template-instances/fattn-vec-instance-nvfp4-q8_0.cu
             template-instances/fattn-vec-instance-q4_g64-q4_g64.cu
             template-instances/fattn-vec-instance-q8_0-q4_g64.cu
-            template-instances/fattn-vec-instance-q4_g64-q8_0.cu)
+            template-instances/fattn-vec-instance-q4_g64-q8_0.cu
+            # TurboQuant TQ KV pairs (D=256 only; gated at runtime by DEN_TQ_KV).
+            template-instances/fattn-vec-instance-tq4_0-tq4_0.cu
+            template-instances/fattn-vec-instance-tq3_0-tq3_0.cu
+            template-instances/fattn-vec-instance-q8_0-tq4_0.cu
+            template-instances/fattn-vec-instance-tq4_0-q8_0.cu
+            template-instances/fattn-vec-instance-q8_0-tq3_0.cu
+            template-instances/fattn-vec-instance-tq3_0-q8_0.cu)
     endif()
 
     if (GGML_CUDA_KVARN)

@@ -297,6 +297,80 @@ static __device__ void quantize_f32_q4_g64_block(const float * __restrict__ x, b
     }
 }
 
+// TurboQuant TQ block quantizers for set_rows / cpy. Mirror quantize_row_tq*_ref
+// (ggml-quants.c): store the L2 norm (fp16) plus the nearest Lloyd-Max centroid index
+// per element. Local device copies of the centroid tables avoid include-order coupling.
+static const __device__ float tq4_0_c_dev[16] = {
+    -0.170786848f, -0.129313577f, -0.101127899f, -0.078514450f,
+    -0.058896279f, -0.041047445f, -0.024253019f, -0.008024689f,
+     0.008024689f,  0.024253019f,  0.041047445f,  0.058896279f,
+     0.078514450f,  0.101127899f,  0.129313577f,  0.170786848f,
+};
+static const __device__ float tq3_0_c_dev[8] = {
+    -0.134496607f, -0.083994330f, -0.047250330f, -0.015318386f,
+     0.015318386f,  0.047250330f,  0.083994330f,  0.134496607f,
+};
+
+static __device__ __forceinline__ int tq_nearest_centroid_dev(const float * c, int nlev, float x) {
+    int best = 0;
+    float bd = fabsf(x - c[0]);
+    for (int i = 1; i < nlev; ++i) {
+        const float dd = fabsf(x - c[i]);
+        if (dd < bd) { bd = dd; best = i; }
+    }
+    return best;
+}
+
+static __device__ __forceinline__ void tq3_set_dev(uint8_t * qs, int e, int v) {
+    const int bit = 3*e;
+    const uint32_t w = (uint32_t) v << (bit & 7);
+    qs[bit >> 3] |= (uint8_t) (w & 0xFF);
+    if ((bit & 7) > 5) {
+        qs[(bit >> 3) + 1] |= (uint8_t) ((w >> 8) & 0xFF);
+    }
+}
+
+static __device__ void quantize_f32_tq4_0_block(const float * __restrict__ x, block_tq4_0 * __restrict__ y) {
+    float ss = 0.0f;
+    for (int j = 0; j < QK_TQ; ++j) {
+        ss += x[j]*x[j];
+    }
+    const float r = sqrtf(ss);
+    y->d = r;
+    if (r == 0.0f) {
+        for (int j = 0; j < QK_TQ/2; ++j) {
+            y->qs[j] = 0;
+        }
+        return;
+    }
+    const float inv = 1.0f / r;
+    for (int j = 0; j < QK_TQ/2; ++j) {
+        const int i0 = tq_nearest_centroid_dev(tq4_0_c_dev, 16, x[2*j + 0]*inv);
+        const int i1 = tq_nearest_centroid_dev(tq4_0_c_dev, 16, x[2*j + 1]*inv);
+        y->qs[j] = (uint8_t) (i0 | (i1 << 4));
+    }
+}
+
+static __device__ void quantize_f32_tq3_0_block(const float * __restrict__ x, block_tq3_0 * __restrict__ y) {
+    float ss = 0.0f;
+    for (int j = 0; j < QK_TQ; ++j) {
+        ss += x[j]*x[j];
+    }
+    const float r = sqrtf(ss);
+    y->d = r;
+    for (int j = 0; j < (QK_TQ*3)/8; ++j) {
+        y->qs[j] = 0;
+    }
+    if (r == 0.0f) {
+        return;
+    }
+    const float inv = 1.0f / r;
+    for (int j = 0; j < QK_TQ; ++j) {
+        const int idx = tq_nearest_centroid_dev(tq3_0_c_dev, 8, x[j]*inv);
+        tq3_set_dev(y->qs, j, idx);
+    }
+}
+
 // Wrapper functions for cpy.cu compatibility
 static __device__ void cpy_blck_f32_q4_0(const char * cxi, char * cdsti) {
     quantize_f32_q4_0_block((const float *)cxi, (block_q4_0 *)cdsti);

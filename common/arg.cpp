@@ -314,6 +314,8 @@ const std::vector<ggml_type> kv_cache_types = {
     GGML_TYPE_Q5_1,
     GGML_TYPE_NVFP4, // NVFP4 KV cache (36 B / 64 els); name resolved via ggml_type_name -> "nvfp4"
     GGML_TYPE_Q4_G64, // Q4_G64 KV cache (34 B / 64 els); name resolved via ggml_type_name -> "q4_g64"
+    GGML_TYPE_TQ4_0, // TurboQuant 4-bit Lloyd-Max KV cache (66 B / 128 els); name -> "tq4_0"
+    GGML_TYPE_TQ3_0, // TurboQuant 3-bit Lloyd-Max KV cache (50 B / 128 els); name -> "tq3_0"
 };
 
 static ggml_type kv_cache_type_from_str(const std::string & s) {

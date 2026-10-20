@@ -431,7 +431,9 @@ extern "C" {
         GGML_TYPE_Q1_0    = 41,
         GGML_TYPE_Q2_0    = 42,
         GGML_TYPE_Q4_G64  = 43, // signed-symmetric INT4, one FP16 scale per 64 values (KV codec)
-        GGML_TYPE_COUNT   = 44,
+        GGML_TYPE_TQ4_0   = 44, // TurboQuant 4-bit Lloyd-Max MSE codec, block 128 = one head vector (KV)
+        GGML_TYPE_TQ3_0   = 45, // TurboQuant 3-bit Lloyd-Max MSE codec, block 128 = one head vector (KV)
+        GGML_TYPE_COUNT   = 46,
     };
 
     // precision

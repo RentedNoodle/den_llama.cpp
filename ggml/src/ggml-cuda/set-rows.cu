@@ -230,7 +230,8 @@ static void set_rows_cuda(
 
     cudaStream_t stream = ctx.stream();
 
-    GGML_ASSERT(dst_row_base == 0 || dst->type == GGML_TYPE_Q4_0 || dst->type == GGML_TYPE_Q8_0 || dst->type == GGML_TYPE_NVFP4 || dst->type == GGML_TYPE_Q4_G64);
+    GGML_ASSERT(dst_row_base == 0 || dst->type == GGML_TYPE_Q4_0 || dst->type == GGML_TYPE_Q8_0 || dst->type == GGML_TYPE_NVFP4 || dst->type == GGML_TYPE_Q4_G64 ||
+        dst->type == GGML_TYPE_TQ4_0 || dst->type == GGML_TYPE_TQ3_0);
 
     if (dst->type == GGML_TYPE_F32) {
         set_rows_cuda(
@@ -342,6 +343,26 @@ static void set_rows_cuda(
             nb1, nb2, nb3,
             stream, dst_row_base
         );
+    } else if (dst->type == GGML_TYPE_TQ4_0) {
+        set_rows_cuda_quant<idx_t, block_tq4_0, QK_TQ, quantize_f32_tq4_0_block>(
+            src0_d, src1_d, (block_tq4_0*)dst->data,
+            ne00, ne01, ne02, ne03,
+            ne10, ne11, ne12, ne13,
+            nb01, nb02, nb03,
+            nb10, nb11, nb12,
+            nb1, nb2, nb3,
+            stream, dst_row_base
+        );
+    } else if (dst->type == GGML_TYPE_TQ3_0) {
+        set_rows_cuda_quant<idx_t, block_tq3_0, QK_TQ, quantize_f32_tq3_0_block>(
+            src0_d, src1_d, (block_tq3_0*)dst->data,
+            ne00, ne01, ne02, ne03,
+            ne10, ne11, ne12, ne13,
+            nb01, nb02, nb03,
+            nb10, nb11, nb12,
+            nb1, nb2, nb3,
+            stream, dst_row_base
+        );
     } else {
         GGML_ABORT("unsupported type %s", ggml_type_name(dst->type));
     }
@@ -436,7 +457,8 @@ void ggml_cuda_op_set_rows_staged(
 
     GGML_ASSERT(src0->type == GGML_TYPE_F32);
     GGML_ASSERT(src1->type == GGML_TYPE_I64);
-    GGML_ASSERT(dst->type == GGML_TYPE_Q4_0 || dst->type == GGML_TYPE_Q8_0 || dst->type == GGML_TYPE_NVFP4 || dst->type == GGML_TYPE_Q4_G64);
+    GGML_ASSERT(dst->type == GGML_TYPE_Q4_0 || dst->type == GGML_TYPE_Q8_0 || dst->type == GGML_TYPE_NVFP4 || dst->type == GGML_TYPE_Q4_G64 ||
+        dst->type == GGML_TYPE_TQ4_0 || dst->type == GGML_TYPE_TQ3_0);
     GGML_ASSERT(first_row >= 0 && row_count > 1 && first_row + row_count <= dst->ne[1]);
 
     const size_t row_bytes = ggml_row_size(dst->type, dst->ne[0]);

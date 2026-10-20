@@ -236,6 +236,30 @@ typedef struct {
 } block_q4_g64;
 static_assert(sizeof(block_q4_g64) == sizeof(ggml_half) + QK_Q4_G64/2, "wrong q4_g64 block size/padding");
 
+// TurboQuant MSE codec: one head-dim (256) vector per block. The graph applies an
+// orthonormal Hadamard rotation of size hadamard_size(n_embd_head)=256 to each head
+// vector before the KV store; the rotation unit is the whole head, so one block must
+// span the whole head. After the rotation each coordinate of a unit-norm vector
+// ~ N(0, 1/256); the codec stores the L2 norm (fp16) and, per coordinate, the index of
+// the nearest Lloyd-Max centroid for that Gaussian. Dequant is norm * centroid[idx].
+// ALU-only, no PCIe.
+#define QK_TQ 256
+typedef struct {
+    ggml_half d;            // fp16 L2 norm of the source (pre-rotation) head vector
+    uint8_t qs[QK_TQ/2];    // 4-bit Lloyd-Max centroid indices (low nibble = element 2j)
+} block_tq4_0;
+static_assert(sizeof(block_tq4_0) == sizeof(ggml_half) + QK_TQ/2, "wrong tq4_0 block size/padding");
+
+typedef struct {
+    ggml_half d;            // fp16 L2 norm of the source (pre-rotation) head vector
+    uint8_t qs[(QK_TQ*3)/8]; // 3-bit Lloyd-Max centroid indices, little-endian bitstream (elem j at bit 3j)
+} block_tq3_0;
+static_assert(sizeof(block_tq3_0) == sizeof(ggml_half) + (QK_TQ*3)/8, "wrong tq3_0 block size/padding");
+
+// TQ codec mirrors the q4_0-style qr=2 pairing used by the generic CUDA dequant block kernel.
+#define QR_TQ 2
+#define QI_TQ (QK_TQ / (4 * QR_TQ))
+
 #define QK5_0 32
 typedef struct {
     ggml_half d;           // delta
@@ -518,6 +542,37 @@ static_assert(sizeof(block_iq4_xs) == sizeof(ggml_half) + sizeof(uint16_t) + QK_
 
 GGML_TABLE_BEGIN(uint8_t, kmask_iq2xs, 8)
     1, 2, 4, 8, 16, 32, 64, 128
+GGML_TABLE_END()
+
+// TurboQuant Lloyd-Max MSE centroids for a coordinate of a unit-norm vector after an
+// orthonormal Hadamard rotation, i.e. N(0, 1/QK_TQ). Dequant is d (stored L2 norm) * centroid.
+// 16-level (4-bit) and 8-level (3-bit) optimal scalar quantizers, computed by Lloyd iteration.
+GGML_TABLE_BEGIN(float, tq4_0_centroids, 16)
+    -0.170786848f, -0.129313577f, -0.101127899f, -0.078514450f,
+    -0.058896279f, -0.041047445f, -0.024253019f, -0.008024689f,
+     0.008024689f,  0.024253019f,  0.041047445f,  0.058896279f,
+     0.078514450f,  0.101127899f,  0.129313577f,  0.170786848f,
+GGML_TABLE_END()
+
+GGML_TABLE_BEGIN(float, tq3_0_centroids, 8)
+    -0.134496607f, -0.083994330f, -0.047250330f, -0.015318386f,
+     0.015318386f,  0.047250330f,  0.083994330f,  0.134496607f,
+GGML_TABLE_END()
+
+// Integer-foldable image of the Lloyd-Max codebook: centroid[idx] ~= TQ*_CODE_SCALE * tq*_0_codes[idx].
+// The centroids are irrational so the old K-dot had to scalar-multiply each element; storing a fine
+// signed-int8 image of every centroid lets the K-dot use dp4a on the int8 codes and fold the single
+// global scale (and the per-block L2 norm d) out of the integer dot, exactly like q4_0's d. The
+// reconstruction error is <= 0.5*scale per level (tq4 max 6.4e-4, tq3 max 2.5e-4), i.e. a few percent
+// of one Lloyd-Max cell, well below the codec's own error. Codes are symmetric (dp4a is signed).
+#define TQ4_0_CODE_SCALE 0.0013448456f
+GGML_TABLE_BEGIN(int8_t, tq4_0_codes, 16)
+    -127, -96, -75, -58, -44, -31, -18, -6, 6, 18, 31, 44, 58, 75, 96, 127,
+GGML_TABLE_END()
+
+#define TQ3_0_CODE_SCALE 0.0010759834f
+GGML_TABLE_BEGIN(int8_t, tq3_0_codes, 8)
+    -125, -78, -44, -14, 14, 44, 78, 125,
 GGML_TABLE_END()
 
 GGML_TABLE_BEGIN(uint8_t, ksigns_iq2xs, 128)

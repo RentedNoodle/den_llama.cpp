@@ -2035,6 +2035,16 @@ static void ggml_cuda_flash_attn_ext_vec(ggml_backend_cuda_context & ctx, ggml_t
     FATTN_VEC_CASES_ALL_D(GGML_TYPE_Q4_G64, GGML_TYPE_Q4_G64)
     FATTN_VEC_CASES_ALL_D(GGML_TYPE_Q8_0,   GGML_TYPE_Q4_G64)
     FATTN_VEC_CASES_ALL_D(GGML_TYPE_Q4_G64, GGML_TYPE_Q8_0)
+
+    // TurboQuant TQ KV pairs; D=256 only (block = 256 = one head vector). Gated at runtime by
+    // DEN_TQ_KV via ggml_cuda_fattn_kv_type_supported()/mixed-pair table, so an unset env is
+    // byte-identical to the pre-TQ build.
+    FATTN_VEC_CASE(256, GGML_TYPE_TQ4_0, GGML_TYPE_TQ4_0)
+    FATTN_VEC_CASE(256, GGML_TYPE_TQ3_0, GGML_TYPE_TQ3_0)
+    FATTN_VEC_CASE(256, GGML_TYPE_Q8_0,  GGML_TYPE_TQ4_0)
+    FATTN_VEC_CASE(256, GGML_TYPE_TQ4_0, GGML_TYPE_Q8_0)
+    FATTN_VEC_CASE(256, GGML_TYPE_Q8_0,  GGML_TYPE_TQ3_0)
+    FATTN_VEC_CASE(256, GGML_TYPE_TQ3_0, GGML_TYPE_Q8_0)
 #endif // GGML_CUDA_FA_ALL_QUANTS
 
     GGML_ABORT("fatal error");
@@ -2047,6 +2057,16 @@ enum best_fattn_kernel {
     BEST_FATTN_KERNEL_VEC     = 100,
     BEST_FATTN_KERNEL_MMA_F16 = 400,
 };
+
+// DEN_TQ_KV: opt-in switch for the TurboQuant KV codec. When unset, TQ KV types are reported
+// unsupported and never dispatched, so the engine is byte-identical to the pre-TQ build.
+static bool ggml_cuda_tq_kv_enabled() {
+    static const bool enabled = []() {
+        const char * e = std::getenv("DEN_TQ_KV");
+        return e != nullptr && atoi(e) != 0;
+    }();
+    return enabled;
+}
 
 static bool ggml_cuda_fattn_kv_type_supported(ggml_type type) {
     switch (type) {
@@ -2065,6 +2085,9 @@ static bool ggml_cuda_fattn_kv_type_supported(ggml_type type) {
         case GGML_TYPE_Q4_G64:
         case GGML_TYPE_BF16:
             return true;
+        case GGML_TYPE_TQ4_0:
+        case GGML_TYPE_TQ3_0:
+            return ggml_cuda_tq_kv_enabled();
         default:
             return false;
     }
@@ -2159,12 +2182,19 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
     // CMakeLists.txt + the vec case table above. q8_0-K/q4_0-V is the legacy pair; the two
     // NVFP4 pairs (K=q8_0/V=nvfp4 and K=nvfp4/V=q8_0) expose K-vs-V precision isolation for
     // the matched NVFP4 case (nvfp4-mixed-pair-limitation.md).
-    const bool mixed_pair_ok =
+    bool mixed_pair_ok =
         (K->type == GGML_TYPE_Q8_0  && V->type == GGML_TYPE_Q4_0) ||
         (K->type == GGML_TYPE_Q8_0  && V->type == GGML_TYPE_NVFP4) ||
         (K->type == GGML_TYPE_NVFP4 && V->type == GGML_TYPE_Q8_0) ||
         (K->type == GGML_TYPE_Q8_0  && V->type == GGML_TYPE_Q4_G64) ||
         (K->type == GGML_TYPE_Q4_G64 && V->type == GGML_TYPE_Q8_0);
+    if (ggml_cuda_tq_kv_enabled()) {
+        mixed_pair_ok = mixed_pair_ok ||
+            (K->type == GGML_TYPE_Q8_0 && V->type == GGML_TYPE_TQ4_0) ||
+            (K->type == GGML_TYPE_TQ4_0 && V->type == GGML_TYPE_Q8_0) ||
+            (K->type == GGML_TYPE_Q8_0 && V->type == GGML_TYPE_TQ3_0) ||
+            (K->type == GGML_TYPE_TQ3_0 && V->type == GGML_TYPE_Q8_0);
+    }
     if (K->type != V->type && !mixed_pair_ok) {
         return BEST_FATTN_KERNEL_NONE;
     }
@@ -2182,8 +2212,23 @@ static best_fattn_kernel ggml_cuda_get_best_fattn_kernel(const int device, const
     // 192 satisfies % 64 == 0 but has no vec instance (DKQ != DV); force it onto the MMA path.
     const bool can_use_vector_kernel = Q->ne[0] <= 256 && Q->ne[0] % 64 == 0 && Q->ne[0] != 192 && K->ne[1] % FATTN_KQ_STRIDE == 0;
 
+    // DEN_FA_PACK_MMA: experimental (default OFF). When set, quantized-K/V decode
+    // (Q->ne[1] == 1) is routed to the packed tensor-core MMA f16 kernel instead of the
+    // vector kernel. The MMA path materializes f16 K/V once per op (see need_f16_K/V in
+    // launch_fattn) but then processes the GQA group in the MMA N dimension (ncols2),
+    // reusing one KV tile across the whole group. Runtime env gate so the change is a
+    // no-op (byte-identical dispatch) when unset.
+    static const bool den_pack_mma = []() {
+        const char * e = std::getenv("DEN_FA_PACK_MMA");
+        return e != nullptr && e[0] != '\0' && e[0] != '0';
+    }();
+
     // If Turing tensor cores are available, use them:
     if (turing_mma_available(cc) && Q->ne[0] != 40 && Q->ne[0] != 72) {
+        if (den_pack_mma && can_use_vector_kernel && Q->ne[1] == 1 &&
+                (ggml_is_quantized(K->type) || ggml_is_quantized(V->type))) {
+            return BEST_FATTN_KERNEL_MMA_F16;
+        }
         if (can_use_vector_kernel) {
             if (!ggml_is_quantized(K->type) && !ggml_is_quantized(V->type)) {
                 if (cc >= GGML_CUDA_CC_ADA_LOVELACE && Q->ne[1] == 1 && Q->ne[3] == 1 && !(gqa_ratio > 4 && K->ne[1] >= 8192)) {
