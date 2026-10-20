@@ -749,6 +749,34 @@ llama_memory_i * llama_memory_kvmem_maybe_create(
         const llama_model & model,
         const llama_memory_params & params,
         const llama_cparams & cparams) {
+    // Plain llama-server does not call llama_kvmem_set_params(). Match the
+    // KVMem wrapper's environment defaults when no caller supplied params.
+    if (!g_kvmem_params.enabled) {
+        const char * en  = getenv("KVMEM_ENABLE");
+        const char * bud = getenv("KVMEM_BUDGET");
+        const char * gen = getenv("KVMEM_GEN_RESERVE");
+        const char * blk = getenv("KVMEM_BLOCK_TOKENS");
+        const char * mth = getenv("KVMEM_METHOD");
+        const char * rec = getenv("KVMEM_RECENT_TOKENS");
+        const char * snk = getenv("KVMEM_SINK_TOKENS");
+        const char * mts = getenv("KVMEM_MTP_STATE");
+        if ((en && en[0] && en[0] != '0') || (bud && bud[0])) {
+            g_kvmem_params = {};
+            g_kvmem_params.enabled       = true;
+            g_kvmem_params.block_tokens  = blk ? (uint32_t) atoi(blk) : 128;
+            g_kvmem_params.gen_reserve   = gen ? (uint32_t) atoi(gen) : 256;
+            g_kvmem_params.budget        = bud ? (uint32_t) atoi(bud) : 131072;
+            g_kvmem_params.method        = mth ? atoi(mth) : 1;
+            g_kvmem_params.recent_tokens = rec ? (uint32_t) atoi(rec) : 0;
+            g_kvmem_params.sink_tokens   = snk ? (uint32_t) atoi(snk) : 0;
+            g_kvmem_params.query_begin   = -1;
+            g_kvmem_params.query_end     = -1;
+            g_kvmem_params.force_pos     = -1;
+            g_kvmem_params.mtp_state     = mts ? atoi(mts) : 2;
+            LLAMA_LOG_INFO("%s: KVMem enabled from env (budget=%u block=%u gen_reserve=%u)\n",
+                    __func__, g_kvmem_params.budget, g_kvmem_params.block_tokens, g_kvmem_params.gen_reserve);
+        }
+    }
     if (!g_kvmem_params.enabled) {
         return nullptr;
     }
@@ -3144,7 +3172,14 @@ void llama_memory_kvmem::harvest_pending(ggml_backend_sched_t sched) {
     }
     if (pending_capture_.empty() || pos_queue_.empty()) {
         harvest_flush();
-        if (sched) {
+        // A no-capture ubatch has no graph outputs owned by KVMem to harvest.
+        // Avoid a full scheduler sync on the per-token decode path; Q-armed
+        // ubatches retain the synchronization below with their captures.
+        static const bool skip_no_capture_sync = []() {
+            const char * e = getenv("KVMEM_PIPELINE_HARVEST");
+            return !(e && e[0] == '0');
+        }();
+        if (sched && !(skip_no_capture_sync && pending_capture_.empty())) {
             ggml_backend_sched_synchronize(sched);
         }
         harvest_full_blocks_async();

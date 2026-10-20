@@ -16,6 +16,9 @@
 #include "speculative.h"
 #include "mtmd.h"
 #include "mtmd-helper.h"
+#if defined(LLAMA_KVMEM)
+#include "llama-kvmem-hooks.h"
+#endif
 
 #include <algorithm>
 #include <cstddef>
@@ -26,6 +29,7 @@
 #include <random>
 #include <utility>
 #include <fstream>
+#include <cstdlib>
 
 // fix problem with std::min and std::max
 #if defined(_WIN32)
@@ -51,6 +55,29 @@ static common_speculative_output_limits server_output_limits(const common_params
     result.per_seq = std::max<int32_t>(1, result.per_seq);
     return result;
 }
+
+#if defined(LLAMA_KVMEM)
+static bool server_kvmem_lifecycle_enabled() {
+    const char * value = std::getenv("DEN_KVMEM_LIFECYCLE");
+    return value != nullptr && value[0] == '1' && value[1] == '\0';
+}
+
+// Route A stage isolation (default = full current Route A):
+//   KVMEM_ROUTE_A_VARIANT=a / 0 -> span + Q capture only (no commit)
+//   KVMEM_ROUTE_A_VARIANT=b / 1 -> span + apply_retrieval + pin (no remove/replay)
+//   KVMEM_ROUTE_A_VARIANT=c / 2 -> full remove + partial ckpt + query replay (default)
+static int server_kvmem_route_a_variant() {
+    const char * value = std::getenv("KVMEM_ROUTE_A_VARIANT");
+    if (value == nullptr || value[0] == '\0') {
+        return 2;
+    }
+    switch (value[0]) {
+        case '0': case 'a': case 'A': return 0;
+        case '1': case 'b': case 'B': return 1;
+        default: return 2;
+    }
+}
+#endif
 
 // synthetic draft verification for benchmarking - accept draft tokens at random instead of by match with the target
 // on replay the draft was already accepted before a context checkpoint restore, so repeat the same decisions
@@ -255,6 +282,13 @@ struct server_slot {
     llama_tokens spec_prompt;
     std::vector<int32_t> spec_i_batch;
     common_prompt_checkpoint spec_ckpt;
+    // Route A KVMem lifecycle state is intentionally per-slot and opt-in.
+    common_prompt_checkpoint kvmem_lifecycle_ckpt;
+    bool kvmem_lifecycle_active = false;
+    bool kvmem_lifecycle_capture = false;
+    bool kvmem_lifecycle_replayed = false;
+    int32_t kvmem_lifecycle_qbegin = -1;
+    int32_t kvmem_lifecycle_qend = -1;
     bool spec_is_replay = false;
     std::mt19937 spec_synth_rng;
 
@@ -369,7 +403,20 @@ struct server_slot {
     void reset() {
         SLT_DBG(*this, "%s", "\n");
 
+#if defined(LLAMA_KVMEM)
+        // -np1 gives this lifecycle sole ownership of the process-wide span.
+        // Clear it on every early release while this slot is still armed.
+        if (kvmem_lifecycle_active) {
+            llama_kvmem_set_request_span(-1, -1, -1);
+        }
+#endif
         spec_is_replay = false;
+        kvmem_lifecycle_active = false;
+        kvmem_lifecycle_capture = false;
+        kvmem_lifecycle_replayed = false;
+        kvmem_lifecycle_qbegin = -1;
+        kvmem_lifecycle_qend = -1;
+        kvmem_lifecycle_ckpt.clear();
 
         last_nl_pos    = 0;
         generated_text = "";
@@ -3166,6 +3213,31 @@ private:
                         // keep track how many tokens we can reuse from the previous state
                         int n_past = 0;
 
+                        // Route A starts cold. Prompt KV reuse can leave the adapter's query
+                        // capture and recurrent state at a different lifecycle boundary.
+#if defined(LLAMA_KVMEM)
+                        if (server_kvmem_lifecycle_enabled() && params_base.n_parallel == 1 &&
+                                slot.task->type == SERVER_TASK_TYPE_COMPLETION && !slot.task->tokens.has_mtmd) {
+                            const int32_t user_begin = slot.task->params.message_spans.last_user_message_pos();
+                            if (user_begin >= 0 && slot.task->n_tokens() > 0) {
+                                slot.kvmem_lifecycle_qend = slot.task->n_tokens();
+                                slot.kvmem_lifecycle_qbegin = std::max<int32_t>(user_begin,
+                                        slot.kvmem_lifecycle_qend - 512);
+                                slot.kvmem_lifecycle_active = true;
+                                slot.kvmem_lifecycle_capture = false;
+                                // Exact replay boundary is logical prompt position; adapter
+                                // translates it to its row position internally.
+                                llama_kvmem_set_request_span(slot.kvmem_lifecycle_qbegin,
+                                        slot.kvmem_lifecycle_qend, slot.kvmem_lifecycle_qbegin);
+                                slot.kvmem_lifecycle_ckpt.clear();
+                                slot.prompt.checkpoints.clear();
+                                n_past = 0;
+                                SLT_INF(slot, "KVMem Route A cold lifecycle, query=[%d,%d), prompt=%d\n",
+                                        slot.kvmem_lifecycle_qbegin, slot.kvmem_lifecycle_qend, slot.task->n_tokens());
+                            }
+                        }
+#endif
+
                         // empty prompt passed -> release the slot and send empty response
                         if (input_tokens.empty()) {
                             SLT_WRN(slot, "%s", "empty prompt - releasing slot\n");
@@ -3220,6 +3292,10 @@ private:
                             if (slot.task->params.cache_prompt) {
                                 // reuse any previously computed tokens that are common with the new prompt
                                 n_past = slot.prompt.tokens.get_common_prefix(input_tokens);
+
+                                if (slot.kvmem_lifecycle_active) {
+                                    n_past = 0;
+                                }
 
                                 // if there is an alora invoked, don't cache after the invocation start
                                 if (slot.alora_invocation_start > 0) {
@@ -3548,6 +3624,21 @@ private:
 
                     // add prompt tokens for processing in the current batch
                     while (slot.prompt.n_tokens() < slot.task->n_tokens() && batch.size() < n_batch) {
+#if defined(LLAMA_KVMEM)
+                        if (slot.kvmem_lifecycle_active &&
+                                slot.prompt.n_tokens() == slot.kvmem_lifecycle_qbegin) {
+                            if (!slot.kvmem_lifecycle_capture) {
+                                slot.kvmem_lifecycle_ckpt.update_pos(slot.prompt.n_tokens(),
+                                        slot.prompt.tokens.pos_next() - 1, slot.prompt.tokens.pos_next() - 1);
+                                slot.kvmem_lifecycle_ckpt.update_tgt(slot.ctx_tgt, slot.id,
+                                        LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+                                slot.kvmem_lifecycle_capture = true;
+                            }
+                            if (slot.prompt.n_tokens() == slot.kvmem_lifecycle_qbegin && batch.size() > n_tokens_prev) {
+                                break;
+                            }
+                        }
+#endif
                         // get next token to process
                         llama_token cur_tok = input_tokens[slot.prompt.n_tokens()];
                         if (cur_tok == LLAMA_TOKEN_NULL) {
@@ -3571,6 +3662,13 @@ private:
                             /* output    = */ slot.need_embd(),
                             /* is_prompt = */ true);
                         slot.prompt.tokens.push_back(cur_tok);
+
+#if defined(LLAMA_KVMEM)
+                        if (slot.kvmem_lifecycle_active &&
+                                slot.prompt.n_tokens() == slot.kvmem_lifecycle_qbegin) {
+                            break;
+                        }
+#endif
 
                         // break at the last user message, or at user messages at least min step past the last checkpoint
                         if (do_checkpoint && spans.is_user_start(slot.prompt.n_tokens())) {
@@ -3859,6 +3957,62 @@ private:
 
                 GGML_ASSERT(slot.task->need_sampling());
 
+#if defined(LLAMA_KVMEM)
+                if (slot.kvmem_lifecycle_active && slot.kvmem_lifecycle_capture &&
+                        slot.kvmem_lifecycle_qbegin >= 0 &&
+                        slot.kvmem_lifecycle_qend == slot.task->n_tokens()) {
+                    const uint32_t qbegin = (uint32_t) slot.kvmem_lifecycle_qbegin;
+                    const uint32_t prompt_end = (uint32_t) slot.kvmem_lifecycle_qend;
+                    const int route_a_variant = server_kvmem_route_a_variant();
+                    if (route_a_variant >= 1 && llama_kvmem_query_replay_fits(qbegin, prompt_end)) {
+                        // Retrieval is committed only after complete Q capture. Validate the
+                        // adapter's actual resident view before discarding prefill KV.
+                        llama_kvmem_apply_retrieval(slot.ctx_tgt);
+                        llama_kvmem_pin_working_set();
+                        const auto view = llama_kvmem_get_attention_view();
+                        if (route_a_variant >= 2 && view.valid) {
+                            if (!llama_kvmem_remove_logical(slot.ctx_tgt, qbegin, prompt_end)) {
+                                throw std::runtime_error("KVMem Route A failed to remove query/tail rows");
+                            }
+                            slot.kvmem_lifecycle_ckpt.load_tgt(slot.ctx_tgt, slot.id,
+                                    LLAMA_STATE_SEQ_FLAGS_PARTIAL_ONLY);
+                            llama_kvmem_set_replay(true);
+                            bool replay_ok = true;
+                            const auto & tokens = slot.task->tokens;
+                            for (uint32_t pos = qbegin; pos < prompt_end; ) {
+                                const int32_t n = (int32_t) std::min<uint32_t>(
+                                        (uint32_t) llama_n_ubatch(slot.ctx_tgt), prompt_end - pos);
+                                llama_batch replay = llama_batch_init(n, 0, 1);
+                                for (int32_t i = 0; i < n; ++i) {
+                                    common_batch_add(replay, tokens[pos + i], pos + i,
+                                            { slot.id }, pos + i + 1 == prompt_end);
+                                }
+                                replay_ok = llama_decode(slot.ctx_tgt, replay) == 0;
+                                llama_batch_free(replay);
+                                if (!replay_ok) {
+                                    break;
+                                }
+                                pos += n;
+                            }
+                            llama_synchronize(slot.ctx_tgt);
+                            llama_kvmem_set_replay(false);
+                            // An empty request span disables further query capture during
+                            // generation; the selected resident view remains active.
+                            llama_kvmem_set_request_span(-1, -1, -1);
+                            if (!replay_ok) {
+                                throw std::runtime_error("KVMem Route A query replay failed");
+                            }
+                            slot.kvmem_lifecycle_replayed = true;
+                            SLT_INF(slot, "KVMem Route A retrieval replay complete, query=[%u,%u)\n",
+                                    qbegin, prompt_end);
+                        }
+                    }
+                    llama_kvmem_set_request_span(-1, -1, -1);
+                    slot.kvmem_lifecycle_active = false;
+                    slot.kvmem_lifecycle_capture = false;
+                }
+#endif
+
                 // prompt evaluated for next-token prediction
                 slot.state = SLOT_STATE_GENERATING;
 
@@ -3870,17 +4024,20 @@ private:
             }
 
             if (slot.can_speculate() && !slot.spec_draft.empty()) {
+                slot.kvmem_lifecycle_replayed = false;
                 return; // sample using speculative decoding
             }
 
             // shifted according to the current sub-batch
-            const int tok_idx = slot.i_batch - off;
+            const int tok_idx = slot.kvmem_lifecycle_replayed
+                    ? -1 : slot.i_batch - off;
 
             llama_token id;
             {
                 scoped_timer timer(t_sampl, n_sampl);
                 id = common_sampler_sample(slot.smpl.get(), slot.ctx_tgt, tok_idx);
             }
+            slot.kvmem_lifecycle_replayed = false;
 
             slot.i_batch = -1;
 
