@@ -2995,6 +2995,19 @@ common_speculative_init_result::common_speculative_init_result(
     // the draft context holds as many tokens per sequence as the target context
     cparams.n_ctx = llama_n_ctx(ctx_tgt);
 
+    // DEN_KVMEM_DFLASH_CTX=N: cap the DRAFT context. The DFlash2 drafter is an SWA
+    // model whose attention only needs its sliding window, but the stock path sizes
+    // its KV to the TARGET's n_ctx, blowing the draft KV up to full length and
+    // cratering decode at depth. Unset (or "0") = old behaviour.
+    if (const char * e = getenv("DEN_KVMEM_DFLASH_CTX")) {
+        const uint32_t cap = (uint32_t) strtoul(e, nullptr, 10);
+        if (cap > 0 && cap < cparams.n_ctx) {
+            LOG_INF("%s: capping draft context %u -> %u (DEN_KVMEM_DFLASH_CTX)\n",
+                    __func__, (uint32_t) cparams.n_ctx, cap);
+            cparams.n_ctx = cap;
+        }
+    }
+
     // note: for small models maybe we can set this to the maximum possible draft from all speculative types
     //       the extra memory for small models is likely negligible?
     cparams.n_rs_seq  = 0;

@@ -16,7 +16,7 @@ static bool use_gdn_replay(const llama_model & model, const llama_cparams & cp) 
     if (mode == 0) return false;
     const auto & h = model.hparams;
     bool supported = model.arch == LLM_ARCH_QWEN35 && h.n_layer() == 64 && cp.n_seq_max == 1 &&
-        cp.n_rs_seq > 0 && cp.n_rs_seq <= 5 && cp.n_ubatch >= cp.n_rs_seq + 1 && cp.offload_kqv && h.ssm_d_inner == 6144 &&
+        cp.n_rs_seq > 0 && cp.n_rs_seq <= 8 && cp.n_ubatch >= cp.n_rs_seq + 1 && cp.offload_kqv && h.ssm_d_inner == 6144 &&
         h.ssm_d_state == 128 && h.ssm_n_group == 16 && h.ssm_dt_rank == 48 && h.ssm_d_conv == 4;
     ggml_backend_dev_t device = nullptr;
     const bool allow_multi_device = std::strcmp(GGML_CUDA_NAME, "CUDA") == 0;

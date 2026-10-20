@@ -87,7 +87,18 @@ if (LLAMA_KVMEM)
         target_sources(llama PRIVATE
             ${LLAMA_KVMEM_ROOT}/src/adapter/llama-kvmem-stagein.cu)
         if (DEFINED CMAKE_CUDA_ARCHITECTURES)
-            set_property(TARGET llama PROPERTY CUDA_ARCHITECTURES ${CMAKE_CUDA_ARCHITECTURES})
+            # Mirror ggml-cuda: promote plain 12X to the 12Xa arch-specific target so
+            # src/adapter/*.cu (llama-kvmem-stagein.cu) is compiled with the same
+            # tcgen05-class gating as the rest of the CUDA backend. Scoped to this target.
+            set(_den_cuda_arches "")
+            foreach (_a IN LISTS CMAKE_CUDA_ARCHITECTURES)
+                if (_a MATCHES "^12[0-9]$")
+                    list(APPEND _den_cuda_arches "${_a}a")
+                else()
+                    list(APPEND _den_cuda_arches "${_a}")
+                endif()
+            endforeach()
+            set_property(TARGET llama PROPERTY CUDA_ARCHITECTURES ${_den_cuda_arches})
         endif()
     endif()
     target_include_directories(llama PRIVATE

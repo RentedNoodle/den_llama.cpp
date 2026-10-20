@@ -1167,7 +1167,7 @@ static __global__ void flash_attn_combine_results(
     dst[tid] = VKQ_numerator / VKQ_denominator;
 }
 
-template <int DV, int ncols1, int ncols2>
+template <int DV, int ncols1, int ncols2, bool gqa_pack = false>
 void launch_fattn(
     ggml_backend_cuda_context & ctx, ggml_tensor * dst, fattn_kernel_t fattn_kernel, const int nwarps, const size_t nbytes_shared,
     const int nbatch_fa, const bool need_f16_K, const bool need_f16_V, const bool stream_k, const int warp_size = WARP_SIZE,
@@ -1288,7 +1288,10 @@ void launch_fattn(
     const int ntiles_x     = ((Q->ne[1] + ncols1 - 1) / ncols1);
     const int gqa_ratio    = Q->ne[2] / K->ne[2];
     const int ntiles_z_gqa = ((gqa_ratio + ncols2 - 1) / ncols2);
-    const int ntiles_dst   = ntiles_x * ntiles_z_gqa * K->ne[2] * Q->ne[3];
+    // gqa_pack: one block per (sequence, K/V head) processes the whole GQA group,
+    // so the GQA factor is folded into ncols1 (== group size) and does NOT tile z.
+    const int ntiles_z_eff = gqa_pack ? 1 : ntiles_z_gqa;
+    const int ntiles_dst   = ntiles_x * ntiles_z_eff * K->ne[2] * Q->ne[3];
 
     // Optional optimization where the mask is scanned to determine whether part of the calculation can be skipped.
     // Only worth the overhead if there is at lease one FATTN_KQ_STRIDE x FATTN_KQ_STRIDE square to be skipped or
@@ -1388,7 +1391,7 @@ void launch_fattn(
         } else {
             blocks_num.x = ntiles_x;
             blocks_num.y = parallel_blocks;
-            blocks_num.z = ntiles_z_gqa*K->ne[2]*Q->ne[3];
+            blocks_num.z = ntiles_z_eff*K->ne[2]*Q->ne[3];
         }
 
         if (parallel_blocks > 1) {

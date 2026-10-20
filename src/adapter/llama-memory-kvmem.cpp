@@ -371,6 +371,22 @@ static bool kvmem_harvest_sync_old() {
     return e && e[0] != '\0' && e[0] != '0';
 }
 
+// Default OFF. When ON, d2h_submit() does not block the host on the compute
+// event; the D2D/D2H copies are already stream-ordered behind compute_done and
+// the be stream waits on snap_be before the capture buffers are reused, so the
+// harvest stays a queue submit and the host is not held for the graph.
+static bool kvmem_fast_harvest() {
+    static int v = -1;
+    if (v < 0) {
+        const char * e = getenv("DEN_KVMEM_FAST_HARVEST");
+        v = (e && e[0] != '\0' && e[0] != '0') ? 1 : 0;
+        if (v == 1) {
+            fprintf(stderr, "KVMEM_FAST_HARVEST enabled\n");
+        }
+    }
+    return v == 1;
+}
+
 static cudaEvent_t kvmem_ggml_cuda_event(ggml_backend_event_t ev) {
     return ev ? static_cast<cudaEvent_t>(ev->context) : nullptr;
 }
@@ -749,6 +765,36 @@ llama_memory_i * llama_memory_kvmem_maybe_create(
         const llama_model & model,
         const llama_memory_params & params,
         const llama_cparams & cparams) {
+    // Self-enable from environment when the host never called
+    // llama_kvmem_set_params (e.g. a plain llama-server carrying the adapter
+    // but not the KVMem server wrapper). KVMEM_ENABLE=1, or a KVMEM_BUDGET
+    // value, turns the windowed KV path on with the spec defaults.
+    if (!g_kvmem_params.enabled) {
+        const char * en  = getenv("KVMEM_ENABLE");
+        const char * bud = getenv("KVMEM_BUDGET");
+        const char * gen = getenv("KVMEM_GEN_RESERVE");
+        const char * blk = getenv("KVMEM_BLOCK_TOKENS");
+        const char * mth = getenv("KVMEM_METHOD");
+        const char * rec = getenv("KVMEM_RECENT_TOKENS");
+        const char * snk = getenv("KVMEM_SINK_TOKENS");
+        const char * mts = getenv("KVMEM_MTP_STATE");
+        if ((en && en[0] && en[0] != '0') || (bud && bud[0])) {
+            g_kvmem_params = {};
+            g_kvmem_params.enabled       = true;
+            g_kvmem_params.block_tokens  = blk ? (uint32_t) atoi(blk) : 128;
+            g_kvmem_params.gen_reserve   = gen ? (uint32_t) atoi(gen) : 256;
+            g_kvmem_params.budget        = bud ? (uint32_t) atoi(bud) : 131072;
+            g_kvmem_params.method        = mth ? atoi(mth) : 1;
+            g_kvmem_params.recent_tokens = rec ? (uint32_t) atoi(rec) : 0;
+            g_kvmem_params.sink_tokens   = snk ? (uint32_t) atoi(snk) : 0;
+            g_kvmem_params.query_begin   = -1;
+            g_kvmem_params.query_end     = -1;
+            g_kvmem_params.force_pos     = -1;
+            g_kvmem_params.mtp_state     = mts ? atoi(mts) : 2;
+            LLAMA_LOG_INFO("%s: KVMem enabled from env (budget=%u block=%u gen_reserve=%u)\n",
+                    __func__, g_kvmem_params.budget, g_kvmem_params.block_tokens, g_kvmem_params.gen_reserve);
+        }
+    }
     if (!g_kvmem_params.enabled) {
         return nullptr;
     }
@@ -3110,7 +3156,7 @@ bool llama_memory_kvmem::d2h_submit(ggml_backend_t be) {
     } else {
         s.inflight = true;
     }
-    if (!old_sync && d2h_->compute_done) {
+    if (!old_sync && d2h_->compute_done && !kvmem_fast_harvest()) {
         ggml_backend_event_synchronize(d2h_->compute_done);
     }
     perf_.last_d2h_submit_us = ggml_time_us() - t_submit0;
@@ -3144,7 +3190,15 @@ void llama_memory_kvmem::harvest_pending(ggml_backend_sched_t sched) {
     }
     if (pending_capture_.empty() || pos_queue_.empty()) {
         harvest_flush();
-        if (sched) {
+        // Per-token full-scheduler sync here was the dominant depth-decode cost
+        // (it runs OUTSIDE the captured CUDA graph). On the no-capture path
+        // (n=1 decode) there is no graph-produced capture to harvest, so the
+        // sync is unnecessary. KVMEM_PIPELINE_HARVEST=0 restores old behaviour.
+        static const bool skip_sync = [](){
+            const char * e = getenv("KVMEM_PIPELINE_HARVEST");
+            return !(e && e[0] == '0');
+        }();
+        if (sched && !(skip_sync && pending_capture_.empty())) {
             ggml_backend_sched_synchronize(sched);
         }
         harvest_full_blocks_async();
