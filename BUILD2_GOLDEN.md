@@ -8,20 +8,20 @@ truth for rebuilding an identical `llama-server` on a fresh machine.
 
 | Field | Value |
 |---|---|
-| Commit (HEAD) | `0875eab41bf5a85189aa3a04bc8333ef86be3407` |
-| Upstream base | `b10687` (`git describe`: `b10687-72-g0875eab41`) |
-| Local branch | `master` |
-| Publish remote | `den` -> `https://github.com/RentedNoodle/den_llama.cpp.git` |
-| Publish branch | `main` (was `0875eab41` before this doc; fast-forward) |
-| Note | `origin` is `ggml-org/llama.cpp` (read-only upstream) — never push there. |
+| Reference commit | `abd589d4cf6d4d2d221b9532d3861fadbdb7b046` |
+| Upstream base | `b10687` |
+| Default branch | `main` |
+| Repository | `https://github.com/RentedNoodle/den_llama.cpp` |
+| Build directory | `build2` (gitignored) |
+| Note | `origin` is `ggml-org/llama.cpp` (read-only upstream). |
 
 ## Toolchain (verified from `build2/CMakeCache.txt`)
 
-| Component | Version / path |
+| Component | Version |
 |---|---|
-| Generator | Ninja 1.13.0 (`C:/Den/den-py314/Scripts/ninja.exe`) |
+| Generator | Ninja 1.13.0 |
 | Build type | `Release` |
-| CUDA toolkit | v13.3.33 (`C:/Program Files/NVIDIA GPU Computing Toolkit/CUDA/v13.3/bin/nvcc.exe`) |
+| CUDA toolkit | v13.3.33 |
 | CUDA arch (effective) | `compute_120a` / `sm_120a` (Blackwell GB203, RTX 5070 Ti) |
 | C/C++ compiler | MSVC 19.x, `14.44.35207` (VS 2022 Community) |
 | Compression mode | `-compress-mode=size` (`GGML_CUDA_COMPRESSION_MODE=size`) |
@@ -62,7 +62,7 @@ GGML_LTO:BOOL=OFF
 
 ## Exact configure command
 
-From a clean checkout at `0875eab41`, on Windows with CUDA 13.3 + VS2022:
+From a clean checkout at `abd589d4c`, on Windows with CUDA 13.3 + VS2022:
 
 ```powershell
 cmake -S . -B build2 -G Ninja `
@@ -91,12 +91,12 @@ cmake --build build2 --target llama-server --config Release -j 8
 ```
 
 Do **not** run a second build concurrently; do not build while a live `llama-server` is up.
-Project rule: one Ninja binary only (`C:/Den/den-py314/Scripts/ninja.exe`, v1.13) — mixing Ninja
-versions resets `.ninja_log` and forces a full 424-target rebuild.
+Use one Ninja binary per build directory. Mixing Ninja
+versions resets `.ninja_log` and forces a full rebuild.
 
 ## Patch stack committed in this golden master (10 files)
 
-Diff vs upstream `b10687` (source at `0875eab41` + these working-tree patches):
+Diff vs upstream `b10687` (source at `abd589d4c` plus these working-tree patches):
 
 | File | What it does |
 |---|---|
@@ -111,30 +111,30 @@ Diff vs upstream `b10687` (source at `0875eab41` + these working-tree patches):
 | `tools/server/server-task.cpp` | Emits `"nextn"` in the non-OAI-compat embeddings JSON when present. |
 | `tools/server/server-context.cpp` | Captures per-token MTP head input hidden (`h_nextn`) into `res->nextn` when `embeddings_nextn` is enabled. |
 
-Env-gated debug blocks (`LLAMA_DUMP_MTP`, writing to `C:\Den\dreya\mtp\dump\`) are intentionally
+Env-gated debug blocks (`LLAMA_DUMP_MTP`, writing to a local debug directory) are intentionally
 part of this commit because they were present in the source that produced `build2`; they are inert
 unless the env var is set.
 
 ## Verification procedure (after rebuild)
 
-1. **Load:** `build2\bin\llama-server.exe --version` then boot the PEAK command and confirm the
-   model loads and MTP is active (~89 t/s on the 27B @ 262k):
+1. **Load:** `build2\bin\llama-server.exe --version`, then boot the reference command and confirm the
+   model loads and MTP is active:
    ```
-   llama-server -m I:\models\Qwen3.8-27B-GSQ-RCO-IQ3_XXS-Uncensored-MTP.gguf ^
+   llama-server -m $env:MODEL_PATH ^
      --spec-type draft-mtp --spec-draft-n-max 2 --ctx-size 262144 -fa on ^
-     -ctk q8_0 -ctv q4_0 -ngl all -b 512 -ub 512 -np 1 ^
+     -ctk q4_0 -ctv q4_0 -ngl all -b 512 -ub 512 -np 1 ^
      --kv-stream-stage-mib 2048 -t 8 -tb 8 --cache-ram 8192 --reasoning-budget 256
    ```
 2. **2-case needle spot:** run NIAH at two depths (e.g. 32k and 196k); expect **2/2**.
-3. **Gates (no-regression):** NIAH 1/1, tool 3/3, t/s vs `master_bench.json`. A regression must be
-   planned + justified before any promote.
+3. **Gates (no-regression):** NIAH 1/1, tool 3/3, and throughput against the recorded baseline. A
+   regression must be planned and justified before any promote.
 
 ## Fresh-machine restore sequence
 
 ```powershell
 git clone https://github.com/RentedNoodle/den_llama.cpp.git
 cd den_llama.cpp
-git checkout 0875eab41bf5a85189aa3a04bc8333ef86be3407   # or: git checkout main (same tip after push)
+git checkout abd589d4cf6d4d2d221b9532d3861fadbdb7b046
 # install: VS2022 + CUDA 13.3 + Ninja >= 1.13
 cmake -S . -B build2 -G Ninja -DCMAKE_BUILD_TYPE=Release -DGGML_CUDA=ON `
   -DGGML_CUDA_FA_ALL_QUANTS=OFF -DGGML_CUDA_NCCL=ON -DGGML_CUDA_COMPRESSION_MODE=size `
@@ -147,5 +147,5 @@ cmake --build build2 --target llama-server --config Release -j 8
 ## Intentionally NOT committed
 
 - `build2/` (gitignored; binaries ~50 MB+) — rebuilt from source, never shipped in git.
-- Model files (`I:\models\*.gguf`) — separate artifacts, permission-only, never uploaded.
-- MTP debug dumps (`C:\Den\dreya\mtp\dump\`) — transient debug output.
+- Model files (external GGUF artifacts) - separate from this repository, never uploaded.
+- MTP debug dumps - transient debug output.
