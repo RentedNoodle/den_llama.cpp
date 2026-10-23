@@ -7,48 +7,56 @@
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg)](LICENSE)
 [![Language: C++](https://img.shields.io/badge/language-C%2B%2B-00599C.svg)](#build)
 [![CUDA: Blackwell sm_120a](https://img.shields.io/badge/CUDA-Blackwell%20sm__120a-76B900.svg)](#build)
-[![Status: build2 stable + experimental branches](https://img.shields.io/badge/status-build2%20stable%20%2B%20experimental%20branches-orange.svg)](#branches-tags-and-stability)
+[![Status: build2 stable source + experimental branches](https://img.shields.io/badge/status-build2%20stable%20source%20%2B%20experimental%20branches-orange.svg)](#status-and-roadmap)
 
-[Build](#build) &middot; [Run](#run) &middot; [Feature matrix](#feature-matrix) &middot; [Benchmarks](#benchmarks) &middot; [Repository layout](#repository-layout) &middot; [Credits](#credits)
+[Build](#build) &middot; [Run](#run) &middot; [Features](#features) &middot; [Benchmarks](#benchmarks) &middot; [Repository layout](#repository-layout) &middot; [Status and roadmap](#status-and-roadmap) &middot; [Credits](#credits)
 
 </div>
 
 ---
 
 > [!IMPORTANT]
-> **Source only.** This repository ships no binaries, model weights, or releases. `build2` and `build3` are build directories recorded in the docs, not committed trees. The current stable line is `build2`; `build2.1` is next. `build3` is regressed and superseded and is documented only for history. The reference target is one NVIDIA Blackwell GPU (RTX 5070 Ti, GB203, sm_120a, 16 GB) running Qwen3.8-27B with an in-model multi-token-prediction (MTP) head.
+> **Project Den is under active development and has not been released.**
+> Public availability is limited to the engine source and reproducible build instructions in this repository; the integrated companion/application is not a public release. No downloadable binary assets or model weights are currently published on GitHub. `build2` and `build3` are build directories recorded in the docs, not committed trees.
 
-den_llama.cpp is the public GGUF-oriented engine line associated with [Project Den](https://github.com/RentedNoodle/Project_Den). It is a llama.cpp fork with changes for a single-card, long-context deployment: MTP draft-and-verify, quantized KV codecs, layer-wise KV precision, adaptive KV streaming, and MoE expert placement. The private native runtime is a separate development line.
+> [!NOTE]
+> The current stable line is `build2`; `build2.1` is next. `build3` is regressed and superseded and is documented only for history. The reference target is one NVIDIA Blackwell GPU (RTX 5070 Ti, GB203, `sm_120a`, 16 GB) running Qwen3.8-27B with an in-model multi-token-prediction (MTP) head.
 
-## Branches, tags, and stability
+den_llama.cpp is the public GGUF-oriented engine line associated with [Project Den](https://github.com/RentedNoodle/Project_Den). It is a llama.cpp fork with changes for a single-card, long-context deployment: MTP draft-and-verify, quantized KV codecs, layer-wise KV precision, adaptive KV streaming, and MoE expert placement. The private native runtime is a separate development line and is not published here.
 
-| Ref | Type | Stability | Contents |
-|---|---|---|---|
-| `abd589d4c` | commit | **Stable reference (`build2`)** | The pinned engine source recorded in [`BUILD2_GOLDEN.md`](BUILD2_GOLDEN.md). There is no `build2` tag; `build2` is this commit plus the recorded build configuration. |
-| `main` | branch | Default | The stable engine source above plus documentation commits. The branch head moves as docs change; pin the commit for reproducible builds. |
-| `build3` | branch / tag | **Regressed / superseded (historical)** | FA fix, NVFP4 KV, layer-wise split-KV, Smart Expert Reduction (SER), MoE `--fit` fix. Tag `build3-golden-20260924` points at `a22b5fea0`. Do not use as the current runtime. |
-| `feat/q4-g64-kv` | branch | Experimental (based on historical `build3`) | `build3` plus the `GGML_TYPE_Q4_G64` KV codec and the KV headroom guard (`9cd4febbb`). |
-| `den-legacy` | branch | Retired | Prior engine history (`a99ff8f9`). |
-| `archive/stage1-nvfp4-abd589d4c` | branch | Archive | Pre-consolidation archive (`42bf457d`). |
+## Public availability
 
-The stable path is `abd589d4c`; `build2.1` is the next line. `build3` is regressed/superseded and `feat/q4-g64-kv` is experimental; neither is the recommended runtime. There are no GitHub releases or binary assets in this repository.
+- **Public:** engine source and reproducible build instructions in this repository.
+- **Not public:** the integrated Project Den companion/application.
+- **Downloadable assets:** none currently published on GitHub.
 
-## Feature matrix
+## Status and roadmap
+
+- **`build2` — stable reference.** Commit `abd589d4cf6d4d2d221b9532d3861fadbdb7b046`, recorded with its exact toolchain and CMake values in [`BUILD2_GOLDEN.md`](BUILD2_GOLDEN.md). There is no `build2` tag; `build2` is this commit plus the recorded build configuration.
+- **`main` — default branch.** Carries the stable engine source above plus documentation commits. The branch head moves as docs change; pin the commit for reproducible builds.
+- **`build2.1` — next line, not published.** Candidate work is derived from the `ik_llama.cpp` lineage and is isolated behind default-off flags. It is not merged or released. Promotion requires the no-regression gate: needle retrieval, tool use, and throughput against the recorded baseline.
+- **`build3` — regressed / superseded (historical).** Tag `build3-golden-20260924` points at `a22b5fea0`. Do not use it as the current runtime.
+- **`feat/q4-g64-kv` — experimental.** Based on the historical `build3` line; carries the `GGML_TYPE_Q4_G64` KV codec and the KV headroom guard (`9cd4febbb`). Not the recommended deployment path.
+- **`den-legacy` — retired.** Prior engine history (`a99ff8f9`).
+- **`archive/stage1-nvfp4-abd589d4c` — archive.** Pre-consolidation archive (`42bf457d`).
+- **Private native runtime — not published.** A separate `NInfer` / future `.den` development line exists outside this repository. Nothing from that line is shipped here.
+
+The stable path is `abd589d4c`; `build2.1` is the next line. `build3` is regressed/superseded and `feat/q4-g64-kv` is experimental; neither is the recommended runtime.
+
+## Features
 
 Status means the feature is present in the named ref and has a CLI surface in that ref. It does not mean every model or GPU combination is validated.
 
-| Capability | Ref | Surface |
-|---|---|---|
-| MTP draft-and-verify | `main` | `--spec-type draft-mtp`, `--spec-draft-n-max` |
-| Server MTP hidden-state output | `main` | `--embeddings-nextn` |
-| NVFP4 KV cache | `build3` (historical) | `--cache-type-k nvfp4`, `--cache-type-v nvfp4` |
-| Layer-wise split-KV | `build3` (historical) | `--kv-high-precision-layers N` |
-| Smart Expert Reduction (SER) | `build3` (historical) | `-ser MIN,THRESH`, `--ser-top-p`, `--ser-ramp` |
-| MoE expert placement | `main`, `build3` (historical) | `--fit`, `-ncmoe N` |
-| Adaptive KV streaming | `main` | `--kv-stream-stage-mib N` |
-| Q4_G64 KV cache | `feat/q4-g64-kv` (experimental) | `--cache-type-k q4_g64`, `--cache-type-v q4_g64` |
-| KV headroom guard | `feat/q4-g64-kv` (experimental) | `--kv-headroom-warn`, `--kv-headroom-block`, `--kv-headroom-force` |
-| NVFP4 weight MMA path | `main` | Experimental; see `ggml/src/ggml-cuda/mma.cuh` |
+- **MTP draft-and-verify** — `main`; `--spec-type draft-mtp`, `--spec-draft-n-max`.
+- **Server MTP hidden-state output** — `main`; `--embeddings-nextn`.
+- **NVFP4 KV cache** — `build3` (historical); `--cache-type-k nvfp4`, `--cache-type-v nvfp4`.
+- **Layer-wise split-KV** — `build3` (historical); `--kv-high-precision-layers N`.
+- **Smart Expert Reduction (SER)** — `build3` (historical); `-ser MIN,THRESH`, `--ser-top-p`, `--ser-ramp`.
+- **MoE expert placement** — `main`, `build3` (historical); `--fit`, `-ncmoe N`.
+- **Adaptive KV streaming** — `main`; `--kv-stream-stage-mib N`.
+- **Q4_G64 KV cache** — `feat/q4-g64-kv` (experimental); `--cache-type-k q4_g64`, `--cache-type-v q4_g64`.
+- **KV headroom guard** — `feat/q4-g64-kv` (experimental); `--kv-headroom-warn`, `--kv-headroom-block`, `--kv-headroom-force`.
+- **NVFP4 weight MMA path** — `main`; experimental; see `ggml/src/ggml-cuda/mma.cuh`.
 
 `build3` does **not** contain the Q4_G64 codec or the KV headroom guard. It is historical and is not the recommended runtime. The experimental `feat/q4-g64-kv` ref carries those flags.
 
@@ -120,43 +128,35 @@ For depth-0.5 retrieval on the reference model, use `-b 2048 -ub 2048`. That is 
 
 ### Historical and experimental refs
 
-`build3` is regressed and superseded. It is documented for availability and measurement history; it is
-not the current runtime. `feat/q4-g64-kv` is experimental and is based on that historical line. Neither
-ref is recommended for new deployments.
+`build3` is regressed and superseded. It is documented for availability and measurement history; it is not the current runtime. `feat/q4-g64-kv` is experimental and is based on that historical line. Neither ref is recommended for new deployments.
 
-For reference, the historical `build3` surface includes `-ctk nvfp4 -ctv nvfp4`,
-`--kv-high-precision-layers N`, `-ser MIN,THRESH`, and `-ncmoe N`. The experimental
-`feat/q4-g64-kv` surface adds `-ctk q4_g64 -ctv q4_g64` and `--kv-headroom-warn/-block/-force`.
+For reference, the historical `build3` surface includes `-ctk nvfp4 -ctv nvfp4`, `--kv-high-precision-layers N`, `-ser MIN,THRESH`, and `-ncmoe N`. The experimental `feat/q4-g64-kv` surface adds `-ctk q4_g64 -ctv q4_g64` and `--kv-headroom-warn/-block/-force`.
 
 ## Benchmarks
 
 These are reported measurements from the reference machine. Raw logs are not published in this repository, and the repo does not contain a turnkey harness for every row. Conditions are included so the numbers are not read as universal.
 
-| Measurement | Result | Conditions |
-|---|---|---|
-| Needle retrieval | 6/6 | `build2`; `v2.0` model; 15K-word haystack, depths 0.1-0.9, temp 0.0 |
-| WikiText-2 perplexity | 6.1745 +/- 0.14889 | `build2`; 40x512 chunks; `-fa on`; default KV |
-| Serve decode, 32K ctx | 82.73 t/s median (79.4-89.6) | `build2`; 5 prompts x 300 tok x 2 reps; MTP n-max 2; accept 0.6703 |
-| Serve decode, 65K ctx | 64.16 t/s median (51.11-72.48) | Mixed-KV build (`FA_ALL_QUANTS=ON`); `-ctk q8_0 -ctv q4_0`; MTP n-max 2; accept 0.7675 |
-| MoE 26B-A4B decode | 94-117 t/s | `build3` (historical); Q4_K_M; `-ncmoe 4`; full residency collapses at the VRAM ceiling |
-| NVFP4 KV decode / KLD | 88.6 t/s / 0.0151 | `build3` (historical); matched `nvfp4` K/V; validated at or below 96K |
+- **Needle retrieval:** 6/6 — `build2`; `v2.0` model; 15K-word haystack, depths 0.1–0.9, temperature 0.0.
+- **WikiText-2 perplexity:** 6.1745 ± 0.14889 — `build2`; 40×512 chunks; `-fa on`; default KV.
+- **Serve decode, 32K context:** 82.73 t/s median (79.4–89.6) — `build2`; 5 prompts × 300 tokens × 2 reps; MTP n-max 2; accept 0.6703.
+- **Serve decode, 65K context:** 64.16 t/s median (51.11–72.48) — mixed-KV build (`FA_ALL_QUANTS=ON`); `-ctk q8_0 -ctv q4_0`; MTP n-max 2; accept 0.7675.
+- **MoE 26B-A4B decode:** 94–117 t/s — `build3` (historical); Q4_K_M; `-ncmoe 4`; full residency collapses at the VRAM ceiling.
+- **NVFP4 KV decode / KLD:** 88.6 t/s / 0.0151 — `build3` (historical); matched `nvfp4` K/V; validated at or below 96K.
 
 Context capacity is not recall. The 196K figure is a placement result on a 16 GB card, not a deep-recall measurement; the needle result above is the largest verified retrieval window recorded for this tree.
 
 ## Repository layout
 
-| Path | What |
-|---|---|
-| `common/speculative.cpp` | MTP carryover reset and draft-and-verify plumbing |
-| `common/arg.cpp` | CLI surface for MTP, KV, SER, MoE placement, and streaming |
-| `include/llama.h`, `src/llama-context.cpp` | MTP hidden-state API and context wiring |
-| `src/models/delta-net-base.cpp` | Gated-delta-net conv-state snapshot bound fix |
-| `common/fit.cpp` | MoE-aware `--fit` margin cap |
-| `ggml/src/ggml-cuda/mma.cuh` | Blackwell block-scaled MMA path |
-| `ggml/src/ggml-cuda/mmq-config-blackwell.cuh` | Blackwell MMQ configuration |
-| `ggml/src/ggml-cuda/template-instances/mmq-instance-nvfp4.cu` | NVFP4 MMQ instance |
-| `benchmarks/benchmark_kv_stream.py` | Adaptive KV streaming sweep driver |
-| `BUILD2_GOLDEN.md` | Recorded build2 toolchain and configure values |
+- `common/speculative.cpp` — MTP carryover reset and draft-and-verify plumbing.
+- `common/arg.cpp` — CLI surface for MTP, KV, SER, MoE placement, and streaming.
+- `include/llama.h`, `src/llama-context.cpp` — MTP hidden-state API and context wiring.
+- `src/models/delta-net-base.cpp` — gated-delta-net conv-state snapshot bound fix.
+- `common/fit.cpp` — MoE-aware `--fit` margin cap.
+- `ggml/src/ggml-cuda/mma.cuh` — Blackwell block-scaled MMA path.
+- `ggml/src/ggml-cuda/mmq-config-blackwell.cuh` — Blackwell MMQ configuration.
+- `ggml/src/ggml-cuda/template-instances/mmq-instance-nvfp4.cu` — NVFP4 MMQ instance.
+- `benchmarks/benchmark_kv_stream.py` — adaptive KV streaming sweep driver.
+- `BUILD2_GOLDEN.md` — recorded `build2` toolchain and configure values.
 
 ## Adaptive KV streaming
 
