@@ -58,9 +58,13 @@
 #define cudaDeviceSynchronize hipDeviceSynchronize
 #define cudaError_t hipError_t
 #define cudaErrorMemoryAllocation hipErrorOutOfMemory
+#define cudaErrorNotReady hipErrorNotReady
 #define cudaErrorPeerAccessAlreadyEnabled hipErrorPeerAccessAlreadyEnabled
 #define cudaErrorPeerAccessNotEnabled hipErrorPeerAccessNotEnabled
+#define cudaEventCreate hipEventCreate
 #define cudaEventCreateWithFlags hipEventCreateWithFlags
+#define cudaEventElapsedTime hipEventElapsedTime
+#define cudaEventQuery hipEventQuery
 #define cudaEventDisableTiming hipEventDisableTiming
 #define cudaEventRecord hipEventRecord
 #define cudaEventSynchronize hipEventSynchronize
@@ -81,6 +85,12 @@
 #define cudaLaunchHostFunc hipLaunchHostFunc
 #define cudaMalloc hipMalloc
 #define cudaMallocHost(ptr, size) hipHostMalloc(ptr, size, hipHostMallocDefault)
+#define cudaHostAlloc hipHostMalloc
+#define cudaHostAllocMapped hipHostMallocMapped
+#define cudaHostAllocPortable hipHostMallocPortable
+#define cudaHostAllocWriteCombined hipHostMallocWriteCombined
+#define cudaHostGetDevicePointer hipHostGetDevicePointer
+#define cudaHostGetFlags hipHostGetFlags
 #define cudaMallocManaged hipMallocManaged
 #define cudaMemAdvise hipMemAdvise
 #define cudaMemcpy hipMemcpy

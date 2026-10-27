@@ -760,6 +760,12 @@ static void * ggml_backend_cuda_buffer_get_base(ggml_backend_buffer_t buffer) {
 }
 
 static bool ggml_backend_cuda_buffer_set_preferred_device(ggml_backend_buffer_t buffer) {
+#if defined(GGML_USE_HIP) || defined(GGML_USE_MUSA)
+    // CUDA 12.2+ location-based cudaMemAdvise has no HIP/MUSA equivalent; this
+    // unified-memory placement hint is a CUDA-only feature (see allreduce.cu).
+    (void) buffer;
+    return false;
+#else
     if (!ggml_backend_buffer_is_cuda(buffer) || getenv("GGML_CUDA_ENABLE_UNIFIED_MEMORY") == nullptr) {
         return false;
     }
@@ -786,9 +792,15 @@ static bool ggml_backend_cuda_buffer_set_preferred_device(ggml_backend_buffer_t 
     GGML_LOG_INFO("set GPU-preferred placement for %.2f MiB model-weight buffer on device %d\n",
         ggml_backend_buffer_get_size(buffer) / 1024.0 / 1024.0, ctx->device);
     return true;
+#endif // !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
 }
 
 static bool ggml_backend_cuda_buffer_set_preferred_host(ggml_backend_buffer_t buffer) {
+#if defined(GGML_USE_HIP) || defined(GGML_USE_MUSA)
+    // Host-location cudaMemAdvise placement is CUDA-only (see set_preferred_device).
+    (void) buffer;
+    return false;
+#else
     if (!ggml_backend_buffer_is_cuda(buffer) || getenv("GGML_CUDA_ENABLE_UNIFIED_MEMORY") == nullptr) {
         return false;
     }
@@ -836,6 +848,7 @@ static bool ggml_backend_cuda_buffer_set_preferred_host(ggml_backend_buffer_t bu
     GGML_LOG_INFO("set host-preferred placement for %.2f MiB KV buffer on device %d\n",
         ggml_backend_buffer_get_size(buffer) / 1024.0 / 1024.0, ctx->device);
     return true;
+#endif // !defined(GGML_USE_HIP) && !defined(GGML_USE_MUSA)
 }
 
 static enum ggml_status ggml_backend_cuda_buffer_init_tensor(ggml_backend_buffer_t buffer, ggml_tensor * tensor) {
