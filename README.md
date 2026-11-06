@@ -179,3 +179,9 @@ Den builds on open work.
 ## License
 
 MIT. See [`LICENSE`](LICENSE). This fork builds on [ggml-org/llama.cpp](https://github.com/ggml-org/llama.cpp).
+
+## Snapshots
+
+After a branch-to-tag migration, regenerate `TAGS.md`; it is the only readable index of tagged
+snapshots. Tags are the record - a deleted branch is recoverable with `git fetch --tags` then
+`git checkout backup/<name>`, but only if the tag list is written down somewhere a human reads.
