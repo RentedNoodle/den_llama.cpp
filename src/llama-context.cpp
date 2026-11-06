@@ -1694,13 +1694,21 @@ static bool needs_raw_logits(const llama_ubatch & ubatch, const std::map<llama_s
 // ============================================================================
 // TEMPORARY DEBUG: dump intermediate MTP draft-head tensors for byte-compare
 // against a PyTorch reimplementation. Triggered by env LLAMA_DUMP_MTP.
-// Writes raw f32 payloads (with a small dim header) into C:\Den\dreya\mtp\dump\
+// Writes raw f32 payloads (with a small dim header) into the directory named by
+// env LLAMA_DUMP_MTP_DIR (default: ./mtp_dump)
 // for the FIRST single-token MTP draft decode only. This block is clearly marked and should be
 // removed once the divergence is found. It does not alter graph logic.
 // ============================================================================
 #include <sys/stat.h>
+#ifdef _WIN32
 #include <direct.h>
+#endif
 static bool g_mtp_dump_done = false;
+// Output directory for the MTP debug dump: LLAMA_DUMP_MTP_DIR, else ./mtp_dump.
+static const char * llm_mtp_dump_dir() {
+    const char * d = getenv("LLAMA_DUMP_MTP_DIR");
+    return (d != nullptr && d[0] != '\0') ? d : "mtp_dump";
+}
 static void llm_mtp_dump_tensor(ggml_cgraph * gf, const char * name) {
     if (!gf) return;
     ggml_tensor * t = ggml_graph_get_tensor(gf, name);
@@ -1711,7 +1719,7 @@ static void llm_mtp_dump_tensor(ggml_cgraph * gf, const char * name) {
     ggml_backend_tensor_get(t, buf.data(), 0, nbytes);
     // dim header (ne0 ne1 ne2 ne3) as 4 int64, then raw element data in native order
     char path[1024];
-    snprintf(path, sizeof(path), "C:\\Den\\dreya\\mtp\\dump\\%s.f32", name);
+    snprintf(path, sizeof(path), "%s/%s.f32", llm_mtp_dump_dir(), name);
     FILE * f = fopen(path, "wb");
     if (!f) { LLAMA_LOG_ERROR("%s: cannot open %s for writing\n", __func__, path); return; }
     int64_t dims[4] = { (int64_t)t->ne[0], (int64_t)t->ne[1], (int64_t)t->ne[2], (int64_t)t->ne[3] };
@@ -1732,7 +1740,7 @@ static void llm_mtp_dump_tensor_ptr(ggml_tensor * t, const char * name) {
     std::vector<float> buf(n);
     ggml_backend_tensor_get(t, buf.data(), 0, nbytes);
     char path[1024];
-    snprintf(path, sizeof(path), "C:\\Den\\dreya\\mtp\\dump\\%s.f32", name);
+    snprintf(path, sizeof(path), "%s/%s.f32", llm_mtp_dump_dir(), name);
     FILE * f = fopen(path, "wb");
     if (!f) { LLAMA_LOG_ERROR("%s: cannot open %s for writing\n", __func__, path); return; }
     int64_t dims[4] = { (int64_t)t->ne[0], (int64_t)t->ne[1], (int64_t)t->ne[2], (int64_t)t->ne[3] };
@@ -1744,7 +1752,7 @@ static void llm_mtp_dump_tensor_ptr(ggml_tensor * t, const char * name) {
 }
 static void llm_mtp_dump_graph(const llama_context * ctx, const llm_graph_result * res, const llama_ubatch & ubatch) {
     if (!res) return;
-    const char * outdir = "C:\\Den\\dreya\\mtp\\dump";
+    const char * outdir = llm_mtp_dump_dir();
     (void)outdir;
 #ifdef _WIN32
     _mkdir(outdir);
@@ -1780,7 +1788,9 @@ static void llm_mtp_dump_graph(const llama_context * ctx, const llm_graph_result
     {
         // token ids + position (single-token draft step)
         if (ubatch.token) {
-            FILE * f = fopen("C:\\Den\\dreya\\mtp\\dump\\input_token_ids.bin", "wb");
+            char path[1024];
+            snprintf(path, sizeof(path), "%s/input_token_ids.bin", llm_mtp_dump_dir());
+            FILE * f = fopen(path, "wb");
             if (f) {
                 int64_t nt = (int64_t)ubatch.n_tokens;
                 int64_t pos = ubatch.pos ? (int64_t)ubatch.pos[0] : -1;
@@ -1793,7 +1803,9 @@ static void llm_mtp_dump_graph(const llama_context * ctx, const llm_graph_result
         // harvested h (the MTP input hidden). In the ubatch it lives as embd.
         if (ubatch.embd && res->get_h_nextn()) {
             // ubatch embd is the h row fed to this MTP layer: dump raw too
-            FILE * f = fopen("C:\\Den\\dreya\\mtp\\dump\\input_h.bin", "wb");
+            char path[1024];
+            snprintf(path, sizeof(path), "%s/input_h.bin", llm_mtp_dump_dir());
+            FILE * f = fopen(path, "wb");
             if (f) {
                 int64_t ne0 = (int64_t)res->get_h_nextn()->ne[0];
                 int64_t ne1 = (int64_t)ubatch.n_tokens;
